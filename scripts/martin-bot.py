@@ -226,8 +226,8 @@ class MartinBot:
             self.config.get('phase1_layer_trigger_atr_multiplier', 0.35),
             0.35,
         )
-        self.phase2_max_layers = max(int(self.config.get('phase2_max_layers', 6)), self.phase1_max_layers)
-        self.phase2_layer_multipliers = list(self.config.get('phase2_layer_multipliers', [1, 1.15, 1.35, 1.7, 2.1, 2.6]))
+        self.phase2_extra_layers = max(int(self.config.get('phase2_extra_layers', self.config.get('phase2_max_layers', 6))), 1)
+        self.phase2_layer_multipliers = list(self.config.get('phase2_layer_multipliers', [1.7, 2.1, 2.6, 3.2, 3.9, 4.8]))
         self.phase2_layer_min_gap_pct = self._safe_float(self.config.get('phase2_layer_min_gap_pct', 0.010), 0.010)
         self.phase2_layer_min_gap_atr_multiplier = self._safe_float(
             self.config.get('phase2_layer_min_gap_atr_multiplier', 1.4),
@@ -240,11 +240,11 @@ class MartinBot:
         )
         if len(self.phase1_layer_multipliers) < self.phase1_max_layers:
             raise ValueError("phase1_layer_multipliers 长度不能小于 phase1_max_layers")
-        if len(self.phase2_layer_multipliers) < self.phase2_max_layers:
-            raise ValueError("phase2_layer_multipliers 长度不能小于 phase2_max_layers")
+        if len(self.phase2_layer_multipliers) < self.phase2_extra_layers:
+            raise ValueError("phase2_layer_multipliers 长度不能小于 phase2_extra_layers")
 
-        self.max_layers = max(int(self.config.get('max_layers', self.phase2_max_layers)), self.phase2_max_layers)
-        self.layer_multipliers = self.phase2_layer_multipliers
+        self.max_layers = self.phase1_max_layers + self.phase2_extra_layers
+        self.layer_multipliers = self.phase1_layer_multipliers + self.phase2_layer_multipliers
         self.first_order_ratio = self.phase1_first_order_ratio
 
         self.level_offset_pct = self.config.get('level_offset_pct', 0.001)              # 结构位偏移 0.1%
@@ -741,9 +741,10 @@ class MartinBot:
         if normalized == 'PHASE2':
             return {
                 'phase': 'PHASE2',
-                'max_layers': self.phase2_max_layers,
+                'max_layers': self.max_layers,
                 'first_order_ratio': self.phase1_first_order_ratio,
                 'layer_multipliers': self.phase2_layer_multipliers,
+                'layer_index_offset': self.phase1_max_layers,
                 'layer_min_gap_pct': self.phase2_layer_min_gap_pct,
                 'layer_min_gap_atr_multiplier': self.phase2_layer_min_gap_atr_multiplier,
                 'layer_trigger_base_pct': self.phase2_layer_trigger_base_pct,
@@ -754,6 +755,7 @@ class MartinBot:
             'max_layers': self.phase1_max_layers,
             'first_order_ratio': self.phase1_first_order_ratio,
             'layer_multipliers': self.phase1_layer_multipliers,
+            'layer_index_offset': 0,
             'layer_min_gap_pct': self.phase1_layer_min_gap_pct,
             'layer_min_gap_atr_multiplier': self.phase1_layer_min_gap_atr_multiplier,
             'layer_trigger_base_pct': self.phase1_layer_trigger_base_pct,
@@ -1034,10 +1036,11 @@ class MartinBot:
         entry_price = self._price_to_precision(entry_price)
 
         layer_multipliers = phase_cfg['layer_multipliers']
-        if layer_num > len(layer_multipliers):
+        phase_layer_index = layer_num - int(phase_cfg.get('layer_index_offset', 0)) - 1
+        if phase_layer_index < 0 or phase_layer_index >= len(layer_multipliers):
             print(f"⚠️ 当前阶段 {phase} 未配置第{layer_num}层倍率，跳过加仓")
             return None
-        desired_margin = equity * phase_cfg['first_order_ratio'] * layer_multipliers[layer_num - 1]
+        desired_margin = equity * phase_cfg['first_order_ratio'] * layer_multipliers[phase_layer_index]
         layer_margin = self._calculate_order_margin(
             desired_margin,
             balance_snapshot,
@@ -1081,13 +1084,14 @@ class MartinBot:
             'sr': sr,
             'position': position,
             'side': side,
+            'phase_layer_index': phase_layer_index,
         }
 
     def _log_add_order_plan(self, plan: Dict[str, Any]) -> None:
         layer_num = int(plan['layer_num'])
         print(
             f"📋 [{plan['phase']}] 第{layer_num}层: {plan['order_side'].upper()} {plan['amount']} @ {plan['entry_price']} "
-            f"(保证金 {plan['layer_margin']:.2f} USDT, 倍率 {self._phase_config(plan['phase'])['layer_multipliers'][layer_num - 1]})"
+            f"(保证金 {plan['layer_margin']:.2f} USDT, 倍率 {self._phase_config(plan['phase'])['layer_multipliers'][plan['phase_layer_index']]})"
         )
         print(
             f"   来源: {plan['source']} | 持仓均价: {plan['avg_price']:.2f} "
@@ -1576,7 +1580,7 @@ class MartinBot:
             'phase1_layer_multipliers': self.phase1_layer_multipliers,
             'phase1_layer_min_gap_pct': self.phase1_layer_min_gap_pct,
             'phase1_layer_trigger_base_pct': self.phase1_layer_trigger_base_pct,
-            'phase2_max_layers': self.phase2_max_layers,
+            'phase2_extra_layers': self.phase2_extra_layers,
             'phase2_layer_multipliers': self.phase2_layer_multipliers,
             'phase2_layer_min_gap_pct': self.phase2_layer_min_gap_pct,
             'phase2_layer_trigger_base_pct': self.phase2_layer_trigger_base_pct,
@@ -2890,7 +2894,8 @@ class MartinBot:
         print(f"  杠杆: {self.leverage}X")
         print(f"  Phase1 首仓: {self.phase1_first_order_ratio*100:.2f}%")
         print(f"  Phase1 层数/倍率: {self.phase1_max_layers} / {self.phase1_layer_multipliers}")
-        print(f"  Phase2 层数/倍率: {self.phase2_max_layers} / {self.phase2_layer_multipliers}")
+        print(f"  Phase2 额外层数/倍率: {self.phase2_extra_layers} / {self.phase2_layer_multipliers}")
+        print(f"  总最大层数: {self.max_layers}")
         print(
             f"  阶段切换: 亏损达到 {self.phase_switch_loss_pct*100:.2f}% "
             f"或层数达到 {self.phase_switch_layer}"
