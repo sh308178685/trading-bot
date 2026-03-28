@@ -1,7 +1,7 @@
 {
-  "apiKey": "your_bitget_api_key_here",
-  "secretKey": "your_bitget_secret_key_here",
-  "passphrase": "your_bitget_passphrase_here",
+  "apiKey": "bg_c65a16abe77659d9103939c14e7bc635",
+  "secretKey": "19a372dca08e918e746d913a1a0b3b917caa75e9222522155c2ced2c7082e22c",
+  "passphrase": "jas890527",
   "exchange": "bitget",
   "sandbox": true,
   "defaultType": "swap",
@@ -34,7 +34,14 @@
   "mean_reversion_short_rsi": 65,
   "mean_reversion_entry_atr_ratio": 0.35,
   "max_layers": 6,
-  "layer_multipliers": [1, 1.15, 1.35, 1.7, 2.1, 2.6],
+  "layer_multipliers": [
+    1,
+    1.15,
+    1.35,
+    1.7,
+    2.1,
+    2.6
+  ],
   "first_order_ratio": 0.025,
   "phase_switch_loss_pct": 0.025,
   "phase_switch_layer": 4,
@@ -52,10 +59,10 @@
   "phase2_layer_trigger_base_pct": 0.012,
   "phase2_layer_trigger_atr_multiplier": 1.5,
   "level_offset_pct": 0.001,
-  "add_layer_base_offset_pct": 0.005,
+  "add_layer_base_offset_pct": 0.006,
   "structure_refresh_threshold": 0.008,
-  "structure_min_gap_pct": 0.005,
-  "structure_min_gap_atr_multiplier": 0.8,
+  "structure_min_gap_pct": 0.006,
+  "structure_min_gap_atr_multiplier": 1.0,
   "layer_min_gap_pct": 0.01,
   "layer_min_gap_atr_multiplier": 1.4,
   "layer_trigger_base_pct": 0.012,
@@ -84,8 +91,9 @@
   "error_sleep": 60,
   "min_balance": 10.0,
   "order_margin_safety_ratio": 0.95,
-  "insufficient_balance_shrink_ratio": 0.90,
+  "insufficient_balance_shrink_ratio": 0.9,
   "dashboardUsername": "admin",
   "dashboardPassword": "change_me",
-  "dashboardSecret": "replace_with_a_random_secret"
+  "dashboardSecret": "replace_with_a_random_secret",
+  "dashboardPort": 3000
 }

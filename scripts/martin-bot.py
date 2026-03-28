@@ -143,6 +143,7 @@ def configure_runtime_logging() -> Path:
 class RuntimeState:
     layer: int = 0
     pending_layer: int = 0
+    phase: str = "PHASE1"
     pending_entry_price: float = 0.0
     last_fill_price: float = 0.0
     last_fill_time: str = ""
@@ -209,9 +210,41 @@ class MartinBot:
             0.35,
         )
 
-        self.max_layers = self.config.get('max_layers', 4)
-        self.layer_multipliers = self.config.get('layer_multipliers', [1, 1.2, 1.5, 2])
-        self.first_order_ratio = self.config.get('first_order_ratio', 0.05)
+        self.phase_switch_loss_pct = self._safe_float(self.config.get('phase_switch_loss_pct', 0.025), 0.025)
+        self.phase_switch_layer = max(int(self.config.get('phase_switch_layer', 4)), 2)
+        self.phase1_max_layers = max(int(self.config.get('phase1_max_layers', 3)), 1)
+        self.phase1_first_order_ratio = self._safe_float(self.config.get('phase1_first_order_ratio', 0.025), 0.025)
+        self.phase1_layer_multipliers = list(self.config.get('phase1_layer_multipliers', [1, 1.15, 1.35]))
+        self.phase1_layer_min_gap_pct = self._safe_float(self.config.get('phase1_layer_min_gap_pct', 0.0), 0.0)
+        self.phase1_layer_min_gap_atr_multiplier = self._safe_float(
+            self.config.get('phase1_layer_min_gap_atr_multiplier', 0.35),
+            0.35,
+        )
+        self.phase1_layer_trigger_base_pct = self._safe_float(self.config.get('phase1_layer_trigger_base_pct', 0.0), 0.0)
+        self.phase1_layer_trigger_atr_multiplier = self._safe_float(
+            self.config.get('phase1_layer_trigger_atr_multiplier', 0.35),
+            0.35,
+        )
+        self.phase2_max_layers = max(int(self.config.get('phase2_max_layers', 6)), self.phase1_max_layers)
+        self.phase2_layer_multipliers = list(self.config.get('phase2_layer_multipliers', [1, 1.15, 1.35, 1.7, 2.1, 2.6]))
+        self.phase2_layer_min_gap_pct = self._safe_float(self.config.get('phase2_layer_min_gap_pct', 0.010), 0.010)
+        self.phase2_layer_min_gap_atr_multiplier = self._safe_float(
+            self.config.get('phase2_layer_min_gap_atr_multiplier', 1.4),
+            1.4,
+        )
+        self.phase2_layer_trigger_base_pct = self._safe_float(self.config.get('phase2_layer_trigger_base_pct', 0.012), 0.012)
+        self.phase2_layer_trigger_atr_multiplier = self._safe_float(
+            self.config.get('phase2_layer_trigger_atr_multiplier', 1.5),
+            1.5,
+        )
+        if len(self.phase1_layer_multipliers) < self.phase1_max_layers:
+            raise ValueError("phase1_layer_multipliers 长度不能小于 phase1_max_layers")
+        if len(self.phase2_layer_multipliers) < self.phase2_max_layers:
+            raise ValueError("phase2_layer_multipliers 长度不能小于 phase2_max_layers")
+
+        self.max_layers = max(int(self.config.get('max_layers', self.phase2_max_layers)), self.phase2_max_layers)
+        self.layer_multipliers = self.phase2_layer_multipliers
+        self.first_order_ratio = self.phase1_first_order_ratio
 
         self.level_offset_pct = self.config.get('level_offset_pct', 0.001)              # 结构位偏移 0.1%
         self.add_layer_base_offset_pct = self.config.get('add_layer_base_offset_pct', 0.005)  # 固定兜底偏移 0.5% * 层数
@@ -222,18 +255,18 @@ class MartinBot:
             self.config.get('structure_min_gap_atr_multiplier', 0.8),
             0.8,
         )
-        self.layer_min_gap_pct = self._safe_float(self.config.get('layer_min_gap_pct', 0.006), 0.006)
+        self.layer_min_gap_pct = self._safe_float(self.config.get('layer_min_gap_pct', self.phase2_layer_min_gap_pct), self.phase2_layer_min_gap_pct)
         self.layer_min_gap_atr_multiplier = self._safe_float(
-            self.config.get('layer_min_gap_atr_multiplier', 1.0),
-            1.0,
+            self.config.get('layer_min_gap_atr_multiplier', self.phase2_layer_min_gap_atr_multiplier),
+            self.phase2_layer_min_gap_atr_multiplier,
         )
         self.layer_trigger_base_pct = self._safe_float(
-            self.config.get('layer_trigger_base_pct', max(self.add_layer_base_offset_pct, 0.005)),
-            max(self.add_layer_base_offset_pct, 0.005),
+            self.config.get('layer_trigger_base_pct', self.phase2_layer_trigger_base_pct),
+            self.phase2_layer_trigger_base_pct,
         )
         self.layer_trigger_atr_multiplier = self._safe_float(
-            self.config.get('layer_trigger_atr_multiplier', 1.0),
-            1.0,
+            self.config.get('layer_trigger_atr_multiplier', self.phase2_layer_trigger_atr_multiplier),
+            self.phase2_layer_trigger_atr_multiplier,
         )
         self.layer_trigger_type = str(self.config.get('layer_trigger_type', 'mark_price')).lower()
         self.use_ema_structure = bool(self.config.get('use_ema_structure', False))
@@ -702,15 +735,89 @@ class MartinBot:
         )
         return False
 
+    def _phase_config(self, phase: Optional[str] = None) -> Dict[str, Any]:
+        normalized = str(phase or self.state.phase or 'PHASE1').upper()
+        if normalized == 'PHASE2':
+            return {
+                'phase': 'PHASE2',
+                'max_layers': self.phase2_max_layers,
+                'first_order_ratio': self.phase1_first_order_ratio,
+                'layer_multipliers': self.phase2_layer_multipliers,
+                'layer_min_gap_pct': self.phase2_layer_min_gap_pct,
+                'layer_min_gap_atr_multiplier': self.phase2_layer_min_gap_atr_multiplier,
+                'layer_trigger_base_pct': self.phase2_layer_trigger_base_pct,
+                'layer_trigger_atr_multiplier': self.phase2_layer_trigger_atr_multiplier,
+            }
+        return {
+            'phase': 'PHASE1',
+            'max_layers': self.phase1_max_layers,
+            'first_order_ratio': self.phase1_first_order_ratio,
+            'layer_multipliers': self.phase1_layer_multipliers,
+            'layer_min_gap_pct': self.phase1_layer_min_gap_pct,
+            'layer_min_gap_atr_multiplier': self.phase1_layer_min_gap_atr_multiplier,
+            'layer_trigger_base_pct': self.phase1_layer_trigger_base_pct,
+            'layer_trigger_atr_multiplier': self.phase1_layer_trigger_atr_multiplier,
+        }
+
+    def _should_switch_to_phase2(
+        self,
+        position: Optional[Dict[str, Any]] = None,
+        current_price: Optional[float] = None,
+        current_profit_pct: Optional[float] = None,
+    ) -> bool:
+        if str(self.state.phase or 'PHASE1').upper() == 'PHASE2':
+            return True
+        if self.state.layer >= self.phase_switch_layer:
+            return True
+        if position is None:
+            return False
+        profit_pct = current_profit_pct
+        if profit_pct is None:
+            profit_pct = self._position_profit_pct(position, current_price)
+        return profit_pct <= -abs(self.phase_switch_loss_pct)
+
+    def _current_phase(
+        self,
+        position: Optional[Dict[str, Any]] = None,
+        current_price: Optional[float] = None,
+        current_profit_pct: Optional[float] = None,
+    ) -> str:
+        if self._should_switch_to_phase2(position, current_price=current_price, current_profit_pct=current_profit_pct):
+            if str(self.state.phase or 'PHASE1').upper() != 'PHASE2':
+                with self.state_lock:
+                    self.state.phase = 'PHASE2'
+                self._save_runtime_state()
+                print(
+                    f"🧭 阶段切换: PHASE1 -> PHASE2 "
+                    f"(layer={self.state.layer}, 阈值={self.phase_switch_layer}, "
+                    f"亏损线={self.phase_switch_loss_pct*100:.2f}%)"
+                )
+            return 'PHASE2'
+        if str(self.state.phase or 'PHASE1').upper() != 'PHASE1':
+            with self.state_lock:
+                self.state.phase = 'PHASE1'
+            self._save_runtime_state()
+        return 'PHASE1'
+
     def _gap_ratio(
         self,
         current_price: float,
         atr_value: float,
-        base_pct: float,
-        atr_multiplier: float,
+        base_pct: Optional[float] = None,
+        atr_multiplier: Optional[float] = None,
         depth_scale: float = 0.0,
         layer_num: int = 1,
+        phase: Optional[str] = None,
+        kind: str = 'spacing',
     ) -> float:
+        if base_pct is None or atr_multiplier is None:
+            phase_cfg = self._phase_config(phase)
+            if kind == 'trigger':
+                base_pct = phase_cfg['layer_trigger_base_pct']
+                atr_multiplier = phase_cfg['layer_trigger_atr_multiplier']
+            else:
+                base_pct = phase_cfg['layer_min_gap_pct']
+                atr_multiplier = phase_cfg['layer_min_gap_atr_multiplier']
         scale = 1.0 + max(layer_num - 2, 0) * depth_scale
         ratios = [max(base_pct, 0.0) * scale]
         if current_price > 0 and atr_value > 0 and atr_multiplier > 0:
@@ -796,14 +903,15 @@ class MartinBot:
         avg_price: float,
         atr_value: float = 0.0,
         pending_entry_price: Optional[float] = None,
+        phase: Optional[str] = None,
     ) -> float:
         spacing_ratio = self._gap_ratio(
             current_price=current_price,
             atr_value=atr_value,
-            base_pct=self.layer_min_gap_pct,
-            atr_multiplier=self.layer_min_gap_atr_multiplier,
             depth_scale=0.25,
             layer_num=layer_num,
+            phase=phase,
+            kind='spacing',
         )
         anchor_price = self._layer_anchor_price(
             side,
@@ -824,16 +932,17 @@ class MartinBot:
         current_price: float,
         next_layer: int,
         pending_entry_price: Optional[float] = None,
+        phase: Optional[str] = None,
     ) -> Tuple[bool, float, float]:
         avg_price = self._safe_float(position.get('entryPrice', self.state.entry_price or current_price), current_price)
         atr_value, _ = self._extract_latest_atr(limit=80)
         trigger_ratio = self._gap_ratio(
             current_price=current_price,
             atr_value=atr_value,
-            base_pct=self.layer_trigger_base_pct,
-            atr_multiplier=self.layer_trigger_atr_multiplier,
             depth_scale=0.50,
             layer_num=next_layer,
+            phase=phase,
+            kind='trigger',
         )
         anchor_price = self._layer_anchor_price(
             self.state.position_side or 'long',
@@ -868,6 +977,13 @@ class MartinBot:
         balance_snapshot: Optional[Dict[str, Any]] = None,
         anchor_pending_price: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
+        position = position or self.get_active_position()
+        phase = self._current_phase(position, current_price=current_price)
+        phase_cfg = self._phase_config(phase)
+        if layer_num > phase_cfg['max_layers']:
+            print(f"⚠️ 当前阶段 {phase} 最多执行到第{phase_cfg['max_layers']}层，跳过第{layer_num}层")
+            return None
+
         if self._exit_in_progress.is_set():
             print("⚠️ 当前正在执行平仓流程，跳过本层加仓")
             return None
@@ -885,7 +1001,6 @@ class MartinBot:
             print("⚠️ 未知持仓方向，无法加仓")
             return None
 
-        position = position or self.get_active_position()
         avg_price = self._safe_float(position.get('entryPrice', current_price)) if position else current_price
         side = self.state.position_side
 
@@ -913,10 +1028,15 @@ class MartinBot:
             avg_price=avg_price,
             atr_value=atr_value,
             pending_entry_price=anchor_pending_price,
+            phase=phase,
         )
         entry_price = self._price_to_precision(entry_price)
 
-        desired_margin = equity * self.first_order_ratio * self.layer_multipliers[layer_num - 1]
+        layer_multipliers = phase_cfg['layer_multipliers']
+        if layer_num > len(layer_multipliers):
+            print(f"⚠️ 当前阶段 {phase} 未配置第{layer_num}层倍率，跳过加仓")
+            return None
+        desired_margin = equity * phase_cfg['first_order_ratio'] * layer_multipliers[layer_num - 1]
         layer_margin = self._calculate_order_margin(
             desired_margin,
             balance_snapshot,
@@ -938,11 +1058,13 @@ class MartinBot:
             current_price,
             layer_num,
             pending_entry_price=anchor_pending_price,
+            phase=phase,
         )
         execute_price = self._price_to_precision(
             self._marketable_trigger_execute_price(side, entry_price, trigger_price)
         )
         return {
+            'phase': phase,
             'layer_num': layer_num,
             'order_side': order_side,
             'amount': amount,
@@ -963,8 +1085,8 @@ class MartinBot:
     def _log_add_order_plan(self, plan: Dict[str, Any]) -> None:
         layer_num = int(plan['layer_num'])
         print(
-            f"📋 第{layer_num}层: {plan['order_side'].upper()} {plan['amount']} @ {plan['entry_price']} "
-            f"(保证金 {plan['layer_margin']:.2f} USDT, 倍率 {self.layer_multipliers[layer_num - 1]})"
+            f"📋 [{plan['phase']}] 第{layer_num}层: {plan['order_side'].upper()} {plan['amount']} @ {plan['entry_price']} "
+            f"(保证金 {plan['layer_margin']:.2f} USDT, 倍率 {self._phase_config(plan['phase'])['layer_multipliers'][layer_num - 1]})"
         )
         print(
             f"   来源: {plan['source']} | 持仓均价: {plan['avg_price']:.2f} "
@@ -998,6 +1120,7 @@ class MartinBot:
                     order_type='limit',
                 )
                 print(f"✅ 第{layer_num}层条件加仓单已挂出")
+            self.state.phase = plan['phase']
             self.state.pending_layer = max(self.state.layer, min(layer_num, self.max_layers))
             self.state.pending_entry_price = plan['execute_price']
             self._save_runtime_state()
@@ -1059,15 +1182,21 @@ class MartinBot:
         if not add_orders:
             return
 
-        next_layer = self.state.layer + 1
-        if next_layer > self.max_layers:
-            return
-
         current_price = self._live_price_from_ws(position, allow_rest=True)
         if current_price <= 0:
             current_price = self._safe_float(position.get('markPrice', 0), self._safe_float(position.get('entryPrice', 0), 0.0))
         if current_price <= 0:
             print("⚠️ 启动检查时无法确定当前价格，跳过加仓单校验")
+            return
+
+        phase = self._current_phase(position, current_price=current_price)
+        phase_cfg = self._phase_config(phase)
+        next_layer = self.state.layer + 1
+        if next_layer > phase_cfg['max_layers']:
+            print(f"✅ 启动检查: 当前阶段 {phase} 无需保留第{next_layer}层加仓挂单")
+            if add_orders:
+                self._cancel_entry_orders(add_orders)
+                self.sync_state_with_exchange()
             return
 
         plan = self._build_add_order_plan(
@@ -1080,10 +1209,10 @@ class MartinBot:
             return
 
         if self._entry_orders_match_plan(add_orders, plan):
-            print("✅ 启动检查: 当前加仓挂单与最新参数一致，无需重挂")
+            print(f"✅ 启动检查: 当前阶段 {phase} 的加仓挂单与最新参数一致，无需重挂")
             return
 
-        print("♻️ 启动检查: 当前加仓挂单与最新参数不一致，撤单后按新参数重挂")
+        print(f"♻️ 启动检查: 当前阶段 {phase} 的加仓挂单与最新参数不一致，撤单后按新参数重挂")
         if not self._cancel_entry_orders(add_orders):
             return
 
@@ -1312,6 +1441,7 @@ class MartinBot:
             self.state = RuntimeState(
                 layer=raw.get('layer', 0),
                 pending_layer=raw.get('pending_layer', raw.get('layer', 0)),
+                phase=raw.get('phase', 'PHASE1'),
                 pending_entry_price=raw.get('pending_entry_price', 0.0),
                 last_fill_price=raw.get('last_fill_price', 0.0),
                 last_fill_time=raw.get('last_fill_time', ""),
@@ -1332,7 +1462,8 @@ class MartinBot:
             print(
                 f"✅ 加载状态: layer={self.state.layer}, "
                 f"best_profit={self.state.best_profit_pct*100:.2f}%, "
-                f"side={self.state.position_side}"
+                f"side={self.state.position_side}, "
+                f"phase={self.state.phase}"
             )
         except Exception as e:
             print(f"⚠️ 加载状态失败: {e}")
@@ -1364,11 +1495,22 @@ class MartinBot:
             'sr_timeframe': self.sr_timeframe,
             'max_layers': self.max_layers,
             'leverage': self.leverage,
+            'phase_switch_loss_pct': self.phase_switch_loss_pct,
+            'phase_switch_layer': self.phase_switch_layer,
             'trend_follow_enabled': self.trend_follow_enabled,
             'trend_follow_adx_threshold': self.trend_follow_adx_threshold,
             'mean_reversion_adx_max': self.mean_reversion_adx_max,
             'first_order_ratio': self.first_order_ratio,
             'layer_multipliers': self.layer_multipliers,
+            'phase1_max_layers': self.phase1_max_layers,
+            'phase1_first_order_ratio': self.phase1_first_order_ratio,
+            'phase1_layer_multipliers': self.phase1_layer_multipliers,
+            'phase1_layer_min_gap_pct': self.phase1_layer_min_gap_pct,
+            'phase1_layer_trigger_base_pct': self.phase1_layer_trigger_base_pct,
+            'phase2_max_layers': self.phase2_max_layers,
+            'phase2_layer_multipliers': self.phase2_layer_multipliers,
+            'phase2_layer_min_gap_pct': self.phase2_layer_min_gap_pct,
+            'phase2_layer_trigger_base_pct': self.phase2_layer_trigger_base_pct,
             'level_offset_pct': self.level_offset_pct,
             'add_layer_base_offset_pct': self.add_layer_base_offset_pct,
             'structure_min_gap_pct': self.structure_min_gap_pct,
@@ -2598,6 +2740,7 @@ class MartinBot:
             balance = self.get_wallet_balance() or 0
 
             self.state.layer = self.estimate_current_layer(contracts, price, balance)
+            self.state.phase = self._current_phase(position, current_price=price)
             self.state.pending_layer = (
                 min(self.max_layers, self.state.layer + 1)
                 if non_reduce_orders else self.state.layer
@@ -2640,11 +2783,18 @@ class MartinBot:
         print(f"  交易所: {getattr(self.exchange, 'name', 'Bitget')}")
         print(f"  交易对: {self.symbol}")
         print(f"  杠杆: {self.leverage}X")
-        print(f"  首仓: {self.first_order_ratio*100:.0f}%")
-        print(f"  加仓倍率: {self.layer_multipliers}")
+        print(f"  Phase1 首仓: {self.phase1_first_order_ratio*100:.2f}%")
+        print(f"  Phase1 层数/倍率: {self.phase1_max_layers} / {self.phase1_layer_multipliers}")
+        print(f"  Phase2 层数/倍率: {self.phase2_max_layers} / {self.phase2_layer_multipliers}")
+        print(
+            f"  阶段切换: 亏损达到 {self.phase_switch_loss_pct*100:.2f}% "
+            f"或层数达到 {self.phase_switch_layer}"
+        )
         print("=" * 60)
 
         self._bootstrap_exchange()
+        startup_position = self.get_active_position()
+        print(f"🧭 启动阶段: {self._current_phase(startup_position)}")
         self._reconcile_startup_entry_orders()
         self._start_ws_risk_monitor()
         self._write_live_snapshot(force=True, include_market=True)
@@ -2684,7 +2834,8 @@ class MartinBot:
                     # ====================================
                     elif self.state.bot_state == "IN_STRATEGY":
                         side_text = (self.state.position_side or "UNKNOWN").upper()
-                        print(f"\n--- [状态: IN_STRATEGY] ({side_text}) ---")
+                        current_phase = self._current_phase(position)
+                        print(f"\n--- [状态: IN_STRATEGY] ({side_text}, {current_phase}) ---")
 
                         # 1) 有持仓
                         if position:
@@ -2736,7 +2887,8 @@ class MartinBot:
 
                             # 只补下一层，不一次性全挂
                             next_layer = self.state.layer + 1
-                            if next_layer <= self.max_layers:
+                            phase_cfg = self._phase_config(current_phase)
+                            if next_layer <= phase_cfg['max_layers']:
                                 open_orders = self.fetch_open_orders()
                                 if open_orders is None:
                                     print("⚠️ 当前无法确认挂单状态，先不补挂，下一轮再试")
@@ -2771,7 +2923,13 @@ class MartinBot:
                                     self._set_runtime_flag('pending_layer', self.state.layer)
                                 if self.state.pending_entry_price != 0.0:
                                     self._set_runtime_flag('pending_entry_price', 0.0)
-                                print(f"⚠️ 已达最后一层 {self.max_layers}，不再补挂，只做风控和止盈")
+                                if current_phase == 'PHASE1':
+                                    print(
+                                        f"⚠️ 已达 PHASE1 阶段上限 {phase_cfg['max_layers']}，"
+                                        f"等待亏损达到 {self.phase_switch_loss_pct*100:.2f}% 或更深层级后再切到 PHASE2"
+                                    )
+                                else:
+                                    print(f"⚠️ 已达最后一层 {phase_cfg['max_layers']}，不再补挂，只做风控和止盈")
 
                         # 2) 无持仓，但可能有挂单
                         else:
