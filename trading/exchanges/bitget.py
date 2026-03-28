@@ -1133,6 +1133,69 @@ class BitgetExchangeAdapter(ExchangeAdapter):
 
         return success_list
 
+    def cancel_orders(self, orders: list[dict[str, Any]], symbol: str | None = None):
+        if not orders:
+            return []
+        target_symbol = symbol or self.symbol
+        normal_orders = [order for order in orders if order.get("type") != "trigger"]
+        trigger_orders = [order for order in orders if order.get("type") == "trigger" or order.get("planType") == "normal_plan"]
+        success_list: list[dict[str, Any]] = []
+
+        if normal_orders:
+            payload = {
+                "symbol": symbol_to_inst_id(target_symbol),
+                "productType": self.inst_type,
+                "marginCoin": self.margin_coin,
+                "orderIdList": [
+                    {"orderId": order["id"]}
+                    for order in normal_orders
+                    if order.get("id")
+                ],
+            }
+            if payload["orderIdList"]:
+                try:
+                    data = self._retry("取消挂单", self._private_post, "/api/v2/mix/order/batch-cancel-orders", payload) or {}
+                    success_list.extend(data.get("successList", []))
+                    failure_list = data.get("failureList", [])
+                    if failure_list:
+                        for failed in failure_list:
+                            print(f"⚠️ 撤单失败: {failed.get('orderId') or failed.get('clientOid')} - {failed.get('errorMsg')}")
+                except Exception:
+                    for order in normal_orders:
+                        cancel_payload = {
+                            "symbol": symbol_to_inst_id(target_symbol),
+                            "productType": self.inst_type,
+                            "marginCoin": self.margin_coin,
+                            "orderId": order.get("id"),
+                        }
+                        result = self._retry("取消挂单", self._private_post, "/api/v2/mix/order/cancel-order", cancel_payload) or {}
+                        success_list.append(result)
+
+        if trigger_orders:
+            trigger_payload = {
+                "symbol": symbol_to_inst_id(target_symbol),
+                "productType": self.inst_type,
+                "marginCoin": self.margin_coin,
+                "planType": "normal_plan",
+                "orderIdList": [
+                    {
+                        "orderId": order.get("id") or "",
+                        "clientOid": order.get("clientOrderId") or "",
+                    }
+                    for order in trigger_orders
+                    if order.get("id") or order.get("clientOrderId")
+                ],
+            }
+            if trigger_payload["orderIdList"]:
+                data = self._retry("取消触发单", self._private_post, "/api/v2/mix/order/cancel-plan-order", trigger_payload) or {}
+                success_list.extend(data.get("successList", []))
+                failure_list = data.get("failureList", [])
+                if failure_list:
+                    for failed in failure_list:
+                        print(f"⚠️ 取消触发单失败: {failed.get('orderId') or failed.get('clientOid')} - {failed.get('errorMsg')}")
+
+        return success_list
+
     def create_trigger_order(
         self,
         symbol: str,

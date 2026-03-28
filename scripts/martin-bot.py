@@ -764,10 +764,19 @@ class MartinBot:
         order = non_reduce_orders[0]
         return self._safe_float(order.get('price', 0))
 
-    def _layer_anchor_price(self, side: str, current_price: float, avg_price: float) -> float:
+    def _layer_anchor_price(
+        self,
+        side: str,
+        current_price: float,
+        avg_price: float,
+        pending_entry_price: Optional[float] = None,
+    ) -> float:
         candidates = [
             self._safe_float(self.state.last_fill_price, 0.0),
-            self._safe_float(self.state.pending_entry_price, 0.0),
+            self._safe_float(
+                self.state.pending_entry_price if pending_entry_price is None else pending_entry_price,
+                0.0,
+            ),
             self._safe_float(avg_price, 0.0),
             self._safe_float(current_price, 0.0),
         ]
@@ -786,6 +795,7 @@ class MartinBot:
         current_price: float,
         avg_price: float,
         atr_value: float = 0.0,
+        pending_entry_price: Optional[float] = None,
     ) -> float:
         spacing_ratio = self._gap_ratio(
             current_price=current_price,
@@ -795,7 +805,12 @@ class MartinBot:
             depth_scale=0.25,
             layer_num=layer_num,
         )
-        anchor_price = self._layer_anchor_price(side, current_price, avg_price)
+        anchor_price = self._layer_anchor_price(
+            side,
+            current_price,
+            avg_price,
+            pending_entry_price=pending_entry_price,
+        )
         if anchor_price <= 0:
             return proposed_price
 
@@ -808,6 +823,7 @@ class MartinBot:
         position: Dict[str, Any],
         current_price: float,
         next_layer: int,
+        pending_entry_price: Optional[float] = None,
     ) -> Tuple[bool, float, float]:
         avg_price = self._safe_float(position.get('entryPrice', self.state.entry_price or current_price), current_price)
         atr_value, _ = self._extract_latest_atr(limit=80)
@@ -819,7 +835,12 @@ class MartinBot:
             depth_scale=0.50,
             layer_num=next_layer,
         )
-        anchor_price = self._layer_anchor_price(self.state.position_side or 'long', current_price, avg_price)
+        anchor_price = self._layer_anchor_price(
+            self.state.position_side or 'long',
+            current_price,
+            avg_price,
+            pending_entry_price=pending_entry_price,
+        )
         if anchor_price <= 0 or current_price <= 0:
             return False, 0.0, trigger_ratio
 
@@ -838,6 +859,239 @@ class MartinBot:
         if side == 'short':
             return min(entry_price, trigger_price)
         return max(entry_price, trigger_price)
+
+    def _build_add_order_plan(
+        self,
+        layer_num: int,
+        current_price: float,
+        position: Optional[Dict[str, Any]] = None,
+        balance_snapshot: Optional[Dict[str, Any]] = None,
+        anchor_pending_price: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if self._exit_in_progress.is_set():
+            print("⚠️ 当前正在执行平仓流程，跳过本层加仓")
+            return None
+
+        balance_snapshot = balance_snapshot or self.get_balance_snapshot()
+        if balance_snapshot is None:
+            print("❌ 余额不足")
+            return None
+        equity = self._safe_float(balance_snapshot.get('equity', 0))
+        if equity < self.min_balance:
+            print("❌ 余额不足")
+            return None
+
+        if not self.state.position_side:
+            print("⚠️ 未知持仓方向，无法加仓")
+            return None
+
+        position = position or self.get_active_position()
+        avg_price = self._safe_float(position.get('entryPrice', current_price)) if position else current_price
+        side = self.state.position_side
+
+        structure_price, sr = self._select_structure_entry_price(side, layer_num, current_price, avg_price)
+        if structure_price is not None:
+            entry_price = structure_price
+            source = "STRUCTURE"
+        else:
+            atr_price = self._select_atr_entry_price(side, layer_num, current_price, avg_price)
+            if atr_price is not None:
+                entry_price = atr_price
+                source = "ATR"
+            else:
+                entry_price = self._select_fallback_entry_price(side, layer_num, current_price, avg_price)
+                source = "FALLBACK"
+
+        atr_value = self._safe_float((sr or {}).get('atr', 0.0), 0.0)
+        if atr_value <= 0:
+            atr_value, _ = self._extract_latest_atr(limit=80)
+        entry_price = self._enforce_layer_spacing(
+            proposed_price=entry_price,
+            side=side,
+            layer_num=layer_num,
+            current_price=current_price,
+            avg_price=avg_price,
+            atr_value=atr_value,
+            pending_entry_price=anchor_pending_price,
+        )
+        entry_price = self._price_to_precision(entry_price)
+
+        desired_margin = equity * self.first_order_ratio * self.layer_multipliers[layer_num - 1]
+        layer_margin = self._calculate_order_margin(
+            desired_margin,
+            balance_snapshot,
+            f"第{layer_num}层",
+        )
+        if layer_margin < self.min_balance:
+            print("❌ 当前可新增保证金不足，跳过本层加仓")
+            return None
+
+        order_side = 'sell' if side == 'short' else 'buy'
+        amount = (layer_margin * self.leverage) / entry_price
+        amount = self._normalize_amount(amount)
+        if amount <= 0:
+            print("❌ 加仓数量低于交易所最小下单量")
+            return None
+
+        ready, trigger_price, trigger_ratio = self._next_layer_trigger_ready(
+            position or {},
+            current_price,
+            layer_num,
+            pending_entry_price=anchor_pending_price,
+        )
+        execute_price = self._price_to_precision(
+            self._marketable_trigger_execute_price(side, entry_price, trigger_price)
+        )
+        return {
+            'layer_num': layer_num,
+            'order_side': order_side,
+            'amount': amount,
+            'entry_price': entry_price,
+            'execute_price': execute_price,
+            'trigger_price': self._price_to_precision(trigger_price) if trigger_price > 0 else 0.0,
+            'trigger_ratio': trigger_ratio,
+            'ready': ready,
+            'source': source,
+            'avg_price': avg_price,
+            'current_price': current_price,
+            'layer_margin': layer_margin,
+            'sr': sr,
+            'position': position,
+            'side': side,
+        }
+
+    def _log_add_order_plan(self, plan: Dict[str, Any]) -> None:
+        layer_num = int(plan['layer_num'])
+        print(
+            f"📋 第{layer_num}层: {plan['order_side'].upper()} {plan['amount']} @ {plan['entry_price']} "
+            f"(保证金 {plan['layer_margin']:.2f} USDT, 倍率 {self.layer_multipliers[layer_num - 1]})"
+        )
+        print(
+            f"   来源: {plan['source']} | 持仓均价: {plan['avg_price']:.2f} "
+            f"| 当前价: {plan['current_price']:.2f}"
+        )
+        sr = plan.get('sr')
+        if sr:
+            print(f"   最新阻力: {[f'{x:.2f}' for x in sr['resistance']]}")
+            print(f"   最新支撑: {[f'{x:.2f}' for x in sr['support']]}")
+        if plan['trigger_price'] > 0:
+            print(
+                f"   下一层启动价: {plan['trigger_price']:.2f} | 实际触发委托价: {plan['execute_price']:.2f} "
+                f"| 最小不利波动: {plan['trigger_ratio']*100:.2f}%"
+            )
+
+    def _submit_add_order_plan(self, plan: Dict[str, Any]) -> bool:
+        layer_num = int(plan['layer_num'])
+        try:
+            if plan['ready']:
+                if not self._submit_entry_order(plan['order_side'], plan['amount'], plan['execute_price'], f"第{layer_num}层"):
+                    return False
+                print(f"✅ 第{layer_num}层加仓单已直接挂出")
+            else:
+                self.exchange.create_trigger_order(
+                    self.symbol,
+                    plan['order_side'],
+                    plan['amount'],
+                    plan['trigger_price'],
+                    price=plan['execute_price'],
+                    trigger_type=self.layer_trigger_type,
+                    order_type='limit',
+                )
+                print(f"✅ 第{layer_num}层条件加仓单已挂出")
+            self.state.pending_layer = max(self.state.layer, min(layer_num, self.max_layers))
+            self.state.pending_entry_price = plan['execute_price']
+            self._save_runtime_state()
+            self._write_live_snapshot(force=True, include_market=True)
+            return True
+        except Exception as e:
+            print(f"❌ 加仓失败: {e}")
+            return False
+
+    def _entry_orders_match_plan(self, orders: List[Dict[str, Any]], plan: Dict[str, Any]) -> bool:
+        if len(orders) != 1:
+            return False
+        order = orders[0]
+        if str(order.get('side', '')).lower() != str(plan['order_side']).lower():
+            return False
+        if self._normalize_amount(self._safe_float(order.get('amount', 0.0), 0.0)) != plan['amount']:
+            return False
+
+        existing_price = self._price_to_precision(self._safe_float(order.get('price', 0.0), 0.0))
+        if existing_price != plan['execute_price']:
+            return False
+
+        if plan['ready']:
+            return str(order.get('type', '')).lower() != 'trigger'
+
+        if str(order.get('type', '')).lower() != 'trigger':
+            return False
+        existing_trigger = self._price_to_precision(self._safe_float(order.get('triggerPrice', 0.0), 0.0))
+        return existing_trigger == plan['trigger_price']
+
+    def _cancel_entry_orders(self, orders: List[Dict[str, Any]]) -> bool:
+        targets = [order for order in orders if not order.get('reduceOnly', False)]
+        if not targets:
+            return True
+        cancel_fn = getattr(self.exchange, 'cancel_orders', None)
+        if not callable(cancel_fn):
+            print("⚠️ 交易所适配器不支持定向撤单，跳过加仓单重建")
+            return False
+        with self.action_lock:
+            try:
+                cancel_fn(targets, self.symbol)
+                print(f"✅ 已撤销 {len(targets)} 个旧加仓挂单")
+                return True
+            except Exception as e:
+                print(f"⚠️ 定向撤销加仓挂单失败: {e}")
+                return False
+
+    def _reconcile_startup_entry_orders(self) -> None:
+        position = self.get_active_position()
+        if not position:
+            return
+
+        open_orders = self.fetch_open_orders()
+        if open_orders is None:
+            print("⚠️ 启动检查时无法获取挂单，跳过加仓单校验")
+            return
+
+        add_orders = [order for order in open_orders if not order.get('reduceOnly', False)]
+        if not add_orders:
+            return
+
+        next_layer = self.state.layer + 1
+        if next_layer > self.max_layers:
+            return
+
+        current_price = self._live_price_from_ws(position, allow_rest=True)
+        if current_price <= 0:
+            current_price = self._safe_float(position.get('markPrice', 0), self._safe_float(position.get('entryPrice', 0), 0.0))
+        if current_price <= 0:
+            print("⚠️ 启动检查时无法确定当前价格，跳过加仓单校验")
+            return
+
+        plan = self._build_add_order_plan(
+            next_layer,
+            current_price,
+            position=position,
+            anchor_pending_price=0.0,
+        )
+        if plan is None:
+            return
+
+        if self._entry_orders_match_plan(add_orders, plan):
+            print("✅ 启动检查: 当前加仓挂单与最新参数一致，无需重挂")
+            return
+
+        print("♻️ 启动检查: 当前加仓挂单与最新参数不一致，撤单后按新参数重挂")
+        if not self._cancel_entry_orders(add_orders):
+            return
+
+        if not self._submit_add_order_plan(plan):
+            print("⚠️ 启动检查: 重挂加仓单失败，保留下一轮主循环补挂")
+            return
+
+        self.sync_state_with_exchange()
 
     def _dynamic_tp_values(self, adx: float, volatility_pct: float) -> Tuple[float, float]:
         leverage = max(float(self.leverage), 1.0)
@@ -2285,23 +2539,6 @@ class MartinBot:
 
         print(f"\n--- 第 {layer_num} 层加仓 ---")
 
-        if self._exit_in_progress.is_set():
-            print("⚠️ 当前正在执行平仓流程，跳过本层加仓")
-            return False
-
-        balance_snapshot = self.get_balance_snapshot()
-        if balance_snapshot is None:
-            print("❌ 余额不足")
-            return False
-        equity = self._safe_float(balance_snapshot.get('equity', 0))
-        if equity < self.min_balance:
-            print("❌ 余额不足")
-            return False
-
-        if not self.state.position_side:
-            print("⚠️ 未知持仓方向，无法加仓")
-            return False
-
         open_orders = self.fetch_open_orders()
         if open_orders is None:
             print("⚠️ 当前无法确认挂单状态，跳过本层加仓，避免重复挂单")
@@ -2312,104 +2549,11 @@ class MartinBot:
             return False
 
         position = self.get_active_position()
-        avg_price = self._safe_float(position.get('entryPrice', current_price)) if position else current_price
-
-        side = self.state.position_side  # long / short
-
-        # 1) 优先结构位
-        structure_price, sr = self._select_structure_entry_price(side, layer_num, current_price, avg_price)
-
-        if structure_price is not None:
-            entry_price = structure_price
-            source = "STRUCTURE"
-        else:
-            # 2) ATR
-            atr_price = self._select_atr_entry_price(side, layer_num, current_price, avg_price)
-            if atr_price is not None:
-                entry_price = atr_price
-                source = "ATR"
-            else:
-                # 3) 固定偏移兜底
-                entry_price = self._select_fallback_entry_price(side, layer_num, current_price, avg_price)
-                source = "FALLBACK"
-
-        atr_value = self._safe_float((sr or {}).get('atr', 0.0), 0.0)
-        if atr_value <= 0:
-            atr_value, _ = self._extract_latest_atr(limit=80)
-        entry_price = self._enforce_layer_spacing(
-            proposed_price=entry_price,
-            side=side,
-            layer_num=layer_num,
-            current_price=current_price,
-            avg_price=avg_price,
-            atr_value=atr_value,
-        )
-
-        entry_price = self._price_to_precision(entry_price)
-
-        desired_margin = equity * self.first_order_ratio * self.layer_multipliers[layer_num - 1]
-        layer_margin = self._calculate_order_margin(
-            desired_margin,
-            balance_snapshot,
-            f"第{layer_num}层",
-        )
-        if layer_margin < self.min_balance:
-            print("❌ 当前可新增保证金不足，跳过本层加仓")
+        plan = self._build_add_order_plan(layer_num, current_price, position=position)
+        if plan is None:
             return False
-        order_side = 'sell' if side == 'short' else 'buy'
-
-        amount = (layer_margin * self.leverage) / entry_price
-        amount = self._normalize_amount(amount)
-
-        if amount <= 0:
-            print("❌ 加仓数量低于交易所最小下单量")
-            return False
-
-        ready, trigger_price, trigger_ratio = self._next_layer_trigger_ready(position or {}, current_price, layer_num)
-        execute_price = self._price_to_precision(
-            self._marketable_trigger_execute_price(side, entry_price, trigger_price)
-        )
-
-        print(
-            f"📋 第{layer_num}层: {order_side.upper()} {amount} @ {entry_price} "
-            f"(保证金 {layer_margin:.2f} USDT, 倍率 {self.layer_multipliers[layer_num - 1]})"
-        )
-        print(f"   来源: {source} | 持仓均价: {avg_price:.2f} | 当前价: {current_price:.2f}")
-
-        if sr:
-            print(f"   最新阻力: {[f'{x:.2f}' for x in sr['resistance']]}")
-            print(f"   最新支撑: {[f'{x:.2f}' for x in sr['support']]}")
-
-        if trigger_price > 0:
-            print(
-                f"   下一层启动价: {trigger_price:.2f} | 实际触发委托价: {execute_price:.2f} "
-                f"| 最小不利波动: {trigger_ratio*100:.2f}%"
-            )
-
-        try:
-            if ready:
-                if not self._submit_entry_order(order_side, amount, execute_price, f"第{layer_num}层"):
-                    return False
-                print(f"✅ 第{layer_num}层加仓单已直接挂出")
-            else:
-                self.exchange.create_trigger_order(
-                    self.symbol,
-                    order_side,
-                    amount,
-                    trigger_price,
-                    price=execute_price,
-                    trigger_type=self.layer_trigger_type,
-                    order_type='limit',
-                )
-                print(f"✅ 第{layer_num}层条件加仓单已挂出")
-            self.state.pending_layer = max(self.state.layer, min(layer_num, self.max_layers))
-            self.state.pending_entry_price = execute_price
-            self._save_runtime_state()
-            self._write_live_snapshot(force=True, include_market=True)
-            return True
-        except Exception as e:
-            print(f"❌ 加仓失败: {e}")
-            return False
+        self._log_add_order_plan(plan)
+        return self._submit_add_order_plan(plan)
 
     # =========================================================
     # 状态同步
@@ -2501,6 +2645,7 @@ class MartinBot:
         print("=" * 60)
 
         self._bootstrap_exchange()
+        self._reconcile_startup_entry_orders()
         self._start_ws_risk_monitor()
         self._write_live_snapshot(force=True, include_market=True)
 
