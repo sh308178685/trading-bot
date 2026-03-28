@@ -84,6 +84,12 @@ function translateState(value) {
   return value || "--";
 }
 
+function translatePhase(value) {
+  if (value === "PHASE1") return "PHASE1 试探";
+  if (value === "PHASE2") return "PHASE2 防守";
+  return value || "--";
+}
+
 function translateOrderType(item) {
   if (item.reduce_only) return "减仓";
   if (item.type === "limit") return "限价";
@@ -139,7 +145,7 @@ function renderMetrics(snapshot) {
     {
       label: "当前层级",
       value: `${snapshot.runtime.layer || 0}/${snapshot.strategy.max_layers}`,
-      detail: `${translateState(snapshot.runtime.bot_state)} | ${translateSide(snapshot.runtime.position_side)}`,
+      detail: `${translateState(snapshot.runtime.bot_state)} | ${translatePhase(snapshot.runtime.phase)}`,
     },
     {
       label: "当前信号",
@@ -236,6 +242,7 @@ function renderChart(targetId, series, options = {}) {
 function renderRuntimeFlags(snapshot) {
   const wrap = document.getElementById("runtime-flags");
   const flags = [
+    { label: "当前阶段", value: translatePhase(snapshot.runtime.phase) },
     { label: "最高浮盈", value: fmtPct(snapshot.runtime.best_profit_pct) },
     { label: "分批止盈 1", value: snapshot.runtime.partial_tp_1_done ? "已完成" : "未完成" },
     { label: "分批止盈 2", value: snapshot.runtime.partial_tp_2_done ? "已完成" : "未完成" },
@@ -376,6 +383,40 @@ function renderIndicators(snapshot) {
     ["ATR", fmtMoney(indicators.atr)],
     ["止盈激活值", fmtPct(indicators.dynamic_tp_activate_pct)],
     ["回撤比例", fmtPct(indicators.dynamic_tp_trail_ratio)],
+    ["动态分批止盈 1", fmtPct(indicators.dynamic_partial_tp1_pct)],
+    ["动态分批止盈 2", fmtPct(indicators.dynamic_partial_tp2_pct)],
+  ];
+
+  target.innerHTML = rows
+    .map(
+      ([label, value]) => `
+        <div class="definition-row">
+          <span>${label}</span>
+          <strong>${value}</strong>
+        </div>
+      `
+    )
+    .join("");
+}
+
+function renderPhaseOverview(snapshot) {
+  const target = document.getElementById("phase-overview");
+  if (!target) {
+    return;
+  }
+
+  const rows = [
+    ["当前阶段", translatePhase(snapshot.runtime.phase)],
+    ["切换亏损阈值", fmtPct((snapshot.strategy.phase_switch_loss_pct || 0) * 100)],
+    ["切换层数阈值", `第 ${snapshot.strategy.phase_switch_layer || "--"} 层`],
+    ["Phase1 层数", `${snapshot.strategy.phase1_max_layers || 0} 层`],
+    ["Phase2 额外层数", `${snapshot.strategy.phase2_extra_layers || 0} 层`],
+    ["Phase1 倍率", (snapshot.strategy.phase1_layer_multipliers || []).join(" / ") || "--"],
+    ["Phase2 倍率", (snapshot.strategy.phase2_layer_multipliers || []).join(" / ") || "--"],
+    [
+      "动态分批止盈",
+      `${fmtPct(snapshot.market.indicators.dynamic_partial_tp1_pct)} / ${fmtPct(snapshot.market.indicators.dynamic_partial_tp2_pct)}`,
+    ],
   ];
 
   target.innerHTML = rows
@@ -454,11 +495,11 @@ function renderLadder(snapshot) {
     .map((item) => {
       const progress = (item.layer / snapshot.strategy.max_layers) * 100;
       return `
-        <div class="ladder-item">
+        <div class="ladder-item ${String(item.phase || "").toLowerCase()}">
           <div class="ladder-head">
             <div>
               <strong>第 ${item.layer} 层</strong>
-              <div class="panel-note">${translateState(item.state)} | x${fmtNumber(item.multiplier, 2)}</div>
+              <div class="panel-note">${translatePhase(item.phase)} | ${translateState(item.state)} | x${fmtNumber(item.multiplier, 2)}</div>
             </div>
             <div>
               <strong>${fmtMoney(item.margin_estimate)}</strong>
@@ -466,9 +507,10 @@ function renderLadder(snapshot) {
             </div>
           </div>
           <div class="progress-track">
-            <div class="progress-bar" style="width:${progress}%"></div>
+            <div class="progress-bar ${String(item.phase || "").toLowerCase()}" style="width:${progress}%"></div>
           </div>
           <div class="action-meta">
+            <span class="phase-chip ${String(item.phase || "").toLowerCase()}">${item.phase_label || translatePhase(item.phase)}</span>
             <span>数量 ${qty.format(item.amount_estimate)}</span>
             <span>预估价 ${item.projected_price ? fmtMoney(item.projected_price) : "--"}</span>
             <span>${translateSource(item.price_source)}</span>
@@ -615,10 +657,19 @@ function renderHeader(snapshot) {
   setText("equity-current", fmtMoney(snapshot.performance.equity_estimate));
   setText("pnl-current", fmtMoney(snapshot.performance.unrealized_pnl));
   setText("price-current", fmtMoney(snapshot.market.indicators.price));
-  setText("ladder-note", `已完成 ${snapshot.runtime.layer || 0} 层 / 最大 ${snapshot.strategy.max_layers} 层`);
+  setText(
+    "ladder-note",
+    `当前 ${translatePhase(snapshot.runtime.phase)} | 已完成 ${snapshot.runtime.layer || 0} 层 / 总最大 ${snapshot.strategy.max_layers} 层`
+  );
 
   const modePill = document.getElementById("mode-pill");
   modePill.textContent = `${translateMode(snapshot.strategy.mode)} | ${snapshot.strategy.symbol}`;
+
+  const phasePill = document.getElementById("phase-pill");
+  if (phasePill) {
+    phasePill.textContent = `${translatePhase(snapshot.runtime.phase)} | 切换亏损 ${fmtPct((snapshot.strategy.phase_switch_loss_pct || 0) * 100)}`;
+    phasePill.className = `phase-pill ${String(snapshot.runtime.phase || "").toLowerCase()}`;
+  }
 
   const stalePill = document.getElementById("stale-pill");
   stalePill.textContent = snapshot.server.stale ? "缓存快照" : "实时快照";
@@ -636,6 +687,7 @@ function applySnapshot(snapshot) {
   renderRuntimeFlags(snapshot);
   renderNextAction(snapshot);
   renderIndicators(snapshot);
+  renderPhaseOverview(snapshot);
   renderLevels("support-list", snapshot.market.support_resistance.support || [], {
     selectedPrice: pricing?.reference_type === "support" ? pricing.reference_price : 0,
   });

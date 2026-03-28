@@ -83,6 +83,17 @@ class DashboardBotProfile:
         self.leverage = safe_float(config.get("leverage", 3), 3)
         self.first_order_ratio = safe_float(config.get("first_order_ratio", 0.1), 0.1)
         self.layer_multipliers = list(config.get("layer_multipliers", [1, 1.5, 2, 2.5, 3]))
+        self.phase_switch_loss_pct = safe_float(config.get("phase_switch_loss_pct", 0.025), 0.025)
+        self.phase_switch_layer = int(config.get("phase_switch_layer", 4) or 4)
+        self.phase1_max_layers = int(config.get("phase1_max_layers", self.max_layers) or self.max_layers)
+        self.phase2_extra_layers = int(config.get("phase2_extra_layers", max(self.max_layers - self.phase1_max_layers, 0)) or 0)
+        self.phase1_first_order_ratio = safe_float(config.get("phase1_first_order_ratio", self.first_order_ratio), self.first_order_ratio)
+        self.phase1_layer_multipliers = list(config.get("phase1_layer_multipliers", self.layer_multipliers[: self.phase1_max_layers]))
+        self.phase2_layer_multipliers = list(config.get("phase2_layer_multipliers", self.layer_multipliers[self.phase1_max_layers :]))
+        self.current_phase = "PHASE1"
+        self.dynamic_partial_tp1_pct = 0.0
+        self.dynamic_partial_tp2_pct = 0.0
+        self.dynamic_partial_tp_phase = "PHASE1"
         self.level_offset_pct = safe_float(config.get("level_offset_pct", 0.001), 0.001)
         self.add_layer_base_offset_pct = safe_float(config.get("add_layer_base_offset_pct", 0.005), 0.005)
         self.rsi_threshold = safe_float(config.get("rsi_threshold", 50), 50)
@@ -121,10 +132,32 @@ class DashboardBotProfile:
         self.leverage = safe_float(strategy.get("leverage", self.leverage), self.leverage)
         self.first_order_ratio = safe_float(strategy.get("first_order_ratio", self.first_order_ratio), self.first_order_ratio)
         self.layer_multipliers = list(strategy.get("layer_multipliers") or self.layer_multipliers)
+        self.phase_switch_loss_pct = safe_float(strategy.get("phase_switch_loss_pct", self.phase_switch_loss_pct), self.phase_switch_loss_pct)
+        self.phase_switch_layer = int(strategy.get("phase_switch_layer") or self.phase_switch_layer)
+        self.phase1_max_layers = int(strategy.get("phase1_max_layers") or self.phase1_max_layers)
+        self.phase2_extra_layers = int(strategy.get("phase2_extra_layers") or self.phase2_extra_layers)
+        self.phase1_first_order_ratio = safe_float(
+            strategy.get("phase1_first_order_ratio", self.phase1_first_order_ratio),
+            self.phase1_first_order_ratio,
+        )
+        self.phase1_layer_multipliers = list(strategy.get("phase1_layer_multipliers") or self.phase1_layer_multipliers)
+        self.phase2_layer_multipliers = list(strategy.get("phase2_layer_multipliers") or self.phase2_layer_multipliers)
+        self.current_phase = str((snapshot.get("runtime") or {}).get("phase") or self.current_phase).upper()
         self.transport = str(strategy.get("transport") or self.transport)
         self.price_precision = strategy.get("price_precision")
         self.amount_precision = strategy.get("amount_precision")
         self.latest_atr = safe_float(indicators.get("atr", self.latest_atr))
+        self.dynamic_partial_tp1_pct = safe_float(
+            indicators.get("dynamic_partial_tp1_pct", self.dynamic_partial_tp1_pct),
+            self.dynamic_partial_tp1_pct,
+        )
+        self.dynamic_partial_tp2_pct = safe_float(
+            indicators.get("dynamic_partial_tp2_pct", self.dynamic_partial_tp2_pct),
+            self.dynamic_partial_tp2_pct,
+        )
+        self.dynamic_partial_tp_phase = str(
+            indicators.get("dynamic_partial_tp_phase") or self.dynamic_partial_tp_phase
+        ).upper()
 
     def strategy_payload(self) -> dict[str, Any]:
         payload = {
@@ -137,6 +170,13 @@ class DashboardBotProfile:
             "leverage": self.leverage,
             "first_order_ratio": self.first_order_ratio,
             "layer_multipliers": self.layer_multipliers,
+            "phase_switch_loss_pct": self.phase_switch_loss_pct,
+            "phase_switch_layer": self.phase_switch_layer,
+            "phase1_max_layers": self.phase1_max_layers,
+            "phase2_extra_layers": self.phase2_extra_layers,
+            "phase1_first_order_ratio": self.phase1_first_order_ratio,
+            "phase1_layer_multipliers": self.phase1_layer_multipliers,
+            "phase2_layer_multipliers": self.phase2_layer_multipliers,
             "trend_follow_adx_threshold": self.trend_follow_adx_threshold,
             "mean_reversion_adx_max": self.mean_reversion_adx_max,
             "transport": self.transport,
@@ -146,6 +186,25 @@ class DashboardBotProfile:
         if self.amount_precision is not None:
             payload["amount_precision"] = self.amount_precision
         return payload
+
+    def layer_phase(self, layer: int) -> str:
+        return "PHASE1" if layer <= self.phase1_max_layers else "PHASE2"
+
+    def layer_multiplier(self, layer: int) -> float:
+        if layer <= 0:
+            return 0.0
+        if layer <= self.phase1_max_layers:
+            index = layer - 1
+            if index < len(self.phase1_layer_multipliers):
+                return safe_float(self.phase1_layer_multipliers[index], 0.0)
+        else:
+            index = layer - self.phase1_max_layers - 1
+            if index < len(self.phase2_layer_multipliers):
+                return safe_float(self.phase2_layer_multipliers[index], 0.0)
+        index = layer - 1
+        if index < len(self.layer_multipliers):
+            return safe_float(self.layer_multipliers[index], 0.0)
+        return 0.0
 
     def _price_to_precision(self, numeric: float) -> float:
         precision = self.price_precision
@@ -265,6 +324,8 @@ class DashboardService:
                 "bot_state": runtime.get("bot_state", "IDLE"),
                 "layer": int(runtime.get("layer", 0) or 0),
                 "pending_layer": int(runtime.get("pending_layer", runtime.get("layer", 0)) or 0),
+                "phase": str(runtime.get("phase", "PHASE1")).upper(),
+                "last_phase": str(runtime.get("last_phase", runtime.get("phase", "PHASE1"))).upper(),
                 "position_side": runtime.get("position_side"),
                 "best_profit_pct": safe_float(runtime.get("best_profit_pct", 0)) * 100,
                 "last_known_contracts": safe_float(runtime.get("last_known_contracts", 0)),
@@ -649,7 +710,9 @@ class DashboardService:
         reference_price = safe_float(position.get("entry_price", 0)) if position else current_price
 
         for layer in range(1, self.bot.max_layers + 1):
-            margin = balance_total * self.bot.first_order_ratio * self.bot.layer_multipliers[layer - 1]
+            phase = self.bot.layer_phase(layer)
+            multiplier = self.bot.layer_multiplier(layer)
+            margin = balance_total * self.bot.phase1_first_order_ratio * multiplier
             estimated_amount = 0.0
             if reference_price > 0:
                 estimated_amount = (margin * self.bot.leverage) / reference_price
@@ -683,8 +746,10 @@ class DashboardService:
             ladder.append(
                 {
                     "layer": layer,
+                    "phase": phase,
+                    "phase_label": "试探阶段" if phase == "PHASE1" else "防守阶段",
                     "state": state,
-                    "multiplier": self.bot.layer_multipliers[layer - 1],
+                    "multiplier": multiplier,
                     "margin_estimate": margin,
                     "amount_estimate": estimated_amount,
                     "projected_price": safe_float((plan or {}).get("final_price", 0)),
