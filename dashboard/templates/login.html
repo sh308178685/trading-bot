@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>马丁策略指挥台登录</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body class="auth-body">
+    <div class="aurora aurora-a"></div>
+    <div class="aurora aurora-b"></div>
+    <main class="auth-shell">
+      <section class="auth-card">
+        <p class="eyebrow">安全访问</p>
+        <h1>马丁策略指挥台</h1>
+        <p class="auth-copy">
+          Bitget 马丁策略专属控制面板。
+          登录后可查看执行过程、盈亏表现和层级仓位。
+        </p>
+
+        {% if error %}
+          <div class="auth-error">{{ error }}</div>
+        {% endif %}
+
+        <form method="post" class="auth-form">
+          <input type="hidden" name="next" value="{{ next_url }}">
+          <label class="auth-field">
+            <span>用户名</span>
+            <input type="text" name="username" value="{{ username_hint }}" autocomplete="username" required>
+          </label>
+          <label class="auth-field">
+            <span>密码</span>
+            <input type="password" name="password" autocomplete="current-password" required>
+          </label>
+          <button type="submit" class="primary-button">进入面板</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>

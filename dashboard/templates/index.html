@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>马丁策略指挥台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="aurora aurora-a"></div>
+    <div class="aurora aurora-b"></div>
+    <main class="page-shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Bitget 马丁策略控制台</p>
+          <h1>马丁策略指挥台</h1>
+          <p class="hero-copy">
+            一个面向马丁策略机器人的实时运营面板。
+            在一个页面里集中查看执行过程、仓位暴露、层级推进、信号变化和收益表现。
+          </p>
+        </div>
+        <div class="hero-side">
+          <div class="badge-row">
+            <span class="live-pill" id="mode-pill">加载中</span>
+            <span class="ghost-pill" id="stale-pill">同步中</span>
+          </div>
+          <div class="hero-stat">
+            <span>最近更新时间</span>
+            <strong id="last-update">--</strong>
+          </div>
+          <div class="hero-stat">
+            <span>刷新频率</span>
+            <strong id="refresh-cadence">5s</strong>
+          </div>
+          <div class="hero-actions">
+            <button type="button" class="primary-button" id="refresh-button">立即刷新</button>
+            {% if auth_enabled %}
+              <a class="secondary-button" href="{{ url_for('logout') }}">退出 {{ auth_user }}</a>
+            {% else %}
+              <span class="ghost-pill">开放访问</span>
+            {% endif %}
+          </div>
+        </div>
+      </section>
+
+      <section class="metrics-grid" id="metrics-grid"></section>
+
+      <section class="panel-grid analytics-grid">
+        <article class="panel panel-xl">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">执行分析</p>
+              <h2>交易归因</h2>
+            </div>
+            <div class="panel-note" id="analytics-note">最近成交</div>
+          </div>
+          <div class="metrics-inline-grid" id="analytics-grid"></div>
+          <div class="stack-card">
+            <h3>当前交易轮次</h3>
+            <div class="definition-list" id="open-cycle"></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">已完成轮次</p>
+              <h2>最近策略回合</h2>
+            </div>
+          </div>
+          <div class="table-shell">
+            <table>
+              <thead>
+                <tr>
+                  <th>开始时间</th>
+                  <th>方向</th>
+                  <th>净收益</th>
+                  <th>持续时长</th>
+                </tr>
+              </thead>
+              <tbody id="cycles-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel-grid top-grid">
+        <article class="panel panel-xl">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">收益表现</p>
+              <h2>权益与盈亏曲线</h2>
+            </div>
+            <div class="panel-note" id="equity-note">等待快照</div>
+          </div>
+          <div class="chart-stack">
+            <div class="chart-card">
+              <div class="chart-title-row">
+                <span>权益估算</span>
+                <span id="equity-current">--</span>
+              </div>
+              <div class="chart-wrap" id="equity-chart"></div>
+            </div>
+            <div class="chart-card">
+              <div class="chart-title-row">
+                <span>浮动盈亏</span>
+                <span id="pnl-current">--</span>
+              </div>
+              <div class="chart-wrap" id="pnl-chart"></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">执行计划</p>
+              <h2>下一步动作</h2>
+            </div>
+          </div>
+          <div class="next-action" id="next-action"></div>
+          <div class="mini-grid" id="runtime-flags"></div>
+        </article>
+      </section>
+
+      <section class="panel-grid middle-grid">
+        <article class="panel panel-xl">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">市场结构</p>
+              <h2>价格、趋势与信号引擎</h2>
+            </div>
+            <div class="signal-badge" id="signal-badge">等待</div>
+          </div>
+          <div class="chart-card market-chart">
+            <div class="chart-title-row">
+              <span>价格路径</span>
+              <span id="price-current">--</span>
+            </div>
+            <div class="chart-wrap" id="price-chart"></div>
+          </div>
+          <div class="triple-grid">
+            <div class="stack-card">
+              <h3>指标面板</h3>
+              <div class="definition-list" id="indicator-list"></div>
+            </div>
+            <div class="stack-card">
+              <h3>支撑位</h3>
+              <div class="level-stack" id="support-list"></div>
+            </div>
+            <div class="stack-card">
+              <h3>阻力位</h3>
+              <div class="level-stack" id="resistance-list"></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">仓位暴露</p>
+              <h2>持仓脉搏</h2>
+            </div>
+          </div>
+          <div class="position-card" id="position-card"></div>
+        </article>
+      </section>
+
+      <section class="panel-grid bottom-grid">
+        <article class="panel panel-xl">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">层级结构</p>
+              <h2>执行阶梯</h2>
+            </div>
+            <div class="panel-note" id="ladder-note">策略层级</div>
+          </div>
+          <div class="ladder-list" id="ladder-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">挂单概览</p>
+              <h2>当前订单栈</h2>
+            </div>
+          </div>
+          <div class="orders-summary" id="orders-summary"></div>
+          <div class="table-shell">
+            <table>
+              <thead>
+                <tr>
+                  <th>方向</th>
+                  <th>类型</th>
+                  <th>价格</th>
+                  <th>数量</th>
+                  <th>距离</th>
+                </tr>
+              </thead>
+              <tbody id="orders-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel-grid logs-grid">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">交易过程</p>
+              <h2>事件时间线</h2>
+            </div>
+          </div>
+          <div class="timeline" id="event-tape"></div>
+        </article>
+
+        <article class="panel panel-xl">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">成交记录</p>
+              <h2>最近私有成交</h2>
+            </div>
+          </div>
+          <div class="table-shell">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>方向</th>
+                  <th>价格</th>
+                  <th>数量</th>
+                  <th>成交额</th>
+                  <th>手续费</th>
+                </tr>
+              </thead>
+              <tbody id="trades-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="warning-strip" id="warning-strip"></section>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

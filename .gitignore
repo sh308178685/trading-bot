@@ -1,0 +1,26 @@
+# Local secrets
+/config/config.json
+/.env
+/.env.*
+!/config/config.example.json
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+/.venv/
+/.deps/
+/.deps-local/
+/wheelhouse/
+/.codex-tmp/
+
+# Runtime artifacts
+/data/
+/logs/
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,481 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © 傻逼1号 - Bitget马丁策略回测版
+// 策略逻辑忠实还原自 martin-bot.py
+
+//@version=5
+strategy("马丁策略 - Bitget版回测", overlay=true, initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.06, slippage=2, pyramiding=0)
+
+// ==================== 参数 ====================
+i_leverage             = input.int(3, "杠杆倍数", minval=1, maxval=125)
+i_fast_ema             = input.int(20, "快线EMA周期", minval=5, maxval=100)
+i_slow_ema             = input.int(50, "慢线EMA周期", minval=10, maxval=200)
+i_rsi_threshold        = input.float(50.0, "RSI阈值")
+i_adx_threshold        = input.float(16.5, "ADX阈值", step=0.5)
+i_max_layers           = input.int(5, "最大加仓层数", minval=1, maxval=10)
+i_first_order_ratio    = input.float(0.10, "首仓保证金比例", step=0.01)
+i_layer_mult_1         = input.float(1.0, "第1层倍率")
+i_layer_mult_2         = input.float(1.5, "第2层倍率")
+i_layer_mult_3         = input.float(2.0, "第3层倍率")
+i_layer_mult_4         = input.float(2.5, "第4层倍率")
+i_layer_mult_5         = input.float(3.0, "第5层倍率")
+i_level_offset_pct     = input.float(0.001, "结构位偏移", step=0.0001)   // 0.1%
+i_add_layer_base_off   = input.float(0.005, "加仓固定偏移", step=0.001) // 0.5% * layer
+i_max_loss_pct         = input.float(0.50, "最大亏损%", step=0.01)      // -50%
+i_fee_rate             = input.float(0.0006, "手续费率", step=0.0001)    // 0.06%
+i_partial_tp1_pct      = input.float(5.0, "分批止盈1 阈值%", step=0.5)
+i_partial_tp1_ratio    = input.float(0.3, "分批止盈1 平仓比例", step=0.05)
+i_partial_tp2_pct      = input.float(8.0, "分批止盈2 阈值%", step=0.5)
+i_partial_tp2_ratio    = input.float(0.2, "分批止盈2 平仓比例", step=0.05)
+
+// ==================== 状态变量 ====================
+var string bot_state   = "IDLE"    // IDLE / IN_STRATEGY / EXITING
+var string pos_side    = "none"    // long / short / none
+var int    layer       = 0
+var float  best_profit = 0.0
+var bool   activated   = false
+var bool   pt1_done    = false
+var bool   pt2_done    = false
+var float  entry_price = 0.0
+var float  avg_price   = 0.0
+var float  total_qty   = 0.0       // 总持仓张数
+var float  total_cost  = 0.0       // 总成本(保证金)
+var float  layer_qty   = 0.0       // 各层持仓量
+
+// 存储各层入场价，用于计算均价
+var float  l1_price = 0.0, l1_qty = 0.0
+var float  l2_price = 0.0, l2_qty = 0.0
+var float  l3_price = 0.0, l3_qty = 0.0
+var float  l4_price = 0.0, l4_qty = 0.0
+var float  l5_price = 0.0, l5_qty = 0.0
+
+// ==================== 指标计算 ====================
+// EMA
+ema_fast = ta.ema(close, i_fast_ema)
+ema_slow = ta.ema(close, i_slow_ema)
+
+// RSI
+rsi_val = ta.rsi(close, 14)
+
+// ADX
+[diplus, diminus, adx_val] = ta.dmi(14, 14)
+
+// ATR
+atr_val = ta.atr(14)
+
+// ==================== 趋势判断 ====================
+is_uptrend   = ema_fast > ema_slow and rsi_val > i_rsi_threshold and adx_val > i_adx_threshold
+is_downtrend = ema_fast < ema_slow and rsi_val < i_rsi_threshold and adx_val > i_adx_threshold
+
+trend_signal = is_uptrend ? "UP" : (is_downtrend ? "DOWN" : "CHOPPY")
+
+// ==================== 支撑阻力计算 ====================
+// 简化版：用1h级别数据（在Pine中只能用当前周期或更高的数据，这里用近期高低+pivot+EMA）
+lookback = 30
+recent_high = ta.highest(high, lookback)
+recent_low  = ta.lowest(low, lookback)
+
+// Pivot点
+pivot_val = (high + low + close) / 3.0
+r1 = 2.0 * pivot_val - low
+s1 = 2.0 * pivot_val - high
+r2 = pivot_val + (high - low)
+s2 = pivot_val - (high - low)
+r3 = high + 2.0 * (pivot_val - low)
+s3 = low - 2.0 * (high - pivot_val)
+
+// 去重+排序：支撑位（低于当前价）
+raw_sup = array.new_float(0)
+if s1 < close
+    array.push(raw_sup, s1)
+if s2 < close
+    array.push(raw_sup, s2)
+if s3 < close
+    array.push(raw_sup, s3)
+if recent_low < close
+    array.push(raw_sup, recent_low)
+if ema_fast * 0.99 < close
+    array.push(raw_sup, ema_fast * 0.99)
+
+// 去重（合并0.2%以内的价位）
+sup_sorted = array.new_float(0)
+if array.size(raw_sup) > 0
+    // 简单排序
+    sorted_tmp = array.copy(raw_sup)
+    for i = 0 to array.size(sorted_tmp) - 1
+        for j = i + 1 to array.size(sorted_tmp) - 1
+            if array.get(sorted_tmp, i) < array.get(sorted_tmp, j)
+                tmp := array.get(sorted_tmp, i)
+                array.set(sorted_tmp, i, array.get(sorted_tmp, j))
+                array.set(sorted_tmp, j, tmp)
+    // 去重
+    if array.size(sorted_tmp) > 0
+        array.push(sup_sorted, array.get(sorted_tmp, 0))
+        for i = 1 to array.size(sorted_tmp) - 1
+            prev := array.get(sup_sorted, array.size(sup_sorted) - 1)
+            curr := array.get(sorted_tmp, i)
+            if curr < prev * (1.0 - 0.002)  // 0.2% gap
+                array.push(sup_sorted, curr)
+
+// 阻力位（高于当前价）
+raw_res = array.new_float(0)
+if r1 > close
+    array.push(raw_res, r1)
+if r2 > close
+    array.push(raw_res, r2)
+if r3 > close
+    array.push(raw_res, r3)
+if recent_high > close
+    array.push(raw_res, recent_high)
+if ema_fast * 1.01 > close
+    array.push(raw_res, ema_fast * 1.01)
+
+res_sorted = array.new_float(0)
+if array.size(raw_res) > 0
+    sorted_tmp2 = array.copy(raw_res)
+    for i = 0 to array.size(sorted_tmp2) - 1
+        for j = i + 1 to array.size(sorted_tmp2) - 1
+            if array.get(sorted_tmp2, i) > array.get(sorted_tmp2, j)
+                tmp := array.get(sorted_tmp2, i)
+                array.set(sorted_tmp2, i, array.get(sorted_tmp2, j))
+                array.set(sorted_tmp2, j, tmp)
+    if array.size(sorted_tmp2) > 0
+        array.push(res_sorted, array.get(sorted_tmp2, 0))
+        for i = 1 to array.size(sorted_tmp2) - 1
+            prev := array.get(res_sorted, array.size(res_sorted) - 1)
+            curr := array.get(sorted_tmp2, i)
+            if curr > prev * (1.0 + 0.002)
+                array.push(res_sorted, curr)
+
+// ==================== 动态止盈参数 ====================
+base_threshold = math.max(2.0 * i_fee_rate * i_leverage, 0.03)
+adx_mult   = adx_val > 30 ? 1.5 : (adx_val > 25 ? 1.2 : (adx_val > 20 ? 1.0 : 0.7))
+trail_ratio = adx_val > 30 ? 0.4  : (adx_val > 25 ? 0.45 : (adx_val > 20 ? 0.5 : 0.6))
+vol_pct    = atr_val / close
+vol_mult   = vol_pct > 0.03 ? 1.3 : (vol_pct > 0.02 ? 1.1 : (vol_pct > 0.01 ? 1.0 : 0.8))
+activate_pct = math.max(math.min(base_threshold * adx_mult * vol_mult, 0.15), 0.03)
+
+// ATR追踪止盈价
+atr_mult = layer < 4 ? 4.0 : 3.0
+trail_price_long  = recent_high - atr_mult * atr_val
+trail_price_short = recent_low + atr_mult * atr_val
+
+// ==================== 计算当前盈亏% ====================
+calc_profit() =>
+    if total_qty <= 0 or avg_price <= 0
+        return 0.0
+    if pos_side == "long"
+        return (close - avg_price) / avg_price * i_leverage
+    else if pos_side == "short"
+        return (avg_price - close) / avg_price * i_leverage
+    else
+        return 0.0
+
+current_profit = calc_profit()
+
+// 更新最高浮盈
+if current_profit > best_profit
+    best_profit := current_profit
+
+// ==================== 获取层倍率 ====================
+get_layer_mult(l) =>
+    if l == 1
+        i_layer_mult_1
+    else if l == 2
+        i_layer_mult_2
+    else if l == 3
+        i_layer_mult_3
+    else if l == 4
+        i_layer_mult_4
+    else
+        i_layer_mult_5
+
+// ==================== 买入/卖出数量计算 ====================
+calc_margin_amount(mult_val) =>
+    equity = strategy.equity
+    margin = equity * i_first_order_ratio * mult_val
+    // 模拟杠杆：合约数量 = 保证金 * 杠杆 / 价格
+    qty = (margin * i_leverage) / close
+    qty
+
+// ==================== 全部平仓 ====================
+close_all() =>
+    if total_qty > 0
+        if pos_side == "long"
+            strategy.close_all(comment="全平 LONG")
+        else
+            strategy.close_all(comment="全平 SHORT")
+    bot_state := "IDLE"
+    pos_side  := "none"
+    layer     := 0
+    best_profit := 0.0
+    activated := false
+    pt1_done  := false
+    pt2_done  := false
+    entry_price := 0.0
+    avg_price := 0.0
+    total_qty := 0.0
+    total_cost := 0.0
+    l1_price := 0.0, l1_qty := 0.0
+    l2_price := 0.0, l2_qty := 0.0
+    l3_price := 0.0, l3_qty := 0.0
+    l4_price := 0.0, l4_qty := 0.0
+    l5_price := 0.0, l5_qty := 0.0
+
+// ==================== 重置状态 ====================
+reset_state() =>
+    bot_state := "IDLE"
+    pos_side  := "none"
+    layer     := 0
+    best_profit := 0.0
+    activated := false
+    pt1_done  := false
+    pt2_done  := false
+    entry_price := 0.0
+    avg_price := 0.0
+    total_qty := 0.0
+    total_cost := 0.0
+    l1_price := 0.0, l1_qty := 0.0
+    l2_price := 0.0, l2_qty := 0.0
+    l3_price := 0.0, l3_qty := 0.0
+    l4_price := 0.0, l4_qty := 0.0
+    l5_price := 0.0, l5_qty := 0.0
+
+// ==================== 首仓入场 ====================
+place_first_order(side_str) =>
+    if side_str == "long" and array.size(sup_sorted) > 0
+        preferred = array.get(sup_sorted, 0) * (1.0 + i_level_offset_pct)
+        max_ep    = close * (1.0 - i_level_offset_pct)
+        ep        = math.min(preferred, max_ep)
+    else if side_str == "long"
+        ep = close * (1.0 - i_level_offset_pct)
+    else if side_str == "short" and array.size(res_sorted) > 0
+        preferred = array.get(res_sorted, 0) * (1.0 - i_level_offset_pct)
+        min_ep    = close * (1.0 + i_level_offset_pct)
+        ep        = math.max(preferred, min_ep)
+    else
+        ep = close * (1.0 + i_level_offset_pct)
+    
+    qty = calc_margin_amount(i_layer_mult_1)
+    if qty > 0
+        if side_str == "long"
+            strategy.entry("MartinLong", strategy.long, qty=qty, limit=ep, comment="首仓L")
+        else
+            strategy.entry("MartinShort", strategy.short, qty=qty, limit=ep, comment="首仓S")
+        bot_state   := "IN_STRATEGY"
+        pos_side    := side_str
+        layer       := 1
+        best_profit := 0.0
+        activated   := false
+        pt1_done    := false
+        pt2_done    := false
+        entry_price := ep
+        avg_price   := ep
+        total_qty   := qty
+        if layer == 1
+            l1_price := ep, l1_qty := qty
+
+// ==================== 加仓 ====================
+place_add_order(layer_num) =>
+    mult_val = get_layer_mult(layer_num)
+    qty = calc_margin_amount(mult_val)
+    
+    if qty <= 0 or layer_num > i_max_layers
+        return
+    
+    // 优先结构位
+    ep = float(na)
+    
+    if pos_side == "long"
+        // 找低于当前价和均价的支撑
+        if array.size(sup_sorted) > 0
+            idx = math.min(math.max(layer_num - 2, 0), array.size(sup_sorted) - 1)
+            preferred = array.get(sup_sorted, idx) * (1.0 + i_level_offset_pct)
+            max_ep = math.min(close, avg_price) * (1.0 - i_level_offset_pct)
+            ep := math.min(preferred, max_ep)
+        if na(ep) or ep == 0.0
+            // ATR兜底
+            atr_mult_add = 1.0 + math.max(layer_num - 2, 0) * 0.5
+            distance = atr_val * atr_mult_add
+            ep := math.min(avg_price, close) - distance
+        if na(ep) or ep == 0.0
+            // 固定偏移兜底
+            offset = i_add_layer_base_off * layer_num
+            ep := avg_price * (1.0 - offset)
+    
+    else if pos_side == "short"
+        if array.size(res_sorted) > 0
+            idx = math.min(math.max(layer_num - 2, 0), array.size(res_sorted) - 1)
+            preferred = array.get(res_sorted, idx) * (1.0 - i_level_offset_pct)
+            min_ep = math.max(close, avg_price) * (1.0 + i_level_offset_pct)
+            ep := math.max(preferred, min_ep)
+        if na(ep) or ep == 0.0
+            atr_mult_add = 1.0 + math.max(layer_num - 2, 0) * 0.5
+            distance = atr_val * atr_mult_add
+            ep := math.max(avg_price, close) + distance
+        if na(ep) or ep == 0.0
+            offset = i_add_layer_base_off * layer_num
+            ep := avg_price * (1.0 + offset)
+    
+    if not na(ep) and ep > 0
+        if pos_side == "long"
+            strategy.entry("MartinLong", strategy.long, qty=qty, limit=ep, comment="L" + str.tostring(layer_num))
+        else
+            strategy.entry("MartinShort", strategy.short, qty=qty, limit=ep, comment="S" + str.tostring(layer_num))
+        
+        layer := layer_num
+        // 更新均价
+        old_cost = total_qty * avg_price
+        new_cost = qty * ep
+        total_qty := total_qty + qty
+        avg_price := (old_cost + new_cost) / total_qty
+        
+        if layer_num == 1
+            l1_price := ep, l1_qty := qty
+        else if layer_num == 2
+            l2_price := ep, l2_qty := qty
+        else if layer_num == 3
+            l3_price := ep, l3_qty := qty
+        else if layer_num == 4
+            l4_price := ep, l4_qty := qty
+        else if layer_num == 5
+            l5_price := ep, l5_qty := qty
+
+// ==================== 主逻辑 ====================
+// 使用 limit order 模拟挂单成交：当价格触及挂单价时入场
+// Pine Strategy 的 limit order 自动在价格到达时成交
+
+// 简化处理：用 market order + 条件判断来模拟
+// 因为 Pine 的 limit order 有一些限制，我们改用条件触发方式
+
+if barstate.isconfirmed
+    // ========== IDLE 状态 ==========
+    if bot_state == "IDLE"
+        if trend_signal == "DOWN"
+            place_first_order("long")
+        else if trend_signal == "UP"
+            place_first_order("short")
+        // CHOPPY 什么都不做
+    
+    // ========== IN_STRATEGY 状态 ==========
+    else if bot_state == "IN_STRATEGY"
+        // 检查是否有持仓（Pine strategy 会自动管理）
+        has_pos = (pos_side == "long" and strategy.position_size > 0) or (pos_side == "short" and strategy.position_size < 0)
+        
+        if has_pos
+            // 更新均价（从strategy获取）
+            if pos_side == "long" and strategy.position_size > 0
+                avg_price := strategy.position_avg_price
+                total_qty := math.abs(strategy.position_size)
+            else if pos_side == "short" and strategy.position_size < 0
+                avg_price := strategy.position_avg_price
+                total_qty := math.abs(strategy.position_size)
+            
+            current_p = calc_profit()
+            
+            // 硬止损
+            if current_p < -i_max_loss_pct
+                close_all()
+            
+            // 更新最高浮盈
+            if current_p > best_profit
+                best_profit := current_p
+            
+            // 分批止盈2 (8%)
+            if best_profit >= i_partial_tp2_pct / 100.0 and not pt2_done
+                close_qty = total_qty * i_partial_tp2_ratio
+                if pos_side == "long"
+                    strategy.close("MartinLong", qty=close_qty, comment="TP2")
+                else
+                    strategy.close("MartinShort", qty=close_qty, comment="TP2")
+                pt2_done := true
+            
+            // 分批止盈1 (5%)
+            if best_profit >= i_partial_tp1_pct / 100.0 and not pt1_done
+                close_qty = total_qty * i_partial_tp1_ratio
+                if pos_side == "long"
+                    strategy.close("MartinLong", qty=close_qty, comment="TP1")
+                else
+                    strategy.close("MartinShort", qty=close_qty, comment="TP1")
+                pt1_done := true
+            
+            // 移动止盈已激活
+            if best_profit >= activate_pct
+                activated := true
+            
+            // 回撤保护
+            if best_profit > 0 and activated
+                drawdown = best_profit - current_p
+                max_dd = trail_ratio * best_profit
+                if layer >= 4
+                    max_dd := math.min(max_dd, best_profit > 0.10 ? 0.035 : 0.05)
+                
+                if drawdown >= max_dd
+                    close_all()
+            
+            // ATR追踪止盈
+            if activated
+                if pos_side == "long" and close < trail_price_long
+                    close_all()
+                else if pos_side == "short" and close > trail_price_short
+                    close_all()
+            
+            // 加仓逻辑：价格反向运动一定距离后加仓
+            // 简化：检测当前亏损达到阈值时触发下一层
+            if current_p < 0 and layer < i_max_layers
+                next_layer = layer + 1
+                // 加仓触发条件：亏损超过一定比例
+                // 根据层数递增
+                add_trigger = i_add_layer_base_off * next_layer * i_leverage * 0.5
+                if current_p < -add_trigger
+                    place_add_order(next_layer)
+        
+        else
+            // 持仓被平了（止盈/止损触发）
+            reset_state()
+    
+    // ========== 趋势反转检测 ==========
+    if bot_state == "IN_STRATEGY" and pos_side == "long" and trend_signal == "UP"
+        close_all()
+    else if bot_state == "IN_STRATEGY" and pos_side == "short" and trend_signal == "DOWN"
+        close_all()
+    else if bot_state == "IN_STRATEGY" and trend_signal == "CHOPPY" and layer == 1
+        // 横盘且只有一层，平掉等信号
+        close_all()
+
+// ==================== 可视化 ====================
+// 趋势背景色
+bgcolor(trend_signal == "UP" ? color.new(color.green, 90) : (trend_signal == "DOWN" ? color.new(color.red, 90) : na), title="趋势背景")
+
+// EMA线
+plot(ema_fast, "EMA快线", color=color.blue, linewidth=1)
+plot(ema_slow, "EMA慢线", color=color.orange, linewidth=1)
+
+// 支撑阻力
+plot(array.size(sup_sorted) > 0 ? array.get(sup_sorted, 0) : na, "支撑1", color=color.green, style=plot.style_linebr, linewidth=1)
+plot(array.size(sup_sorted) > 1 ? array.get(sup_sorted, 1) : na, "支撑2", color=color.new(color.green, 50), style=plot.style_linebr, linewidth=1)
+plot(array.size(res_sorted) > 0 ? array.get(res_sorted, 0) : na, "阻力1", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(array.size(res_sorted) > 1 ? array.get(res_sorted, 1) : na, "阻力2", color=color.new(color.red, 50), style=plot.style_linebr, linewidth=1)
+
+// 信号标签
+plotshape(trend_signal == "DOWN" and bot_state == "IDLE", title="做多信号", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="L")
+plotshape(trend_signal == "UP" and bot_state == "IDLE", title="做空信号", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+
+// 信息表格
+var table info_tbl = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+if barstate.islast
+    table.cell(info_tbl, 0, 0, "状态", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_tbl, 1, 0, bot_state, text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(info_tbl, 0, 1, "方向", text_color=color.white)
+    table.cell(info_tbl, 1, 1, pos_side, text_color=pos_side == "long" ? color.green : (pos_side == "short" ? color.red : color.gray))
+    table.cell(info_tbl, 0, 2, "层数", text_color=color.white)
+    table.cell(info_tbl, 1, 2, str.tostring(layer), text_color=color.white)
+    table.cell(info_tbl, 0, 3, "持仓量", text_color=color.white)
+    table.cell(info_tbl, 1, 3, str.tostring(total_qty, "#.##"), text_color=color.white)
+    table.cell(info_tbl, 0, 4, "均价", text_color=color.white)
+    table.cell(info_tbl, 1, 4, str.tostring(avg_price, "#.##"), text_color=color.white)
+    table.cell(info_tbl, 0, 5, "浮盈%", text_color=color.white)
+    table.cell(info_tbl, 1, 5, str.tostring(current_profit * 100, "#.##") + "%", text_color=current_profit > 0 ? color.green : color.red)
+    table.cell(info_tbl, 0, 6, "最高浮盈%", text_color=color.white)
+    table.cell(info_tbl, 1, 6, str.tostring(best_profit * 100, "#.##") + "%", text_color=color.yellow)
+    table.cell(info_tbl, 0, 7, "趋势", text_color=color.white)
+    table.cell(info_tbl, 1, 7, trend_signal, text_color=trend_signal == "UP" ? color.green : (trend_signal == "DOWN" ? color.red : color.gray))
