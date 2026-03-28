@@ -144,6 +144,7 @@ p {
 
 .live-pill,
 .ghost-pill,
+.phase-pill,
 .signal-badge {
   display: inline-flex;
   align-items: center;
@@ -167,6 +168,21 @@ p {
 .signal-badge {
   background: rgba(127, 210, 255, 0.14);
   color: var(--accent);
+}
+
+.phase-pill {
+  background: rgba(149, 168, 255, 0.14);
+  color: var(--accent-3);
+}
+
+.phase-pill.phase1 {
+  background: rgba(127, 210, 255, 0.14);
+  color: var(--accent);
+}
+
+.phase-pill.phase2 {
+  background: rgba(255, 215, 140, 0.16);
+  color: var(--accent-2);
 }
 
 .hero-stat {
@@ -509,6 +525,16 @@ p {
   gap: 10px;
 }
 
+.ladder-item.phase1 {
+  border-color: rgba(127, 210, 255, 0.18);
+  background: linear-gradient(135deg, rgba(10, 25, 42, 0.72), rgba(8, 18, 31, 0.58));
+}
+
+.ladder-item.phase2 {
+  border-color: rgba(255, 215, 140, 0.18);
+  background: linear-gradient(135deg, rgba(34, 24, 8, 0.44), rgba(14, 18, 28, 0.62));
+}
+
 .ladder-head {
   display: flex;
   justify-content: space-between;
@@ -527,6 +553,33 @@ p {
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+
+.progress-bar.phase1 {
+  background: linear-gradient(90deg, #6ebeff, #7fd2ff);
+}
+
+.progress-bar.phase2 {
+  background: linear-gradient(90deg, #ffbf73, #ffd78c);
+}
+
+.phase-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.phase-chip.phase1 {
+  background: rgba(127, 210, 255, 0.14);
+  color: var(--accent);
+}
+
+.phase-chip.phase2 {
+  background: rgba(255, 215, 140, 0.16);
+  color: var(--accent-2);
 }
 
 .table-shell {
