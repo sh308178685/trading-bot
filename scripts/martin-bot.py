@@ -144,6 +144,7 @@ class RuntimeState:
     layer: int = 0
     pending_layer: int = 0
     phase: str = "PHASE1"
+    last_phase: str = "PHASE1"
     pending_entry_price: float = 0.0
     last_fill_price: float = 0.0
     last_fill_time: str = ""
@@ -1509,6 +1510,7 @@ class MartinBot:
                 layer=raw.get('layer', 0),
                 pending_layer=raw.get('pending_layer', raw.get('layer', 0)),
                 phase=raw.get('phase', 'PHASE1'),
+                last_phase=raw.get('last_phase', raw.get('phase', 'PHASE1')),
                 pending_entry_price=raw.get('pending_entry_price', 0.0),
                 last_fill_price=raw.get('last_fill_price', 0.0),
                 last_fill_time=raw.get('last_fill_time', ""),
@@ -2899,6 +2901,7 @@ class MartinBot:
         startup_position = self.get_active_position()
         print(f"🧭 启动阶段: {self._current_phase(startup_position)}")
         self._reconcile_startup_entry_orders()
+        self._set_runtime_flag('last_phase', self.state.phase)
         self._start_ws_risk_monitor()
         self._write_live_snapshot(force=True, include_market=True)
 
@@ -2998,6 +3001,12 @@ class MartinBot:
                                     time.sleep(self.loop_interval)
                                     continue
                                 add_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
+                                phase_changed = current_phase != str(self.state.last_phase or current_phase).upper()
+                                if phase_changed:
+                                    print(
+                                        f"🧭 运行中阶段切换: {self.state.last_phase or 'UNKNOWN'} -> {current_phase}，"
+                                        "检查并按新阶段参数重建加仓挂单"
+                                    )
                                 target_pending_layer = (
                                     min(self.max_layers, self.state.layer + 1)
                                     if add_orders else self.state.layer
@@ -3005,10 +3014,35 @@ class MartinBot:
                                 if target_pending_layer != self.state.pending_layer:
                                     self._set_runtime_flag('pending_layer', target_pending_layer)
                                 if len(add_orders) == 0:
+                                    if phase_changed:
+                                        self._set_runtime_flag('last_phase', current_phase)
                                     ticker = self.exchange.fetch_ticker(self.symbol)
                                     price = self._safe_float(ticker.get('last', 0))
                                     self.place_add_order(next_layer, price)
                                 else:
+                                    if phase_changed:
+                                        rebuild_price = self._safe_float(
+                                            position.get('markPrice', 0),
+                                            self._safe_float(position.get('entryPrice', 0), 0.0),
+                                        )
+                                        if rebuild_price <= 0:
+                                            ticker = self.exchange.fetch_ticker(self.symbol)
+                                            rebuild_price = self._safe_float(ticker.get('last', 0))
+                                        rebuild_plan = self._build_add_order_plan(
+                                            next_layer,
+                                            rebuild_price,
+                                            position=position,
+                                            anchor_pending_price=0.0,
+                                        )
+                                        if rebuild_plan is not None:
+                                            if self._entry_orders_match_plan(add_orders, rebuild_plan):
+                                                print(f"✅ 阶段切换后当前加仓挂单已符合 {current_phase} 参数，无需重挂")
+                                            else:
+                                                print(f"♻️ 阶段切换后按 {current_phase} 参数重建加仓挂单")
+                                                if self._cancel_entry_orders(add_orders) and self._submit_add_order_plan(rebuild_plan):
+                                                    open_orders = self.fetch_open_orders() or []
+                                                    add_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
+                                        self._set_runtime_flag('last_phase', current_phase)
                                     pending_price = self._pending_entry_price_from_orders(add_orders)
                                     if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
                                         self._set_runtime_flag('pending_entry_price', pending_price)
