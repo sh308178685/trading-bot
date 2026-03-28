@@ -1261,6 +1261,73 @@ class MartinBot:
         activate_pct = min(activate_pct, 0.15)
         return activate_pct, trail_ratio
 
+    def _dynamic_partial_tp_targets(
+        self,
+        position: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, float]] = None,
+        current_profit_pct: Optional[float] = None,
+        best_profit_pct: Optional[float] = None,
+    ) -> Dict[str, float]:
+        side = self._position_side(position)
+        layer = max(int(self.state.layer), 1)
+        phase = self._current_phase(position, current_profit_pct=current_profit_pct)
+        risk_context = context or self._build_risk_context(position_side=side, layer=layer) or {}
+
+        adx = self._safe_float(risk_context.get('adx', 20.0), 20.0)
+        volatility_pct = self._safe_float(risk_context.get('volatility_pct', 0.02), 0.02)
+
+        if adx >= 30:
+            trend_mult = 1.20
+        elif adx >= 20:
+            trend_mult = 1.00
+        else:
+            trend_mult = 0.85
+
+        if volatility_pct > 0.03:
+            vol_mult = 1.25
+        elif volatility_pct > 0.015:
+            vol_mult = 1.05
+        else:
+            vol_mult = 0.90
+
+        if layer >= 4:
+            layer_mult = 0.88
+        elif layer == 3:
+            layer_mult = 0.95
+        else:
+            layer_mult = 1.00
+
+        phase_mult = 0.92 if phase == 'PHASE2' else 1.00
+        total_mult = trend_mult * vol_mult * layer_mult * phase_mult
+
+        leverage = max(float(self.leverage), 1.0)
+        profit_floor = max(
+            self.trailing_min_close_profit_pct,
+            self.protective_stop_min_profit_pct,
+            2 * self.fee_rate * leverage + 0.001,
+        )
+
+        tp1_threshold = max(profit_floor, 0.04 * total_mult)
+        tp1_threshold = min(max(tp1_threshold, 0.015), 0.08)
+
+        tp2_threshold = max(tp1_threshold + 0.015, 0.07 * total_mult)
+        tp2_threshold = min(tp2_threshold, 0.14)
+
+        return {
+            'tp1_threshold': tp1_threshold,
+            'tp2_threshold': tp2_threshold,
+            'tp1_ratio': 0.30,
+            'tp2_ratio': 0.20,
+            'trend_mult': trend_mult,
+            'vol_mult': vol_mult,
+            'layer_mult': layer_mult,
+            'phase_mult': phase_mult,
+            'phase': phase,
+            'adx': adx,
+            'volatility_pct': volatility_pct,
+            'best_profit_pct': self._safe_float(best_profit_pct, self.state.best_profit_pct),
+        }
+
     def _build_risk_context(self, position_side: Optional[str] = None, layer: Optional[int] = None) -> Optional[Dict[str, float]]:
         df = self.fetch_ohlcv_df(limit=80)
         if df is None:
@@ -1674,6 +1741,8 @@ class MartinBot:
         context = self._build_risk_context(position_side=self.state.position_side, layer=self.state.layer)
         activate_pct = context['activate_pct'] if context else 0.0
         trail_ratio = context['trail_ratio'] if context else 0.5
+        live_position = self.get_active_position()
+        partial_targets = self._dynamic_partial_tp_targets(position=live_position, context=context)
 
         return {
             'ticker': {
@@ -1697,6 +1766,11 @@ class MartinBot:
                 'signal': signal,
                 'dynamic_tp_activate_pct': activate_pct * 100,
                 'dynamic_tp_trail_ratio': trail_ratio * 100,
+                'dynamic_partial_tp1_pct': partial_targets['tp1_threshold'] * 100,
+                'dynamic_partial_tp2_pct': partial_targets['tp2_threshold'] * 100,
+                'dynamic_partial_tp1_ratio': partial_targets['tp1_ratio'] * 100,
+                'dynamic_partial_tp2_ratio': partial_targets['tp2_ratio'] * 100,
+                'dynamic_partial_tp_phase': partial_targets['phase'],
             },
             'support_resistance': support_resistance
             or {'current_price': self._safe_float(latest['close']), 'support': [], 'resistance': []},
@@ -2413,6 +2487,12 @@ class MartinBot:
             return
 
         best_profit_pct = self.state.best_profit_pct
+        partial_targets = self._dynamic_partial_tp_targets(
+            position=position,
+            context=context,
+            current_profit_pct=current_profit_pct,
+            best_profit_pct=best_profit_pct,
+        )
         if best_profit_pct < context['activate_pct']:
             return
 
@@ -2428,14 +2508,20 @@ class MartinBot:
             reason="WS移动止盈激活",
         )
 
-        if best_profit_pct >= 0.08 and not self.state.partial_tp_2_done:
-            print(f"🎯 WS分批止盈2: 浮盈 {best_profit_pct*100:.2f}% >= 8%，平仓20%")
-            if self._execute_partial_take_profit(position, 0.2, "分批止盈2", "partial_tp_2_done"):
+        if best_profit_pct >= partial_targets['tp2_threshold'] and not self.state.partial_tp_2_done:
+            print(
+                f"🎯 WS分批止盈2: 浮盈 {best_profit_pct*100:.2f}% "
+                f">= 动态阈值 {partial_targets['tp2_threshold']*100:.2f}%，平仓20%"
+            )
+            if self._execute_partial_take_profit(position, partial_targets['tp2_ratio'], "分批止盈2", "partial_tp_2_done"):
                 return
 
-        if best_profit_pct >= 0.05 and not self.state.partial_tp_1_done:
-            print(f"🎯 WS分批止盈1: 浮盈 {best_profit_pct*100:.2f}% >= 5%，平仓30%")
-            if self._execute_partial_take_profit(position, 0.3, "分批止盈1", "partial_tp_1_done"):
+        if best_profit_pct >= partial_targets['tp1_threshold'] and not self.state.partial_tp_1_done:
+            print(
+                f"🎯 WS分批止盈1: 浮盈 {best_profit_pct*100:.2f}% "
+                f">= 动态阈值 {partial_targets['tp1_threshold']*100:.2f}%，平仓30%"
+            )
+            if self._execute_partial_take_profit(position, partial_targets['tp1_ratio'], "分批止盈1", "partial_tp_1_done"):
                 return
 
         current_price = live_price or self._safe_float(position.get('markPrice', 0), context['current_price'])
@@ -2498,6 +2584,17 @@ class MartinBot:
                 f"📊 动态止盈: ADX={context['adx']:.1f} 波动率={context['volatility_pct']*100:.2f}% "
                 f"| 激活阈值={activate_pct*100:.2f}% 回撤比例={trail_ratio*100:.0f}%"
             )
+            partial_targets = self._dynamic_partial_tp_targets(
+                position=position,
+                context=context,
+                current_profit_pct=current_profit_pct,
+                best_profit_pct=self.state.best_profit_pct,
+            )
+            print(
+                f"📌 动态分批止盈: TP1>={partial_targets['tp1_threshold']*100:.2f}% 平30% "
+                f"| TP2>={partial_targets['tp2_threshold']*100:.2f}% 平20% "
+                f"| 阶段={partial_targets['phase']}"
+            )
 
             if self.state.best_profit_pct < activate_pct:
                 print(f"⏳ 等待激活: {self.state.best_profit_pct*100:.2f}% < {activate_pct*100:.2f}%")
@@ -2512,15 +2609,21 @@ class MartinBot:
             )
 
             # 分批止盈2
-            if self.state.best_profit_pct >= 0.08 and not self.state.partial_tp_2_done:
-                print(f"🎯 分批止盈2: 浮盈 {self.state.best_profit_pct*100:.2f}% >= 8%，平仓20%")
-                self._execute_partial_take_profit(position, 0.2, "分批止盈2", "partial_tp_2_done")
+            if self.state.best_profit_pct >= partial_targets['tp2_threshold'] and not self.state.partial_tp_2_done:
+                print(
+                    f"🎯 分批止盈2: 浮盈 {self.state.best_profit_pct*100:.2f}% "
+                    f">= 动态阈值 {partial_targets['tp2_threshold']*100:.2f}%，平仓20%"
+                )
+                self._execute_partial_take_profit(position, partial_targets['tp2_ratio'], "分批止盈2", "partial_tp_2_done")
                 return False
 
             # 分批止盈1
-            if self.state.best_profit_pct >= 0.05 and not self.state.partial_tp_1_done:
-                print(f"🎯 分批止盈1: 浮盈 {self.state.best_profit_pct*100:.2f}% >= 5%，平仓30%")
-                self._execute_partial_take_profit(position, 0.3, "分批止盈1", "partial_tp_1_done")
+            if self.state.best_profit_pct >= partial_targets['tp1_threshold'] and not self.state.partial_tp_1_done:
+                print(
+                    f"🎯 分批止盈1: 浮盈 {self.state.best_profit_pct*100:.2f}% "
+                    f">= 动态阈值 {partial_targets['tp1_threshold']*100:.2f}%，平仓30%"
+                )
+                self._execute_partial_take_profit(position, partial_targets['tp1_ratio'], "分批止盈1", "partial_tp_1_done")
                 return False
 
             should_close = (
