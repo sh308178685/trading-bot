@@ -1156,6 +1156,57 @@ class MartinBot:
         existing_trigger = self._price_to_precision(self._safe_float(order.get('triggerPrice', 0.0), 0.0))
         return existing_trigger == plan['trigger_price']
 
+    def _relative_price_delta(self, current_price: float, target_price: float) -> float:
+        baseline = max(abs(current_price), abs(target_price), 1e-9)
+        return abs(current_price - target_price) / baseline
+
+    def _entry_order_refresh_reason(self, orders: List[Dict[str, Any]], plan: Dict[str, Any]) -> str:
+        if not orders:
+            return "当前没有加仓挂单"
+        if len(orders) != 1:
+            return f"当前存在 {len(orders)} 个加仓挂单"
+
+        order = orders[0]
+        order_type = str(order.get('type', '')).lower()
+        existing_side = str(order.get('side', '')).lower()
+        if existing_side != str(plan['order_side']).lower():
+            return f"方向不一致({existing_side} -> {plan['order_side']})"
+
+        existing_amount = self._normalize_amount(self._safe_float(order.get('amount', 0.0), 0.0))
+        if existing_amount != plan['amount']:
+            return f"数量不一致({existing_amount} -> {plan['amount']})"
+
+        existing_price = self._price_to_precision(self._safe_float(order.get('price', 0.0), 0.0))
+        execute_delta = self._relative_price_delta(existing_price, plan['execute_price'])
+        refresh_threshold = max(self._safe_float(self.structure_refresh_threshold, 0.0), 0.0)
+
+        if plan['ready']:
+            if order_type == 'trigger':
+                return "触发状态已变化，需改为直接挂单"
+            if execute_delta >= refresh_threshold:
+                return (
+                    f"委托价偏离过大({existing_price:.2f} -> {plan['execute_price']:.2f}, "
+                    f"{execute_delta*100:.2f}%)"
+                )
+            return ""
+
+        if order_type != 'trigger':
+            return "当前挂单类型不是条件单"
+
+        existing_trigger = self._price_to_precision(self._safe_float(order.get('triggerPrice', 0.0), 0.0))
+        trigger_delta = self._relative_price_delta(existing_trigger, plan['trigger_price'])
+        if trigger_delta >= refresh_threshold:
+            return (
+                f"触发价偏离过大({existing_trigger:.2f} -> {plan['trigger_price']:.2f}, "
+                f"{trigger_delta*100:.2f}%)"
+            )
+        if execute_delta >= refresh_threshold:
+            return (
+                f"委托价偏离过大({existing_price:.2f} -> {plan['execute_price']:.2f}, "
+                f"{execute_delta*100:.2f}%)"
+            )
+        return ""
+
     def _cancel_entry_orders(self, orders: List[Dict[str, Any]]) -> bool:
         targets = [order for order in orders if not order.get('reduceOnly', False)]
         if not targets:
@@ -1172,6 +1223,41 @@ class MartinBot:
             except Exception as e:
                 print(f"⚠️ 定向撤销加仓挂单失败: {e}")
                 return False
+
+    def _reconcile_active_entry_orders(
+        self,
+        add_orders: List[Dict[str, Any]],
+        next_layer: int,
+        current_price: float,
+        position: Dict[str, Any],
+        reason_prefix: str = "",
+    ) -> bool:
+        plan = self._build_add_order_plan(
+            next_layer,
+            current_price,
+            position=position,
+            anchor_pending_price=0.0,
+        )
+        if plan is None:
+            return False
+
+        if self._entry_orders_match_plan(add_orders, plan):
+            pending_price = self._pending_entry_price_from_orders(add_orders)
+            if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
+                self._set_runtime_flag('pending_entry_price', pending_price)
+            return True
+
+        refresh_reason = self._entry_order_refresh_reason(add_orders, plan)
+        if not refresh_reason:
+            pending_price = self._pending_entry_price_from_orders(add_orders)
+            if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
+                self._set_runtime_flag('pending_entry_price', pending_price)
+            return True
+
+        print(f"♻️ {reason_prefix}第{next_layer}层加仓挂单需要重建: {refresh_reason}")
+        if not self._cancel_entry_orders(add_orders):
+            return False
+        return self._submit_add_order_plan(plan)
 
     def _reconcile_startup_entry_orders(self) -> None:
         position = self.get_active_position()
@@ -1204,24 +1290,15 @@ class MartinBot:
                 self.sync_state_with_exchange()
             return
 
-        plan = self._build_add_order_plan(
+        if self._reconcile_active_entry_orders(
+            add_orders,
             next_layer,
             current_price,
-            position=position,
-            anchor_pending_price=0.0,
-        )
-        if plan is None:
-            return
-
-        if self._entry_orders_match_plan(add_orders, plan):
-            print(f"✅ 启动检查: 当前阶段 {phase} 的加仓挂单与最新参数一致，无需重挂")
-            return
-
-        print(f"♻️ 启动检查: 当前阶段 {phase} 的加仓挂单与最新参数不一致，撤单后按新参数重挂")
-        if not self._cancel_entry_orders(add_orders):
-            return
-
-        if not self._submit_add_order_plan(plan):
+            position,
+            reason_prefix=f"启动检查[{phase}] ",
+        ):
+            print(f"✅ 启动检查: 当前阶段 {phase} 的加仓挂单已完成校准")
+        else:
             print("⚠️ 启动检查: 重挂加仓单失败，保留下一轮主循环补挂")
             return
 
@@ -2254,7 +2331,33 @@ class MartinBot:
                 merged.append(lv)
         return merged
 
-    def find_support_resistance(self, lookback=30):
+    def _timeframe_seconds(self, timeframe: Optional[str]) -> float:
+        value = str(timeframe or self.timeframe).strip().lower()
+        try:
+            if value.endswith("m"):
+                return float(value[:-1]) * 60
+            if value.endswith("h"):
+                return float(value[:-1]) * 3600
+            if value.endswith("d"):
+                return float(value[:-1]) * 86400
+            if value.endswith("w"):
+                return float(value[:-1]) * 604800
+        except ValueError:
+            return float("inf")
+        return float("inf")
+
+    def _structure_timeframes_for_layer(self, layer_num: int) -> List[str]:
+        candidates: List[str] = [str(self.sr_timeframe)]
+        if layer_num >= 2:
+            candidates.append(str(self.timeframe))
+
+        unique: List[str] = []
+        for timeframe in sorted(candidates, key=self._timeframe_seconds):
+            if timeframe not in unique:
+                unique.append(timeframe)
+        return unique
+
+    def find_support_resistance(self, lookback=30, timeframe: Optional[str] = None):
         """
         返回最近 5 个支撑 / 阻力候选
         来源：
@@ -2262,7 +2365,8 @@ class MartinBot:
         - pivot r1/r2/r3, s1/s2/s3
         - EMA20 上下偏移
         """
-        df = self.fetch_ohlcv_df(timeframe=self.sr_timeframe, limit=lookback + 40)
+        timeframe = str(timeframe or self.sr_timeframe)
+        df = self.fetch_ohlcv_df(timeframe=timeframe, limit=lookback + 40)
         if df is None:
             return None
 
@@ -2320,6 +2424,7 @@ class MartinBot:
         support_candidates = sorted(support_candidates, reverse=True)
 
         result = {
+            'timeframe': timeframe,
             'current_price': current_price,
             'gap_ratio': structure_gap_ratio,
             'atr': atr,
@@ -2327,7 +2432,7 @@ class MartinBot:
             'support': support_candidates[:5]
         }
 
-        print(f"📊 支撑阻力: 当前价={current_price:.2f}")
+        print(f"📊 支撑阻力[{timeframe}]: 当前价={current_price:.2f}")
         print(f"  阻力: {[f'{x:.2f}' for x in result['resistance']]}")
         print(f"  支撑: {[f'{x:.2f}' for x in result['support']]}")
 
@@ -2341,40 +2446,33 @@ class MartinBot:
         - 做空：优先找高于当前价、高于均价的阻力位
         - 层数越深，优先更深一档结构位
         """
-        sr = self.find_support_resistance()
-        if not sr:
-            return None, None
+        last_sr = None
+        for timeframe in self._structure_timeframes_for_layer(layer_num):
+            sr = self.find_support_resistance(timeframe=timeframe)
+            if not sr:
+                continue
+            last_sr = sr
 
-        if side == 'long':
-            candidates = []
-            for s in sr['support']:
-                if s < current_price and s < avg_price:
-                    candidates.append(s)
+            if side == 'long':
+                candidates = [s for s in sr['support'] if s < current_price and s < avg_price]
+                if not candidates:
+                    continue
 
+                idx = min(max(layer_num - 2, 0), len(candidates) - 1)
+                preferred_price = candidates[idx] * (1 + self.level_offset_pct)
+                max_entry_price = min(current_price, avg_price) * (1 - self.level_offset_pct)
+                return min(preferred_price, max_entry_price), sr
+
+            candidates = [r for r in sr['resistance'] if r > current_price and r > avg_price]
             if not candidates:
-                return None, sr
-
-            # layer2 -> 第一档支撑
-            # layer3 -> 第二档
-            # ...
-            idx = min(max(layer_num - 2, 0), len(candidates) - 1)
-            preferred_price = candidates[idx] * (1 + self.level_offset_pct)
-            max_entry_price = min(current_price, avg_price) * (1 - self.level_offset_pct)
-            return min(preferred_price, max_entry_price), sr
-
-        else:
-            candidates = []
-            for r in sr['resistance']:
-                if r > current_price and r > avg_price:
-                    candidates.append(r)
-
-            if not candidates:
-                return None, sr
+                continue
 
             idx = min(max(layer_num - 2, 0), len(candidates) - 1)
             preferred_price = candidates[idx] * (1 - self.level_offset_pct)
             min_entry_price = max(current_price, avg_price) * (1 + self.level_offset_pct)
             return max(preferred_price, min_entry_price), sr
+
+        return None, last_sr
 
     def _select_atr_entry_price(self, side: str, layer_num: int, current_price: float, avg_price: float):
         """
@@ -3025,28 +3123,27 @@ class MartinBot:
                                     price = self._safe_float(ticker.get('last', 0))
                                     self.place_add_order(next_layer, price)
                                 else:
-                                    if phase_changed:
-                                        rebuild_price = self._safe_float(
-                                            position.get('markPrice', 0),
-                                            self._safe_float(position.get('entryPrice', 0), 0.0),
-                                        )
-                                        if rebuild_price <= 0:
-                                            ticker = self.exchange.fetch_ticker(self.symbol)
-                                            rebuild_price = self._safe_float(ticker.get('last', 0))
-                                        rebuild_plan = self._build_add_order_plan(
+                                    reconcile_price = self._safe_float(
+                                        position.get('markPrice', 0),
+                                        self._safe_float(position.get('entryPrice', 0), 0.0),
+                                    )
+                                    if reconcile_price <= 0:
+                                        ticker = self.exchange.fetch_ticker(self.symbol)
+                                        reconcile_price = self._safe_float(ticker.get('last', 0))
+                                    if reconcile_price > 0:
+                                        reason_prefix = ""
+                                        if phase_changed:
+                                            reason_prefix = f"阶段切换[{current_phase}] "
+                                        self._reconcile_active_entry_orders(
+                                            add_orders,
                                             next_layer,
-                                            rebuild_price,
-                                            position=position,
-                                            anchor_pending_price=0.0,
+                                            reconcile_price,
+                                            position,
+                                            reason_prefix=reason_prefix,
                                         )
-                                        if rebuild_plan is not None:
-                                            if self._entry_orders_match_plan(add_orders, rebuild_plan):
-                                                print(f"✅ 阶段切换后当前加仓挂单已符合 {current_phase} 参数，无需重挂")
-                                            else:
-                                                print(f"♻️ 阶段切换后按 {current_phase} 参数重建加仓挂单")
-                                                if self._cancel_entry_orders(add_orders) and self._submit_add_order_plan(rebuild_plan):
-                                                    open_orders = self.fetch_open_orders() or []
-                                                    add_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
+                                        open_orders = self.fetch_open_orders() or []
+                                        add_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
+                                    if phase_changed:
                                         self._set_runtime_flag('last_phase', current_phase)
                                     pending_price = self._pending_entry_price_from_orders(add_orders)
                                     if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
