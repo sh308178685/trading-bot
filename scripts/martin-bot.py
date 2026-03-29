@@ -1007,7 +1007,14 @@ class MartinBot:
         avg_price = self._safe_float(position.get('entryPrice', current_price)) if position else current_price
         side = self.state.position_side
 
-        structure_price, sr = self._select_structure_entry_price(side, layer_num, current_price, avg_price)
+        structure_price, sr = self._select_structure_entry_price(
+            side,
+            layer_num,
+            current_price,
+            avg_price,
+            pending_entry_price=anchor_pending_price,
+            phase=phase,
+        )
         if structure_price is not None:
             entry_price = structure_price
             source = "STRUCTURE"
@@ -1023,16 +1030,17 @@ class MartinBot:
         atr_value = self._safe_float((sr or {}).get('atr', 0.0), 0.0)
         if atr_value <= 0:
             atr_value, _ = self._extract_latest_atr(limit=80)
-        entry_price = self._enforce_layer_spacing(
-            proposed_price=entry_price,
-            side=side,
-            layer_num=layer_num,
-            current_price=current_price,
-            avg_price=avg_price,
-            atr_value=atr_value,
-            pending_entry_price=anchor_pending_price,
-            phase=phase,
-        )
+        if source != "STRUCTURE":
+            entry_price = self._enforce_layer_spacing(
+                proposed_price=entry_price,
+                side=side,
+                layer_num=layer_num,
+                current_price=current_price,
+                avg_price=avg_price,
+                atr_value=atr_value,
+                pending_entry_price=anchor_pending_price,
+                phase=phase,
+            )
         entry_price = self._price_to_precision(entry_price)
 
         layer_multipliers = phase_cfg['layer_multipliers']
@@ -2438,7 +2446,15 @@ class MartinBot:
 
         return result
 
-    def _select_structure_entry_price(self, side: str, layer_num: int, current_price: float, avg_price: float):
+    def _select_structure_entry_price(
+        self,
+        side: str,
+        layer_num: int,
+        current_price: float,
+        avg_price: float,
+        pending_entry_price: Optional[float] = None,
+        phase: Optional[str] = None,
+    ):
         """
         根据最新支撑阻力，选择“下一层”挂单价
         规则：
@@ -2447,6 +2463,14 @@ class MartinBot:
         - 层数越深，优先更深一档结构位
         """
         last_sr = None
+        anchor_price = self._layer_anchor_price(
+            side,
+            current_price,
+            avg_price,
+            pending_entry_price=pending_entry_price,
+        )
+        min_gap_ratio = max(self._phase_config(phase).get('layer_min_gap_pct', 0.0), 0.0)
+
         for timeframe in self._structure_timeframes_for_layer(layer_num):
             sr = self.find_support_resistance(timeframe=timeframe)
             if not sr:
@@ -2458,19 +2482,30 @@ class MartinBot:
                 if not candidates:
                     continue
 
-                idx = min(max(layer_num - 2, 0), len(candidates) - 1)
-                preferred_price = candidates[idx] * (1 + self.level_offset_pct)
+                start_idx = min(max(layer_num - 2, 0), len(candidates) - 1)
                 max_entry_price = min(current_price, avg_price) * (1 - self.level_offset_pct)
-                return min(preferred_price, max_entry_price), sr
+                for idx in range(start_idx, len(candidates)):
+                    preferred_price = min(candidates[idx] * (1 + self.level_offset_pct), max_entry_price)
+                    if anchor_price > 0 and min_gap_ratio > 0:
+                        gap_ratio = (anchor_price - preferred_price) / anchor_price
+                        if gap_ratio < min_gap_ratio:
+                            continue
+                    return preferred_price, sr
+                continue
 
             candidates = [r for r in sr['resistance'] if r > current_price and r > avg_price]
             if not candidates:
                 continue
 
-            idx = min(max(layer_num - 2, 0), len(candidates) - 1)
-            preferred_price = candidates[idx] * (1 - self.level_offset_pct)
+            start_idx = min(max(layer_num - 2, 0), len(candidates) - 1)
             min_entry_price = max(current_price, avg_price) * (1 + self.level_offset_pct)
-            return max(preferred_price, min_entry_price), sr
+            for idx in range(start_idx, len(candidates)):
+                preferred_price = max(candidates[idx] * (1 - self.level_offset_pct), min_entry_price)
+                if anchor_price > 0 and min_gap_ratio > 0:
+                    gap_ratio = (preferred_price - anchor_price) / anchor_price
+                    if gap_ratio < min_gap_ratio:
+                        continue
+                return preferred_price, sr
 
         return None, last_sr
 
