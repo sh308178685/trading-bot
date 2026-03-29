@@ -1061,16 +1061,7 @@ class MartinBot:
             print("❌ 加仓数量低于交易所最小下单量")
             return None
 
-        ready, trigger_price, trigger_ratio = self._next_layer_trigger_ready(
-            position or {},
-            current_price,
-            layer_num,
-            pending_entry_price=anchor_pending_price,
-            phase=phase,
-        )
-        execute_price = self._price_to_precision(
-            self._marketable_trigger_execute_price(side, entry_price, trigger_price)
-        )
+        execute_price = self._price_to_precision(entry_price)
         return {
             'phase': phase,
             'layer_num': layer_num,
@@ -1078,9 +1069,9 @@ class MartinBot:
             'amount': amount,
             'entry_price': entry_price,
             'execute_price': execute_price,
-            'trigger_price': self._price_to_precision(trigger_price) if trigger_price > 0 else 0.0,
-            'trigger_ratio': trigger_ratio,
-            'ready': ready,
+            'trigger_price': 0.0,
+            'trigger_ratio': 0.0,
+            'ready': False,
             'source': source,
             'avg_price': avg_price,
             'current_price': current_price,
@@ -1109,16 +1100,12 @@ class MartinBot:
                 print(f"   VP结构位: {[f'{x:.2f}' for x in sr['vp_levels']]}")
                 print(f"   VP阻力: {[f'{x:.2f}' for x in sr.get('vp_resistance', [])]}")
                 print(f"   VP支撑: {[f'{x:.2f}' for x in sr.get('vp_support', [])]}")
-        if plan['trigger_price'] > 0:
-            print(
-                f"   下一层启动价: {plan['trigger_price']:.2f} | 实际触发委托价: {plan['execute_price']:.2f} "
-                f"| 最小不利波动: {plan['trigger_ratio']*100:.2f}%"
-            )
+        print(f"   委托价: {plan['execute_price']:.2f}")
 
     def _submit_add_order_plan(self, plan: Dict[str, Any]) -> bool:
         layer_num = int(plan['layer_num'])
         try:
-            if plan['ready']:
+            if plan['trigger_price'] <= 0:
                 if not self._submit_entry_order(plan['order_side'], plan['amount'], plan['execute_price'], f"第{layer_num}层"):
                     return False
                 print(f"✅ 第{layer_num}层加仓单已直接挂出")
@@ -1156,7 +1143,7 @@ class MartinBot:
         if existing_price != plan['execute_price']:
             return False
 
-        if plan['ready']:
+        if plan['trigger_price'] <= 0:
             return str(order.get('type', '')).lower() != 'trigger'
 
         if str(order.get('type', '')).lower() != 'trigger':
@@ -1188,9 +1175,9 @@ class MartinBot:
         execute_delta = self._relative_price_delta(existing_price, plan['execute_price'])
         refresh_threshold = max(self._safe_float(self.structure_refresh_threshold, 0.0), 0.0)
 
-        if plan['ready']:
+        if plan['trigger_price'] <= 0:
             if order_type == 'trigger':
-                return "触发状态已变化，需改为直接挂单"
+                return "当前挂单仍是条件单，需改为直接限价单"
             if execute_delta >= refresh_threshold:
                 return (
                     f"委托价偏离过大({existing_price:.2f} -> {plan['execute_price']:.2f}, "
@@ -3252,13 +3239,15 @@ class MartinBot:
                                         self._set_runtime_flag('pending_entry_price', pending_price)
                                     trigger_orders = [o for o in add_orders if o.get('type') == 'trigger']
                                     if trigger_orders:
-                                        trigger_price = self._safe_float(trigger_orders[0].get('triggerPrice', 0.0), 0.0)
                                         print(
-                                            f"📋 当前已有 {len(add_orders)} 个加仓条件单: "
-                                            f"启动价 {trigger_price:.2f}, 委托价 {pending_price:.2f}"
+                                            f"📋 当前已有 {len(add_orders)} 个加仓挂单: "
+                                            f"委托价 {pending_price:.2f}"
                                         )
                                     else:
-                                        print(f"📋 当前已有 {len(add_orders)} 个加仓挂单")
+                                        print(
+                                            f"📋 当前已有 {len(add_orders)} 个加仓挂单: "
+                                            f"委托价 {pending_price:.2f}"
+                                        )
                             else:
                                 if self.state.pending_layer != self.state.layer:
                                     self._set_runtime_flag('pending_layer', self.state.layer)
