@@ -1109,6 +1109,10 @@ class MartinBot:
         if sr:
             print(f"   最新阻力: {[f'{x:.2f}' for x in sr['resistance']]}")
             print(f"   最新支撑: {[f'{x:.2f}' for x in sr['support']]}")
+            if sr.get('vp_levels'):
+                print(f"   VP结构位: {[f'{x:.2f}' for x in sr['vp_levels']]}")
+                print(f"   VP阻力: {[f'{x:.2f}' for x in sr.get('vp_resistance', [])]}")
+                print(f"   VP支撑: {[f'{x:.2f}' for x in sr.get('vp_support', [])]}")
         if plan['trigger_price'] > 0:
             print(
                 f"   下一层启动价: {plan['trigger_price']:.2f} | 实际触发委托价: {plan['execute_price']:.2f} "
@@ -2365,6 +2369,65 @@ class MartinBot:
                 unique.append(timeframe)
         return unique
 
+    def _find_volume_profile_levels(self, timeframe=None, lookback=100) -> List[float]:
+        timeframe = str(timeframe or self.sr_timeframe)
+        lookback = max(int(lookback or 100), 20)
+        fetch_limit = max(lookback, self.atr_period + 20)
+        df = self.fetch_ohlcv_df(timeframe=timeframe, limit=fetch_limit)
+        if df is None or df.empty:
+            return []
+
+        df = self.add_indicators(df)
+        window = df.tail(lookback).copy()
+        if window.empty:
+            return []
+
+        price_min = self._safe_float(window['low'].min(), 0.0)
+        price_max = self._safe_float(window['high'].max(), 0.0)
+        price_range = max(price_max - price_min, 0.0)
+        if price_min <= 0 or price_max <= 0 or price_range <= 0:
+            return []
+
+        atr_value = self._safe_float(window['atr'].iloc[-1], 0.0)
+        fallback_width = price_range / 50 if price_range > 0 else 0.0
+        bin_width = max(atr_value * 0.5, fallback_width, price_min * 0.0005)
+        if bin_width <= 0:
+            return []
+
+        bin_count = max(int(price_range / bin_width) + 1, 1)
+        volume_bins = [0.0] * bin_count
+
+        for row in window.itertuples(index=False):
+            candle_low = self._safe_float(getattr(row, 'low', 0.0), 0.0)
+            candle_high = self._safe_float(getattr(row, 'high', 0.0), 0.0)
+            volume = max(self._safe_float(getattr(row, 'volume', 0.0), 0.0), 0.0)
+            if volume <= 0:
+                continue
+
+            start_price = min(candle_low, candle_high)
+            end_price = max(candle_low, candle_high)
+            start_idx = min(max(int((start_price - price_min) / bin_width), 0), bin_count - 1)
+            end_idx = min(max(int((end_price - price_min) / bin_width), 0), bin_count - 1)
+
+            touched_bins = max(end_idx - start_idx + 1, 1)
+            volume_per_bin = volume / touched_bins
+            for idx in range(start_idx, end_idx + 1):
+                volume_bins[idx] += volume_per_bin
+
+        ranked_bins = sorted(
+            [
+                (idx, volume)
+                for idx, volume in enumerate(volume_bins)
+                if volume > 0
+            ],
+            key=lambda item: (-item[1], item[0]),
+        )
+        top_levels = [
+            price_min + (idx + 0.5) * bin_width
+            for idx, _ in ranked_bins[:5]
+        ]
+        return self._dedupe_price_levels(top_levels, min_gap_ratio=0.001)
+
     def find_support_resistance(self, lookback=30, timeframe: Optional[str] = None):
         """
         返回最近 5 个支撑 / 阻力候选
@@ -2416,6 +2479,12 @@ class MartinBot:
             raw_res.append(ema20 * 1.01)
             raw_sup.append(ema20 * 0.99)
 
+        vp_levels = self._find_volume_profile_levels(timeframe=timeframe)
+        vp_resistance = [x for x in vp_levels if x > current_price]
+        vp_support = [x for x in vp_levels if x < current_price]
+        raw_res.extend(vp_resistance)
+        raw_sup.extend(vp_support)
+
         resistance_candidates = [x for x in raw_res if x > current_price]
         support_candidates = [x for x in raw_sup if x < current_price]
 
@@ -2436,11 +2505,15 @@ class MartinBot:
             'current_price': current_price,
             'gap_ratio': structure_gap_ratio,
             'atr': atr,
+            'vp_levels': vp_levels,
+            'vp_resistance': sorted(vp_resistance),
+            'vp_support': sorted(vp_support, reverse=True),
             'resistance': resistance_candidates[:5],
             'support': support_candidates[:5]
         }
 
         print(f"📊 支撑阻力[{timeframe}]: 当前价={current_price:.2f}")
+        print(f"  VP结构位: {[f'{x:.2f}' for x in vp_levels]}")
         print(f"  阻力: {[f'{x:.2f}' for x in result['resistance']]}")
         print(f"  支撑: {[f'{x:.2f}' for x in result['support']]}")
 
