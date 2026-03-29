@@ -38,6 +38,7 @@ import json
 import time
 import argparse
 import traceback
+import math
 import sys
 import os
 import atexit
@@ -882,6 +883,7 @@ class MartinBot:
         pending_entry_price: Optional[float] = None,
     ) -> float:
         candidates = [
+            self._safe_float(pending_entry_price, 0.0),
             self._safe_float(self.state.last_fill_price, 0.0),
             self._safe_float(avg_price, 0.0),
             self._safe_float(current_price, 0.0),
@@ -1155,6 +1157,94 @@ class MartinBot:
         baseline = max(abs(current_price), abs(target_price), 1e-9)
         return abs(current_price - target_price) / baseline
 
+    def _structure_side_distance(self, side: str, current_price: float, target_price: float) -> float:
+        if current_price <= 0 or target_price <= 0:
+            return float("inf")
+        if side == 'long':
+            return max(current_price - target_price, 0.0)
+        return max(target_price - current_price, 0.0)
+
+    def _is_structure_price_valid_for_side(self, side: str, current_price: float, avg_price: float, price: float) -> bool:
+        if price <= 0 or current_price <= 0 or avg_price <= 0:
+            return False
+        if side == 'long':
+            return price < current_price and price < avg_price
+        return price > current_price and price > avg_price
+
+    def _is_materially_better_structure_price(
+        self,
+        side: str,
+        current_price: float,
+        candidate_price: float,
+        reference_price: float,
+    ) -> bool:
+        candidate_distance = self._structure_side_distance(side, current_price, candidate_price)
+        reference_distance = self._structure_side_distance(side, current_price, reference_price)
+        if not math.isfinite(candidate_distance) or not math.isfinite(reference_distance):
+            return False
+        if candidate_distance >= reference_distance:
+            return False
+        if reference_distance <= 1e-9:
+            return True
+        improvement_ratio = (reference_distance - candidate_distance) / reference_distance
+        sticky_threshold = max(self._safe_float(self.structure_refresh_threshold, 0.0), 0.0)
+        return improvement_ratio >= sticky_threshold
+
+    def _select_sticky_structure_price(
+        self,
+        candidate_prices: List[float],
+        pending_entry_price: Optional[float] = None,
+    ) -> Optional[float]:
+        anchor_price = self._safe_float(pending_entry_price, 0.0)
+        if anchor_price <= 0 or not candidate_prices:
+            return None
+        nearest_price = min(candidate_prices, key=lambda price: abs(price - anchor_price))
+        sticky_delta = self._relative_price_delta(nearest_price, anchor_price)
+        sticky_threshold = max(
+            self._safe_float(self.structure_refresh_threshold, 0.0),
+            self._safe_float(self.level_offset_pct, 0.0) * 2.0,
+            0.001,
+        )
+        if sticky_delta <= sticky_threshold:
+            return nearest_price
+        return None
+
+    def _stabilize_plan_with_existing_entry(
+        self,
+        plan: Dict[str, Any],
+        orders: List[Dict[str, Any]],
+        current_price: float,
+    ) -> Dict[str, Any]:
+        if len(orders) != 1:
+            return plan
+        existing_order = orders[0]
+        existing_price = self._price_to_precision(self._safe_float(existing_order.get('price', 0.0), 0.0))
+        if existing_price <= 0:
+            return plan
+        if str(existing_order.get('side', '')).lower() != str(plan.get('order_side', '')).lower():
+            return plan
+        if self._normalize_amount(self._safe_float(existing_order.get('amount', 0.0), 0.0)) != plan.get('amount'):
+            return plan
+        if plan.get('trigger_price', 0.0) > 0:
+            return plan
+        side = str(plan.get('side') or self.state.position_side or '').lower()
+        avg_price = self._safe_float(plan.get('avg_price', 0.0), 0.0)
+        if side not in ('long', 'short'):
+            return plan
+        if not self._is_structure_price_valid_for_side(side, current_price, avg_price, existing_price):
+            return plan
+        if self._is_materially_better_structure_price(side, current_price, plan['execute_price'], existing_price):
+            return plan
+
+        stabilized_plan = dict(plan)
+        stabilized_plan['entry_price'] = existing_price
+        stabilized_plan['execute_price'] = existing_price
+        stabilized_plan['sticky_existing_price'] = True
+        stabilized_plan['sticky_reason'] = (
+            f"沿用现有挂单价 {existing_price:.2f}，新候选价 {plan['execute_price']:.2f} 未明显更优"
+        )
+        return stabilized_plan
+
     def _entry_order_refresh_reason(self, orders: List[Dict[str, Any]], plan: Dict[str, Any]) -> str:
         if not orders:
             return "当前没有加仓挂单"
@@ -1227,14 +1317,18 @@ class MartinBot:
         position: Dict[str, Any],
         reason_prefix: str = "",
     ) -> bool:
+        anchor_pending_price = self._pending_entry_price_from_orders(add_orders)
         plan = self._build_add_order_plan(
             next_layer,
             current_price,
             position=position,
-            anchor_pending_price=0.0,
+            anchor_pending_price=anchor_pending_price,
         )
         if plan is None:
             return False
+        plan = self._stabilize_plan_with_existing_entry(plan, add_orders, current_price)
+        if plan.get('sticky_existing_price'):
+            print(f"🧷 {reason_prefix}第{next_layer}层加仓挂单保持不动: {plan['sticky_reason']}")
 
         if self._entry_orders_match_plan(add_orders, plan):
             pending_price = self._pending_entry_price_from_orders(add_orders)
@@ -2520,6 +2614,7 @@ class MartinBot:
         """
         last_sr = None
         last_fill_price = self._safe_float(self.state.last_fill_price, 0.0)
+        pending_anchor_price = self._safe_float(pending_entry_price, 0.0)
         min_gap_ratio = max(self._phase_config(phase).get('layer_min_gap_pct', 0.0), 0.0)
 
         for timeframe in self._structure_timeframes_for_layer(layer_num):
@@ -2537,13 +2632,22 @@ class MartinBot:
                     continue
 
                 max_entry_price = min(current_price, avg_price) * (1 - self.level_offset_pct)
+                valid_prices: List[float] = []
                 for candidate in candidates:
                     preferred_price = min(candidate * (1 + self.level_offset_pct), max_entry_price)
                     if last_fill_price > 0 and min_gap_ratio > 0:
                         gap_ratio = (last_fill_price - preferred_price) / last_fill_price
                         if gap_ratio < min_gap_ratio:
                             continue
-                    return preferred_price, sr
+                    valid_prices.append(preferred_price)
+                sticky_price = self._select_sticky_structure_price(
+                    valid_prices,
+                    pending_entry_price=pending_anchor_price,
+                )
+                if sticky_price is not None:
+                    return sticky_price, sr
+                if valid_prices:
+                    return valid_prices[0], sr
                 continue
 
             candidates = sorted(
@@ -2553,13 +2657,22 @@ class MartinBot:
                 continue
 
             min_entry_price = max(current_price, avg_price) * (1 + self.level_offset_pct)
+            valid_prices = []
             for candidate in candidates:
                 preferred_price = max(candidate * (1 - self.level_offset_pct), min_entry_price)
                 if last_fill_price > 0 and min_gap_ratio > 0:
                     gap_ratio = (preferred_price - last_fill_price) / last_fill_price
                     if gap_ratio < min_gap_ratio:
                         continue
-                return preferred_price, sr
+                valid_prices.append(preferred_price)
+            sticky_price = self._select_sticky_structure_price(
+                valid_prices,
+                pending_entry_price=pending_anchor_price,
+            )
+            if sticky_price is not None:
+                return sticky_price, sr
+            if valid_prices:
+                return valid_prices[0], sr
 
         return None, last_sr
 
