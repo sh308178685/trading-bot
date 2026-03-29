@@ -883,10 +883,6 @@ class MartinBot:
     ) -> float:
         candidates = [
             self._safe_float(self.state.last_fill_price, 0.0),
-            self._safe_float(
-                self.state.pending_entry_price if pending_entry_price is None else pending_entry_price,
-                0.0,
-            ),
             self._safe_float(avg_price, 0.0),
             self._safe_float(current_price, 0.0),
         ]
@@ -2533,15 +2529,10 @@ class MartinBot:
         规则：
         - 做多：优先找低于当前价、低于均价的支撑位
         - 做空：优先找高于当前价、高于均价的阻力位
-        - 候选结构位按离当前价从近到远逐个检查，满足最小间距才使用
+        - 若已有实际成交价，仅检查候选结构位与 last_fill_price 的最小间距
         """
         last_sr = None
-        anchor_price = self._layer_anchor_price(
-            side,
-            current_price,
-            avg_price,
-            pending_entry_price=pending_entry_price,
-        )
+        last_fill_price = self._safe_float(self.state.last_fill_price, 0.0)
         min_gap_ratio = max(self._phase_config(phase).get('layer_min_gap_pct', 0.0), 0.0)
 
         for timeframe in self._structure_timeframes_for_layer(layer_num):
@@ -2561,8 +2552,8 @@ class MartinBot:
                 max_entry_price = min(current_price, avg_price) * (1 - self.level_offset_pct)
                 for candidate in candidates:
                     preferred_price = min(candidate * (1 + self.level_offset_pct), max_entry_price)
-                    if anchor_price > 0 and min_gap_ratio > 0:
-                        gap_ratio = (anchor_price - preferred_price) / anchor_price
+                    if last_fill_price > 0 and min_gap_ratio > 0:
+                        gap_ratio = (last_fill_price - preferred_price) / last_fill_price
                         if gap_ratio < min_gap_ratio:
                             continue
                     return preferred_price, sr
@@ -2577,8 +2568,8 @@ class MartinBot:
             min_entry_price = max(current_price, avg_price) * (1 + self.level_offset_pct)
             for candidate in candidates:
                 preferred_price = max(candidate * (1 - self.level_offset_pct), min_entry_price)
-                if anchor_price > 0 and min_gap_ratio > 0:
-                    gap_ratio = (preferred_price - anchor_price) / anchor_price
+                if last_fill_price > 0 and min_gap_ratio > 0:
+                    gap_ratio = (preferred_price - last_fill_price) / last_fill_price
                     if gap_ratio < min_gap_ratio:
                         continue
                 return preferred_price, sr
