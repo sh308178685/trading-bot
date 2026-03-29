@@ -2460,7 +2460,7 @@ class MartinBot:
         规则：
         - 做多：优先找低于当前价、低于均价的支撑位
         - 做空：优先找高于当前价、高于均价的阻力位
-        - 层数越深，优先更深一档结构位
+        - 候选结构位按离当前价从近到远逐个检查，满足最小间距才使用
         """
         last_sr = None
         anchor_price = self._layer_anchor_price(
@@ -2478,14 +2478,16 @@ class MartinBot:
             last_sr = sr
 
             if side == 'long':
-                candidates = [s for s in sr['support'] if s < current_price and s < avg_price]
+                candidates = sorted(
+                    [s for s in sr['support'] if s < current_price and s < avg_price],
+                    reverse=True,
+                )
                 if not candidates:
                     continue
 
-                start_idx = min(max(layer_num - 2, 0), len(candidates) - 1)
                 max_entry_price = min(current_price, avg_price) * (1 - self.level_offset_pct)
-                for idx in range(start_idx, len(candidates)):
-                    preferred_price = min(candidates[idx] * (1 + self.level_offset_pct), max_entry_price)
+                for candidate in candidates:
+                    preferred_price = min(candidate * (1 + self.level_offset_pct), max_entry_price)
                     if anchor_price > 0 and min_gap_ratio > 0:
                         gap_ratio = (anchor_price - preferred_price) / anchor_price
                         if gap_ratio < min_gap_ratio:
@@ -2493,14 +2495,15 @@ class MartinBot:
                     return preferred_price, sr
                 continue
 
-            candidates = [r for r in sr['resistance'] if r > current_price and r > avg_price]
+            candidates = sorted(
+                [r for r in sr['resistance'] if r > current_price and r > avg_price]
+            )
             if not candidates:
                 continue
 
-            start_idx = min(max(layer_num - 2, 0), len(candidates) - 1)
             min_entry_price = max(current_price, avg_price) * (1 + self.level_offset_pct)
-            for idx in range(start_idx, len(candidates)):
-                preferred_price = max(candidates[idx] * (1 - self.level_offset_pct), min_entry_price)
+            for candidate in candidates:
+                preferred_price = max(candidate * (1 - self.level_offset_pct), min_entry_price)
                 if anchor_price > 0 and min_gap_ratio > 0:
                     gap_ratio = (preferred_price - anchor_price) / anchor_price
                     if gap_ratio < min_gap_ratio:
