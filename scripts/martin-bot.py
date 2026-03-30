@@ -211,6 +211,32 @@ class MartinBot:
             self.config.get('mean_reversion_entry_atr_ratio', 0.35),
             0.35,
         )
+        self.strong_trend_entry_enabled = bool(self.config.get('strong_trend_entry_enabled', True))
+        self.strong_trend_entry_adx = self._safe_float(
+            self.config.get(
+                'strong_trend_entry_adx',
+                max(self.trend_follow_adx_threshold + 4.0, self.adx_threshold + 10.0),
+            ),
+            max(self.trend_follow_adx_threshold + 4.0, self.adx_threshold + 10.0),
+        )
+        self.strong_trend_entry_mode = str(
+            self.config.get('strong_trend_entry_mode', 'marketable_limit')
+        ).lower()
+        self.strong_trend_limit_offset_pct = max(
+            self._safe_float(self.config.get('strong_trend_limit_offset_pct', 0.0003), 0.0003),
+            0.0,
+        )
+        self.strong_trend_pullback_atr_ratio = max(
+            self._safe_float(self.config.get('strong_trend_pullback_atr_ratio', 0.15), 0.15),
+            0.0,
+        )
+        self.strong_trend_max_pullback_pct = max(
+            self._safe_float(self.config.get('strong_trend_max_pullback_pct', 0.0015), 0.0015),
+            0.0,
+        )
+        self.keep_pending_entry_on_stretched = bool(
+            self.config.get('keep_pending_entry_on_stretched', True)
+        )
 
         self.phase_switch_loss_pct = self._safe_float(self.config.get('phase_switch_loss_pct', 0.025), 0.025)
         self.phase_switch_layer = max(int(self.config.get('phase_switch_layer', 4)), 2)
@@ -2155,16 +2181,24 @@ class MartinBot:
             retry_amount = self._normalize_amount(current_amount * self.insufficient_balance_shrink_ratio)
         return retry_amount
 
-    def _submit_entry_order(self, order_side: str, amount: float, entry_price: float, label: str) -> bool:
+    def _submit_entry_order(
+        self,
+        order_side: str,
+        amount: float,
+        entry_price: float,
+        label: str,
+        order_type: str = 'limit',
+    ) -> bool:
         with self.action_lock:
             if self._exit_in_progress.is_set():
                 print(f"⚠️ {label} 下单前检测到平仓流程进行中，跳过本次挂单")
                 return False
             try:
-                self.exchange.create_order(self.symbol, 'limit', order_side, amount, entry_price)
+                create_price = entry_price if order_type == 'limit' else None
+                self.exchange.create_order(self.symbol, order_type, order_side, amount, create_price)
                 return True
             except Exception as e:
-                if self._is_insufficient_balance_error(e):
+                if order_type == 'limit' and self._is_insufficient_balance_error(e):
                     retry_amount = self._calculate_retry_amount(amount, entry_price)
                     if retry_amount > 0 and retry_amount < amount:
                         print(
@@ -2376,10 +2410,10 @@ class MartinBot:
     def _infer_signal(self, row) -> Tuple[str, str]:
         return self._entry_bias_from_row(row)
 
-    def get_trend(self) -> Tuple[Optional[str], Optional[float]]:
+    def get_trend_context(self) -> Optional[Dict[str, Any]]:
         df = self.fetch_ohlcv_df(limit=self.trend_lookback)
         if df is None:
-            return None, None
+            return None
 
         df = self.add_indicators(df)
         row = df.iloc[-1]
@@ -2400,7 +2434,129 @@ class MartinBot:
             f"ADX={adx_val:.1f}"
         )
         print(f"📈 市场状态: {market_state} | 信号: {signal}")
-        return signal, current_price
+        return {
+            'market_state': market_state,
+            'signal': signal,
+            'price': current_price,
+            'ema_fast': fast_ema_val,
+            'ema_slow': slow_ema_val,
+            'rsi': rsi_val,
+            'adx': adx_val,
+            'atr': self._safe_float(row.get('atr'), 0.0),
+        }
+
+    def get_trend(self) -> Tuple[Optional[str], Optional[float]]:
+        context = self.get_trend_context()
+        if not context:
+            return None, None
+        return context['signal'], context['price']
+
+    def _first_entry_should_use_aggressive_trend_plan(
+        self,
+        trade_side: str,
+        trend_context: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not self.strong_trend_entry_enabled or not trend_context:
+            return False
+        signal = str(trend_context.get('signal') or '').upper()
+        adx = self._safe_float(trend_context.get('adx'), 0.0)
+        desired_signal = 'LONG' if trade_side.lower() == 'long' else 'SHORT'
+        return signal == desired_signal and adx >= self.strong_trend_entry_adx
+
+    def _is_pending_entry_signal_compatible(
+        self,
+        trade_side: str,
+        trend_context: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not trend_context:
+            return False
+        signal = str(trend_context.get('signal') or '').upper()
+        market_state = str(trend_context.get('market_state') or '').upper()
+        side = trade_side.lower()
+        if side == 'long':
+            if signal == 'LONG':
+                return True
+            return self.keep_pending_entry_on_stretched and market_state == 'BULLISH_BUT_STRETCHED'
+        if side == 'short':
+            if signal == 'SHORT':
+                return True
+            return self.keep_pending_entry_on_stretched and market_state == 'BEARISH_BUT_STRETCHED'
+        return False
+
+    def _build_first_entry_plan(
+        self,
+        trade_side: str,
+        current_price: float,
+        sr: Optional[Dict[str, Any]],
+        trend_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        side = trade_side.lower()
+        order_side = 'sell' if side == 'short' else 'buy'
+        plan = {
+            'entry_type': 'limit',
+            'entry_price': 0.0,
+            'source': 'structure',
+            'order_side': order_side,
+        }
+
+        if self._first_entry_should_use_aggressive_trend_plan(side, trend_context):
+            if self.strong_trend_entry_mode == 'market':
+                plan['entry_type'] = 'market'
+                plan['entry_price'] = current_price
+                plan['source'] = 'strong_trend_market'
+                return plan
+
+            offset = self.strong_trend_limit_offset_pct
+            if side == 'long':
+                plan['entry_price'] = current_price * (1 + offset)
+            else:
+                plan['entry_price'] = current_price * (1 - offset)
+            plan['source'] = 'strong_trend_marketable_limit'
+            return plan
+
+        atr_value = self._safe_float((trend_context or {}).get('atr'), 0.0)
+        atr_pullback_ratio = (atr_value / current_price) * self.strong_trend_pullback_atr_ratio if current_price > 0 else 0.0
+        allowed_pullback_pct = max(
+            self.level_offset_pct,
+            min(self.strong_trend_max_pullback_pct, atr_pullback_ratio) if atr_pullback_ratio > 0 else self.level_offset_pct,
+        )
+
+        if sr:
+            if side == 'short':
+                levels = sr['resistance']
+                if levels:
+                    preferred_price = levels[0] * (1 - self.level_offset_pct)
+                    if trend_context and str(trend_context.get('signal') or '').upper() == 'SHORT':
+                        max_chase_price = current_price * (1 + allowed_pullback_pct)
+                        plan['entry_price'] = min(preferred_price, max_chase_price)
+                        plan['source'] = 'structure_clamped_short'
+                    else:
+                        min_entry_price = current_price * (1 + self.level_offset_pct)
+                        plan['entry_price'] = max(preferred_price, min_entry_price)
+                else:
+                    plan['entry_price'] = current_price * (1 + self.level_offset_pct)
+                    plan['source'] = 'fallback_short'
+            else:
+                levels = sr['support']
+                if levels:
+                    preferred_price = levels[0] * (1 + self.level_offset_pct)
+                    if trend_context and str(trend_context.get('signal') or '').upper() == 'LONG':
+                        min_chase_price = current_price * (1 - allowed_pullback_pct)
+                        plan['entry_price'] = max(preferred_price, min_chase_price)
+                        plan['source'] = 'structure_clamped_long'
+                    else:
+                        max_entry_price = current_price * (1 - self.level_offset_pct)
+                        plan['entry_price'] = min(preferred_price, max_entry_price)
+                else:
+                    plan['entry_price'] = current_price * (1 - self.level_offset_pct)
+                    plan['source'] = 'fallback_long'
+        else:
+            plan['entry_price'] = current_price * (
+                (1 + self.level_offset_pct) if side == 'short' else (1 - self.level_offset_pct)
+            )
+            plan['source'] = 'no_structure_fallback'
+
+        return plan
 
     # =========================================================
     # 支撑阻力
@@ -3013,31 +3169,20 @@ class MartinBot:
             print("❌ 当前可新增保证金不足，跳过首仓")
             return False
 
+        trend_context = self.get_trend_context()
         sr = self.find_support_resistance()
-
-        if sr:
-            if trade_side.lower() == 'short':
-                levels = sr['resistance']
-                if levels:
-                    preferred_price = levels[0] * (1 - self.level_offset_pct)
-                    min_entry_price = current_price * (1 + self.level_offset_pct)
-                    entry_price = max(preferred_price, min_entry_price)
-                else:
-                    entry_price = current_price * (1 + self.level_offset_pct)
-            else:
-                levels = sr['support']
-                if levels:
-                    preferred_price = levels[0] * (1 + self.level_offset_pct)
-                    max_entry_price = current_price * (1 - self.level_offset_pct)
-                    entry_price = min(preferred_price, max_entry_price)
-                else:
-                    entry_price = current_price * (1 - self.level_offset_pct)
+        entry_plan = self._build_first_entry_plan(
+            trade_side,
+            current_price,
+            sr,
+            trend_context=trend_context,
+        )
+        entry_type = str(entry_plan.get('entry_type', 'limit')).lower()
+        entry_price = self._safe_float(entry_plan.get('entry_price', current_price), current_price)
+        if entry_type == 'limit':
+            entry_price = self._price_to_precision(entry_price)
         else:
-            entry_price = current_price * (
-                (1 + self.level_offset_pct) if trade_side.lower() == 'short' else (1 - self.level_offset_pct)
-            )
-
-        entry_price = self._price_to_precision(entry_price)
+            entry_price = current_price
         amount = (base_margin * self.leverage) / entry_price
         amount = self._normalize_amount(amount)
 
@@ -3045,10 +3190,19 @@ class MartinBot:
             print("❌ 首仓数量低于交易所最小下单量")
             return False
 
-        print(f"📋 首仓: {order_side.upper()} {amount} @ {entry_price} (保证金 {base_margin:.2f} USDT)")
+        if entry_type == 'market':
+            print(
+                f"📋 首仓: {order_side.upper()} {amount} @ 市价参考 {entry_price:.2f} "
+                f"(保证金 {base_margin:.2f} USDT, 来源 {entry_plan['source']})"
+            )
+        else:
+            print(
+                f"📋 首仓: {order_side.upper()} {amount} @ {entry_price} "
+                f"(保证金 {base_margin:.2f} USDT, 来源 {entry_plan['source']})"
+            )
 
         try:
-            if not self._submit_entry_order(order_side, amount, entry_price, "首仓"):
+            if not self._submit_entry_order(order_side, amount, entry_price, "首仓", order_type=entry_type):
                 return False
             print("✅ 首仓挂单已挂出")
 
@@ -3061,7 +3215,7 @@ class MartinBot:
             self.state.partial_tp_2_done = False
             self.state.activated = False
             self.state.entry_price = entry_price
-            self.state.pending_entry_price = entry_price
+            self.state.pending_entry_price = 0.0 if entry_type == 'market' else entry_price
             self.state.last_fill_price = 0.0
             self.state.last_fill_time = ""
             self.state.protective_stop_active = False
@@ -3232,7 +3386,9 @@ class MartinBot:
                             time.sleep(self.loop_interval)
                             continue
 
-                        signal, price = self.get_trend()
+                        trend_context = self.get_trend_context()
+                        signal = trend_context['signal'] if trend_context else None
+                        price = trend_context['price'] if trend_context else None
                         if signal == "SHORT":
                             self.place_first_order('short', price)
                         elif signal == "LONG":
@@ -3395,7 +3551,9 @@ class MartinBot:
                                 continue
 
                             # 无持仓但有挂单 -> 检查趋势
-                            signal, price = self.get_trend()
+                            trend_context = self.get_trend_context()
+                            signal = trend_context['signal'] if trend_context else None
+                            price = trend_context['price'] if trend_context else None
 
                             if self.state.position_side == 'long' and signal == 'SHORT':
                                 print("⚠️ 原计划做多，但当前更适合反向做空，撤单重挂")
@@ -3410,9 +3568,15 @@ class MartinBot:
                                 self.place_first_order('long', price)
 
                             elif signal == "WAIT":
-                                print("📊 横盘，取消挂单，等待更清晰信号")
-                                self.cancel_all_orders()
-                                self._reset_state()
+                                if self._is_pending_entry_signal_compatible(
+                                    str(self.state.position_side or ''),
+                                    trend_context,
+                                ):
+                                    print("📊 信号转为 stretched，但趋势方向仍兼容，保留首仓挂单继续等待")
+                                else:
+                                    print("📊 横盘/方向失效，取消挂单，等待更清晰信号")
+                                    self.cancel_all_orders()
+                                    self._reset_state()
 
                             else:
                                 print("📊 趋势与挂单方向兼容，继续等待成交")
