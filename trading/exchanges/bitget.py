@@ -1305,7 +1305,13 @@ class BitgetExchangeAdapter(ExchangeAdapter):
         order_id: str | None = None,
         client_oid: str | None = None,
         size: Any = None,
+        delegate_type: str = "2",
     ) -> dict[str, Any]:
+        """Modify a TPSL plan order.
+
+        Args:
+            delegate_type: Bitget required field. "1" = take profit, "2" = stop loss.
+        """
         if not order_id and not client_oid:
             raise ValueError("order_id or client_oid is required")
 
@@ -1321,6 +1327,7 @@ class BitgetExchangeAdapter(ExchangeAdapter):
             "triggerPrice": self.price_to_precision(symbol, normalized_trigger_price),
             "triggerType": trigger_type,
             "executePrice": self.price_to_precision(symbol, execute_value),
+            "delegateType": delegate_type,
         }
         if order_id:
             request["orderId"] = order_id
