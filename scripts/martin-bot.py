@@ -146,6 +146,7 @@ class RuntimeState:
     pending_layer: int = 0
     phase: str = "PHASE1"
     last_phase: str = "PHASE1"
+    phase2_start_layer: int = 0
     pending_entry_price: float = 0.0
     last_fill_price: float = 0.0
     last_fill_time: str = ""
@@ -799,9 +800,13 @@ class MartinBot:
             return primary_index
 
         if phase == 'PHASE2':
-            # PHASE2 允许因亏损提前切换，此时下一层可能仍是全局第2/3层。
-            # 这种情况下回退到 PHASE2 阶段内层号索引，避免误判为“未配置倍率”。
-            fallback_index = layer_num - 1
+            # PHASE2 允许因亏损提前切换，此时需要基于 PHASE2 实际起始层号
+            # 计算阶段内索引，保证倍率在提前切换路径下也保持递增。
+            phase2_start_layer = int(getattr(self.state, 'phase2_start_layer', 0) or 0)
+            if phase2_start_layer > 0:
+                fallback_index = layer_num - phase2_start_layer
+            else:
+                fallback_index = layer_num - offset - 1
             if 0 <= fallback_index < len(layer_multipliers):
                 return fallback_index
 
@@ -834,6 +839,7 @@ class MartinBot:
             if str(self.state.phase or 'PHASE1').upper() != 'PHASE2':
                 with self.state_lock:
                     self.state.phase = 'PHASE2'
+                    self.state.phase2_start_layer = max(self.state.layer + 1, 1)
                 self._save_runtime_state()
                 print(
                     f"🧭 阶段切换: PHASE1 -> PHASE2 "
@@ -844,6 +850,7 @@ class MartinBot:
         if str(self.state.phase or 'PHASE1').upper() != 'PHASE1':
             with self.state_lock:
                 self.state.phase = 'PHASE1'
+                self.state.phase2_start_layer = 0
             self._save_runtime_state()
         return 'PHASE1'
 
@@ -1725,6 +1732,7 @@ class MartinBot:
                 pending_layer=raw.get('pending_layer', raw.get('layer', 0)),
                 phase=raw.get('phase', 'PHASE1'),
                 last_phase=raw.get('last_phase', raw.get('phase', 'PHASE1')),
+                phase2_start_layer=raw.get('phase2_start_layer', 0),
                 pending_entry_price=raw.get('pending_entry_price', 0.0),
                 last_fill_price=raw.get('last_fill_price', 0.0),
                 last_fill_time=raw.get('last_fill_time', ""),
