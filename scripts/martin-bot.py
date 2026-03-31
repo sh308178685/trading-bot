@@ -789,6 +789,24 @@ class MartinBot:
             'layer_trigger_atr_multiplier': self.phase1_layer_trigger_atr_multiplier,
         }
 
+    def _resolve_phase_layer_index(self, phase_cfg: Dict[str, Any], layer_num: int) -> int:
+        layer_multipliers = list(phase_cfg.get('layer_multipliers') or [])
+        phase = str(phase_cfg.get('phase', 'PHASE1')).upper()
+        offset = int(phase_cfg.get('layer_index_offset', 0))
+
+        primary_index = layer_num - offset - 1
+        if 0 <= primary_index < len(layer_multipliers):
+            return primary_index
+
+        if phase == 'PHASE2':
+            # PHASE2 允许因亏损提前切换，此时下一层可能仍是全局第2/3层。
+            # 这种情况下回退到 PHASE2 阶段内层号索引，避免误判为“未配置倍率”。
+            fallback_index = layer_num - 1
+            if 0 <= fallback_index < len(layer_multipliers):
+                return fallback_index
+
+        return -1
+
     def _should_switch_to_phase2(
         self,
         position: Optional[Dict[str, Any]] = None,
@@ -1068,7 +1086,7 @@ class MartinBot:
         entry_price = self._price_to_precision(entry_price)
 
         layer_multipliers = phase_cfg['layer_multipliers']
-        phase_layer_index = layer_num - int(phase_cfg.get('layer_index_offset', 0)) - 1
+        phase_layer_index = self._resolve_phase_layer_index(phase_cfg, layer_num)
         if phase_layer_index < 0 or phase_layer_index >= len(layer_multipliers):
             print(f"⚠️ 当前阶段 {phase} 未配置第{layer_num}层倍率，跳过加仓")
             return None
