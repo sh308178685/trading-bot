@@ -79,6 +79,34 @@ def main():
         expected_multipliers=[2.4, 3.9, 5.3, 6.8],
     )
 
+    legacy_bot = module.MartinBot.__new__(module.MartinBot)
+    legacy_bot.phase_switch_layer = 4
+    legacy_bot.phase1_max_layers = 3
+    legacy_bot.state = module.RuntimeState(
+        layer=2,
+        phase="PHASE2",
+        phase2_start_layer=0,
+    )
+    repaired = legacy_bot._repair_phase2_start_layer()
+    if not repaired or legacy_bot.state.phase2_start_layer != 2:
+        raise AssertionError(
+            "历史状态修复错误: "
+            f"repaired={repaired}, phase2_start_layer={legacy_bot.state.phase2_start_layer}"
+        )
+    legacy_phase_cfg = {
+        "phase": "PHASE2",
+        "layer_index_offset": legacy_bot.phase1_max_layers,
+        "layer_multipliers": [2.4, 3.9, 5.3, 6.8, 8.4, 10.1],
+    }
+    legacy_index = legacy_bot._resolve_phase_layer_index(legacy_phase_cfg, 3)
+    if legacy_index != 1:
+        raise AssertionError(f"历史状态索引错误: expected=1, actual={legacy_index}")
+    print("历史状态修复:")
+    print(
+        f"  layer {legacy_bot.state.layer} -> "
+        f"phase2_start_layer {legacy_bot.state.phase2_start_layer}, next index {legacy_index}"
+    )
+
     print("验证通过")
 
 

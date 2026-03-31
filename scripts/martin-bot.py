@@ -790,6 +790,30 @@ class MartinBot:
             'layer_trigger_atr_multiplier': self.phase1_layer_trigger_atr_multiplier,
         }
 
+    def _infer_phase2_start_layer(self, layer: Optional[int] = None) -> int:
+        layer_num = int(self.state.layer if layer is None else layer)
+        if layer_num < self.phase_switch_layer:
+            return max(layer_num, 1)
+        return self.phase1_max_layers + 1
+
+    def _repair_phase2_start_layer(self) -> bool:
+        if str(self.state.phase or 'PHASE1').upper() != 'PHASE2':
+            return False
+        current = int(getattr(self.state, 'phase2_start_layer', 0) or 0)
+        if current > 0:
+            return False
+
+        inferred = self._infer_phase2_start_layer()
+        if inferred <= 0:
+            return False
+
+        self.state.phase2_start_layer = inferred
+        print(
+            f"🔧 修复历史 PHASE2 状态: layer={self.state.layer}, "
+            f"推断 phase2_start_layer={inferred}"
+        )
+        return True
+
     def _resolve_phase_layer_index(self, phase_cfg: Dict[str, Any], layer_num: int) -> int:
         layer_multipliers = list(phase_cfg.get('layer_multipliers') or [])
         phase = str(phase_cfg.get('phase', 'PHASE1')).upper()
@@ -799,6 +823,8 @@ class MartinBot:
 
         if phase == 'PHASE2':
             phase2_start_layer = int(getattr(self.state, 'phase2_start_layer', 0) or 0)
+            if phase2_start_layer <= 0:
+                phase2_start_layer = self._infer_phase2_start_layer()
             # PHASE2 允许因亏损提前切换。只要实际起点不是正常路径的起点，
             # 就优先按实际起始层号计算阶段内索引，避免 primary_index 在覆盖区抢先命中。
             force_fallback = (
@@ -1760,6 +1786,9 @@ class MartinBot:
                 entry_price=raw.get('entry_price', 0.0),
                 last_update=raw.get('last_update', ""),
             )
+            repaired = self._repair_phase2_start_layer()
+            if repaired:
+                self._save_runtime_state()
             print(
                 f"✅ 加载状态: layer={self.state.layer}, "
                 f"best_profit={self.state.best_profit_pct*100:.2f}%, "
@@ -3340,6 +3369,7 @@ class MartinBot:
 
             self.state.layer = self.estimate_current_layer(contracts, price, balance)
             self.state.phase = self._current_phase(position, current_price=price)
+            self._repair_phase2_start_layer()
             self.state.pending_layer = (
                 min(self.max_layers, self.state.layer + 1)
                 if non_reduce_orders else self.state.layer
