@@ -148,6 +148,7 @@ class RuntimeState:
     last_phase: str = "PHASE1"
     phase2_start_layer: int = 0
     pending_entry_price: float = 0.0
+    pending_entry_amount: float = 0.0
     last_fill_price: float = 0.0
     last_fill_time: str = ""
     protective_stop_active: bool = False
@@ -332,6 +333,10 @@ class MartinBot:
         self.error_sleep = self.config.get('error_sleep', 60)
         self.min_balance = self.config.get('min_balance', 10.0)
         self.order_margin_safety_ratio = self.config.get('order_margin_safety_ratio', 0.95)
+        self.entry_amount_refresh_tolerance = max(
+            self._safe_float(self.config.get('entry_amount_refresh_tolerance', 0.01), 0.01),
+            0.0,
+        )
         self.insufficient_balance_shrink_ratio = self.config.get('insufficient_balance_shrink_ratio', 0.90)
         self.ws_risk_monitor_enabled = bool(
             self.config.get('ws_risk_monitor_enabled', self.config.get('wsEnabled', True))
@@ -385,7 +390,7 @@ class MartinBot:
     def _save_json(self, path, data):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + '.tmp')
+        temp_path = path.with_suffix(path.suffix + f'.{os.getpid()}.tmp')
         with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(temp_path, path)
@@ -960,7 +965,26 @@ class MartinBot:
         if not non_reduce_orders:
             return 0.0
         order = non_reduce_orders[0]
-        return self._safe_float(order.get('price', 0))
+        price = self._safe_float(order.get('price', 0))
+        return price if self._is_sane_pending_entry_price(price) else 0.0
+
+    def _is_sane_pending_entry_price(self, price: float) -> bool:
+        price = self._safe_float(price, 0.0)
+        if price <= 0:
+            return False
+        references = [
+            self._safe_float(self.state.pending_entry_price, 0.0),
+            self._safe_float(self.state.last_fill_price, 0.0),
+            self._safe_float(self.state.entry_price, 0.0),
+        ]
+        references = [value for value in references if value > 0]
+        if not references:
+            return True
+        anchor = min(references) if str(self.state.position_side or '').lower() == 'long' else max(references)
+        if anchor <= 0:
+            return True
+        ratio = price / anchor
+        return 0.7 <= ratio <= 1.3
 
     def _layer_anchor_price(
         self,
@@ -1191,6 +1215,37 @@ class MartinBot:
                 print(f"   VP支撑: {[f'{x:.2f}' for x in sr.get('vp_support', [])]}")
         print(f"   委托价: {plan['execute_price']:.2f}")
 
+    def _amount_delta_ratio(self, left: float, right: float) -> float:
+        left_value = abs(self._safe_float(left, 0.0))
+        right_value = abs(self._safe_float(right, 0.0))
+        return abs(left_value - right_value) / max(left_value, right_value, 1e-9)
+
+    def _stabilize_plan_amount_with_existing_entry(
+        self,
+        plan: Dict[str, Any],
+        orders: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if len(orders) != 1:
+            return plan
+        existing_order = orders[0]
+        if str(existing_order.get('side', '')).lower() != str(plan.get('order_side', '')).lower():
+            return plan
+
+        existing_amount = self._normalize_amount(self._safe_float(existing_order.get('amount', 0.0), 0.0))
+        if existing_amount <= 0:
+            return plan
+
+        if self._amount_delta_ratio(existing_amount, plan.get('amount', 0.0)) > self.entry_amount_refresh_tolerance:
+            return plan
+
+        stabilized_plan = dict(plan)
+        stabilized_plan['amount'] = existing_amount
+        stabilized_plan['sticky_amount_reason'] = (
+            f"沿用现有挂单数量 {existing_amount}，新候选数量 {plan['amount']} 偏差未超过 "
+            f"{self.entry_amount_refresh_tolerance*100:.2f}%"
+        )
+        return stabilized_plan
+
     def _submit_add_order_plan(self, plan: Dict[str, Any]) -> bool:
         layer_num = int(plan['layer_num'])
         try:
@@ -1212,6 +1267,7 @@ class MartinBot:
             self.state.phase = plan['phase']
             self.state.pending_layer = max(self.state.layer, min(layer_num, self.max_layers))
             self.state.pending_entry_price = plan['execute_price']
+            self.state.pending_entry_amount = plan['amount']
             self._save_runtime_state()
             self._write_live_snapshot(force=True, include_market=True)
             return True
@@ -1225,7 +1281,8 @@ class MartinBot:
         order = orders[0]
         if str(order.get('side', '')).lower() != str(plan['order_side']).lower():
             return False
-        if self._normalize_amount(self._safe_float(order.get('amount', 0.0), 0.0)) != plan['amount']:
+        existing_amount = self._normalize_amount(self._safe_float(order.get('amount', 0.0), 0.0))
+        if self._amount_delta_ratio(existing_amount, plan['amount']) > self.entry_amount_refresh_tolerance:
             return False
 
         existing_price = self._price_to_precision(self._safe_float(order.get('price', 0.0), 0.0))
@@ -1345,7 +1402,7 @@ class MartinBot:
             return f"方向不一致({existing_side} -> {plan['order_side']})"
 
         existing_amount = self._normalize_amount(self._safe_float(order.get('amount', 0.0), 0.0))
-        if existing_amount != plan['amount']:
+        if self._amount_delta_ratio(existing_amount, plan['amount']) > self.entry_amount_refresh_tolerance:
             return f"数量不一致({existing_amount} -> {plan['amount']})"
 
         existing_price = self._price_to_precision(self._safe_float(order.get('price', 0.0), 0.0))
@@ -1413,7 +1470,10 @@ class MartinBot:
         )
         if plan is None:
             return False
+        plan = self._stabilize_plan_amount_with_existing_entry(plan, add_orders)
         plan = self._stabilize_plan_with_existing_entry(plan, add_orders, current_price)
+        if plan.get('sticky_amount_reason'):
+            print(f"🧷 {reason_prefix}第{next_layer}层加仓数量保持不动: {plan['sticky_amount_reason']}")
         if plan.get('sticky_existing_price'):
             print(f"🧷 {reason_prefix}第{next_layer}层加仓挂单保持不动: {plan['sticky_reason']}")
 
@@ -1770,6 +1830,7 @@ class MartinBot:
                 last_phase=raw.get('last_phase', raw.get('phase', 'PHASE1')),
                 phase2_start_layer=raw.get('phase2_start_layer', 0),
                 pending_entry_price=raw.get('pending_entry_price', 0.0),
+                pending_entry_amount=raw.get('pending_entry_amount', 0.0),
                 last_fill_price=raw.get('last_fill_price', 0.0),
                 last_fill_time=raw.get('last_fill_time', ""),
                 protective_stop_active=raw.get('protective_stop_active', False),
@@ -2331,7 +2392,7 @@ class MartinBot:
                 close_side = 'sell' if side == 'long' else 'buy'
 
                 print(f"\n--- 市价平仓 {contracts} ---")
-                self.exchange.create_order(
+                response = self.exchange.create_order(
                     self.symbol,
                     'market',
                     close_side,
@@ -2340,10 +2401,25 @@ class MartinBot:
                     {'reduceOnly': True}
                 )
                 print("✅ 平仓完成")
-                return True
+                return response
             except Exception as e:
                 print(f"❌ 平仓失败: {e}")
-                return False
+                return None
+
+    def _wait_for_position_close(self, expected_contracts: float, timeout_sec: float = 3.0) -> bool:
+        deadline = time.time() + max(timeout_sec, 0.5)
+        target = self._safe_float(expected_contracts, 0.0)
+        while time.time() < deadline:
+            latest = self.get_active_position()
+            if not latest:
+                return True
+            remaining = self._safe_float(latest.get('contracts', 0.0), 0.0)
+            if remaining <= 0:
+                return True
+            if target > 0 and remaining < max(target * 0.05, 0.01):
+                return True
+            time.sleep(0.2)
+        return False
 
     def _partial_close(self, position, ratio, reason):
         with self.action_lock:
@@ -2402,9 +2478,17 @@ class MartinBot:
                     return False
 
                 print(f"🎯 {reason}")
-                closed = self.close_position(live_position)
                 self._clear_protective_stop(remote=True, force_all=True)
-                self.cancel_all_orders()
+                open_orders = self.fetch_open_orders() or []
+                entry_orders = [order for order in open_orders if not order.get('reduceOnly', False)]
+                if entry_orders:
+                    self._cancel_entry_orders(entry_orders)
+                close_response = self.close_position(live_position)
+                closed = self._wait_for_position_close(self._safe_float(live_position.get('contracts', 0.0), 0.0))
+                if closed:
+                    self.cancel_all_orders()
+                elif close_response:
+                    print("⚠️ 平仓单已提交，但短时间内未确认平仓，跳过全撤单以免撤掉减仓单")
                 self.sync_state_with_exchange()
                 self._write_live_snapshot(force=True, include_market=True)
                 return closed
@@ -3281,6 +3365,7 @@ class MartinBot:
             self.state.activated = False
             self.state.entry_price = entry_price
             self.state.pending_entry_price = 0.0 if entry_type == 'market' else entry_price
+            self.state.pending_entry_amount = amount
             self.state.last_fill_price = 0.0
             self.state.last_fill_time = ""
             self.state.protective_stop_active = False
@@ -3375,6 +3460,10 @@ class MartinBot:
                 if non_reduce_orders else self.state.layer
             )
             self.state.pending_entry_price = self._pending_entry_price_from_orders(non_reduce_orders)
+            self.state.pending_entry_amount = (
+                self._normalize_amount(self._safe_float(non_reduce_orders[0].get('amount', 0.0), 0.0))
+                if non_reduce_orders else 0.0
+            )
             if self.state.last_fill_price <= 0:
                 self.state.last_fill_price = entry_price
             self._save_runtime_state()
@@ -3395,6 +3484,9 @@ class MartinBot:
                     self.state.layer = 1
                 self.state.pending_layer = max(self.state.pending_layer, self.state.layer)
                 self.state.pending_entry_price = self._pending_entry_price_from_orders(open_orders)
+                self.state.pending_entry_amount = self._normalize_amount(
+                    self._safe_float(open_orders[0].get('amount', 0.0), 0.0)
+                )
                 self._save_runtime_state()
                 self._write_live_snapshot(force=True, include_market=True)
                 print(f"✅ 同步挂单状态: {len(open_orders)} 个挂单, side={self.state.position_side}")
@@ -3502,6 +3594,7 @@ class MartinBot:
                                         self.state.last_fill_price = filled_price
                                         self.state.last_fill_time = self._now_str()
                                         self.state.pending_entry_price = 0.0
+                                        self.state.pending_entry_amount = 0.0
                                     if current_contracts > previous_contracts and self.state.pending_layer > self.state.layer:
                                         self.state.layer = self.state.pending_layer
                                         filled_price = self._safe_float(self.state.pending_entry_price, 0.0)
@@ -3510,6 +3603,7 @@ class MartinBot:
                                         self.state.last_fill_price = filled_price
                                         self.state.last_fill_time = self._now_str()
                                         self.state.pending_entry_price = 0.0
+                                        self.state.pending_entry_amount = 0.0
                                     if self.state.pending_layer < self.state.layer:
                                         self.state.pending_layer = self.state.layer
                                 self._save_runtime_state()
@@ -3572,6 +3666,10 @@ class MartinBot:
                                     pending_price = self._pending_entry_price_from_orders(add_orders)
                                     if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
                                         self._set_runtime_flag('pending_entry_price', pending_price)
+                                    if add_orders:
+                                        pending_amount = self._normalize_amount(self._safe_float(add_orders[0].get('amount', 0.0), 0.0))
+                                        if abs(pending_amount - self.state.pending_entry_amount) > 1e-9:
+                                            self._set_runtime_flag('pending_entry_amount', pending_amount)
                                     trigger_orders = [o for o in add_orders if o.get('type') == 'trigger']
                                     if trigger_orders:
                                         print(
@@ -3588,6 +3686,8 @@ class MartinBot:
                                     self._set_runtime_flag('pending_layer', self.state.layer)
                                 if self.state.pending_entry_price != 0.0:
                                     self._set_runtime_flag('pending_entry_price', 0.0)
+                                if self.state.pending_entry_amount != 0.0:
+                                    self._set_runtime_flag('pending_entry_amount', 0.0)
                                 if current_phase == 'PHASE1':
                                     print(
                                         f"⚠️ 已达 PHASE1 阶段上限 {phase_cfg['max_layers']}，"
