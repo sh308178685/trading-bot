@@ -794,15 +794,25 @@ class MartinBot:
         layer_multipliers = list(phase_cfg.get('layer_multipliers') or [])
         phase = str(phase_cfg.get('phase', 'PHASE1')).upper()
         offset = int(phase_cfg.get('layer_index_offset', 0))
+        phase2_start_layer = 0
+        force_fallback = False
+
+        if phase == 'PHASE2':
+            phase2_start_layer = int(getattr(self.state, 'phase2_start_layer', 0) or 0)
+            # PHASE2 允许因亏损提前切换。只要实际起点不是正常路径的起点，
+            # 就优先按实际起始层号计算阶段内索引，避免 primary_index 在覆盖区抢先命中。
+            force_fallback = (
+                phase2_start_layer > 0 and
+                phase2_start_layer != offset + 1
+            )
 
         primary_index = layer_num - offset - 1
-        if 0 <= primary_index < len(layer_multipliers):
+        if not force_fallback and 0 <= primary_index < len(layer_multipliers):
             return primary_index
 
         if phase == 'PHASE2':
             # PHASE2 允许因亏损提前切换，此时需要基于 PHASE2 实际起始层号
             # 计算阶段内索引，保证倍率在提前切换路径下也保持递增。
-            phase2_start_layer = int(getattr(self.state, 'phase2_start_layer', 0) or 0)
             if phase2_start_layer > 0:
                 fallback_index = layer_num - phase2_start_layer
             else:
