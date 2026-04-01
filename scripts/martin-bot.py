@@ -1249,6 +1249,18 @@ class MartinBot:
     def _submit_add_order_plan(self, plan: Dict[str, Any]) -> bool:
         layer_num = int(plan['layer_num'])
         try:
+            if self._exit_in_progress.is_set():
+                print(f"⚠️ 第{layer_num}层加仓下单前检测到平仓流程进行中，跳过本次挂单")
+                return False
+            if self.state.bot_state != "IN_STRATEGY" or self.state.layer <= 0:
+                print(
+                    f"⚠️ 当前运行态不允许部署第{layer_num}层加仓单: "
+                    f"bot_state={self.state.bot_state}, layer={self.state.layer}"
+                )
+                return False
+            if not self.get_active_position():
+                print(f"⚠️ 当前无持仓，跳过部署第{layer_num}层加仓单")
+                return False
             if plan['trigger_price'] <= 0:
                 if not self._submit_entry_order(plan['order_side'], plan['amount'], plan['execute_price'], f"第{layer_num}层"):
                     return False
@@ -1876,6 +1888,36 @@ class MartinBot:
             self._last_risk_rest_position_at = 0.0
         self._save_runtime_state()
 
+    def _has_orphan_entry_orders(self, open_orders: List[Dict[str, Any]]) -> bool:
+        non_reduce_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
+        if not non_reduce_orders:
+            return bool(open_orders)
+        return (
+            self.state.last_known_contracts > 0
+            or self.state.layer > 1
+            or self.state.pending_layer > 1
+        )
+
+    def _finalize_full_exit(self, reason: str = "") -> bool:
+        prefix = f"{reason} " if reason else ""
+        cleared = False
+        for attempt in range(1, 4):
+            self.cancel_all_orders()
+            time.sleep(0.2)
+            open_orders = self.fetch_open_orders()
+            if open_orders is None:
+                print(f"⚠️ {prefix}全平后无法确认挂单状态，第 {attempt} 次清理未完成")
+                continue
+            if not open_orders:
+                cleared = True
+                break
+            print(f"⚠️ {prefix}全平后仍有 {len(open_orders)} 个挂单残留，第 {attempt} 次重试撤单")
+        self._reset_state()
+        self._write_live_snapshot(force=True, include_market=True)
+        if not cleared:
+            print(f"⚠️ {prefix}全平后挂单清理未完全确认，运行态已重置为 IDLE")
+        return cleared
+
     def _snapshot_strategy(self, stream: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = {
             'name': 'Bitget 马丁策略机器人',
@@ -2473,8 +2515,7 @@ class MartinBot:
             try:
                 live_position = position or self.get_active_position()
                 if not live_position:
-                    self.cancel_all_orders()
-                    self.sync_state_with_exchange()
+                    self._finalize_full_exit(reason="未检测到持仓")
                     return False
 
                 print(f"🎯 {reason}")
@@ -2486,11 +2527,14 @@ class MartinBot:
                 close_response = self.close_position(live_position)
                 closed = self._wait_for_position_close(self._safe_float(live_position.get('contracts', 0.0), 0.0))
                 if closed:
-                    self.cancel_all_orders()
+                    self._finalize_full_exit(reason="平仓完成后")
                 elif close_response:
                     print("⚠️ 平仓单已提交，但短时间内未确认平仓，跳过全撤单以免撤掉减仓单")
-                self.sync_state_with_exchange()
-                self._write_live_snapshot(force=True, include_market=True)
+                    self.sync_state_with_exchange()
+                    self._write_live_snapshot(force=True, include_market=True)
+                else:
+                    self.sync_state_with_exchange()
+                    self._write_live_snapshot(force=True, include_market=True)
                 return closed
             finally:
                 self._exit_in_progress.clear()
@@ -3391,6 +3435,12 @@ class MartinBot:
         if layer_num > self.max_layers:
             print(f"已达最大层数 {self.max_layers}")
             return False
+        if self.state.bot_state != "IN_STRATEGY" or self.state.layer <= 0:
+            print(
+                f"⚠️ 当前运行态不允许补挂第{layer_num}层: "
+                f"bot_state={self.state.bot_state}, layer={self.state.layer}"
+            )
+            return False
 
         print(f"\n--- 第 {layer_num} 层加仓 ---")
 
@@ -3404,6 +3454,9 @@ class MartinBot:
             return False
 
         position = self.get_active_position()
+        if not position:
+            print(f"⚠️ 当前无持仓，跳过补挂第{layer_num}层")
+            return False
         plan = self._build_add_order_plan(layer_num, current_price, position=position)
         if plan is None:
             return False
@@ -3475,6 +3528,10 @@ class MartinBot:
             if open_orders is None:
                 print("⚠️ 挂单状态获取失败，保持当前状态，稍后重试")
                 self._write_live_snapshot(force=True, include_market=False)
+                return
+            if self._has_orphan_entry_orders(open_orders):
+                print("⚠️ 检测到无持仓孤儿挂单，执行撤单并重置运行态")
+                self._finalize_full_exit(reason="孤儿挂单清理")
                 return
             if open_orders:
                 first_order = open_orders[0]
