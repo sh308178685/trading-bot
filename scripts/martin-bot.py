@@ -1401,6 +1401,45 @@ class MartinBot:
         )
         return stabilized_plan
 
+    def _preserve_existing_entry_price_for_amount_rebuild(
+        self,
+        plan: Dict[str, Any],
+        orders: List[Dict[str, Any]],
+        current_price: float,
+    ) -> Dict[str, Any]:
+        if len(orders) != 1:
+            return plan
+
+        existing_order = orders[0]
+        if str(existing_order.get('side', '')).lower() != str(plan.get('order_side', '')).lower():
+            return plan
+
+        existing_amount = self._normalize_amount(self._safe_float(existing_order.get('amount', 0.0), 0.0))
+        if self._amount_delta_ratio(existing_amount, plan.get('amount', 0.0)) <= self.entry_amount_refresh_tolerance:
+            return plan
+
+        existing_price = self._price_to_precision(self._safe_float(existing_order.get('price', 0.0), 0.0))
+        if existing_price <= 0:
+            return plan
+
+        side = str(plan.get('side') or self.state.position_side or '').lower()
+        avg_price = self._safe_float(plan.get('avg_price', 0.0), 0.0)
+        if side not in ('long', 'short'):
+            return plan
+        if not self._is_sane_pending_entry_price(existing_price):
+            return plan
+        if not self._is_structure_price_valid_for_side(side, current_price, avg_price, existing_price):
+            return plan
+
+        stabilized_plan = dict(plan)
+        stabilized_plan['entry_price'] = existing_price
+        stabilized_plan['execute_price'] = existing_price
+        stabilized_plan['sticky_existing_price_for_rebuild'] = True
+        stabilized_plan['sticky_rebuild_reason'] = (
+            f"数量需要重建，沿用旧挂单价 {existing_price:.2f}，仅更新数量 {existing_amount} -> {plan['amount']}"
+        )
+        return stabilized_plan
+
     def _entry_order_refresh_reason(self, orders: List[Dict[str, Any]], plan: Dict[str, Any]) -> str:
         if not orders:
             return "当前没有加仓挂单"
@@ -1484,10 +1523,13 @@ class MartinBot:
             return False
         plan = self._stabilize_plan_amount_with_existing_entry(plan, add_orders)
         plan = self._stabilize_plan_with_existing_entry(plan, add_orders, current_price)
+        plan = self._preserve_existing_entry_price_for_amount_rebuild(plan, add_orders, current_price)
         if plan.get('sticky_amount_reason'):
             print(f"🧷 {reason_prefix}第{next_layer}层加仓数量保持不动: {plan['sticky_amount_reason']}")
         if plan.get('sticky_existing_price'):
             print(f"🧷 {reason_prefix}第{next_layer}层加仓挂单保持不动: {plan['sticky_reason']}")
+        if plan.get('sticky_existing_price_for_rebuild'):
+            print(f"🧷 {reason_prefix}第{next_layer}层加仓重建沿用旧价: {plan['sticky_rebuild_reason']}")
 
         if self._entry_orders_match_plan(add_orders, plan):
             pending_price = self._pending_entry_price_from_orders(add_orders)
