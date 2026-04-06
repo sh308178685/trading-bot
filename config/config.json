@@ -15,7 +15,7 @@
   "dashboardNetworkRetryAttempts": 1,
   "dashboardNetworkRetryDelay": 0.5,
   "dashboardNetworkRetryBackoff": 1.2,
-  "symbol": "ETH/USDT:USDT",
+  "symbol": "BTC/USDT:USDT",
   "leverage": 3,
   "timeframe": "5m",
   "sr_timeframe": "1h",
