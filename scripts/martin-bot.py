@@ -142,6 +142,7 @@ def configure_runtime_logging() -> Path:
 
 @dataclass
 class RuntimeState:
+    symbol: str = ""
     layer: int = 0
     pending_layer: int = 0
     phase: str = "PHASE1"
@@ -369,11 +370,13 @@ class MartinBot:
         self._last_live_trades_at = 0.0
         self._last_live_ledger_at = 0.0
         self._live_snapshot_cache: Dict[str, Any] = {}
+        self._state_sync_required = False
+        self._state_sync_reason = ""
 
         self.exchange = self._init_exchange()
         self.markets = None
 
-        self.state = RuntimeState()
+        self.state = RuntimeState(symbol=self.symbol)
         self._load_runtime_state()
         self._last_risk_log_profit_pct = self.state.best_profit_pct
 
@@ -448,6 +451,17 @@ class MartinBot:
             return float(value)
         except Exception:
             return default
+
+    def _mark_state_sync_required(self, reason: str) -> None:
+        reason_text = str(reason or '').strip() or 'unknown'
+        if not self._state_sync_required or reason_text != self._state_sync_reason:
+            print(f"⚠️ 状态同步待重试: {reason_text}")
+        self._state_sync_required = True
+        self._state_sync_reason = reason_text
+
+    def _clear_state_sync_required(self) -> None:
+        self._state_sync_required = False
+        self._state_sync_reason = ""
 
     def _amount_to_precision(self, amount: float) -> float:
         try:
@@ -1550,8 +1564,8 @@ class MartinBot:
         return self._submit_add_order_plan(plan)
 
     def _reconcile_startup_entry_orders(self) -> None:
-        position = self.get_active_position()
-        if not position:
+        ok, position = self.enforce_exchange_position_sync(reason="启动校准")
+        if not ok or not position:
             return
 
         open_orders = self.fetch_open_orders()
@@ -1559,7 +1573,13 @@ class MartinBot:
             print("⚠️ 启动检查时无法获取挂单，跳过加仓单校验")
             return
 
-        add_orders = [order for order in open_orders if not order.get('reduceOnly', False)]
+        position_side = str(position.get('side', '')).lower()
+        expected_order_side = 'buy' if position_side == 'long' else 'sell'
+        add_orders = [
+            order for order in open_orders
+            if not order.get('reduceOnly', False)
+            and str(order.get('side', '')).lower() == expected_order_side
+        ]
         if not add_orders:
             return
 
@@ -1877,7 +1897,17 @@ class MartinBot:
             return
         try:
             raw = self._load_json(self.runtime_file, default={})
+            runtime_symbol = str(raw.get('symbol') or '').strip()
+            if runtime_symbol and runtime_symbol != self.symbol:
+                print(
+                    f"⚠️ 运行态交易对与当前配置不一致: runtime={runtime_symbol}, config={self.symbol}。"
+                    "将忽略旧运行态，等待按当前交易对重新同步。"
+                )
+                self.state = RuntimeState(symbol=self.symbol)
+                self._save_runtime_state()
+                return
             self.state = RuntimeState(
+                symbol=runtime_symbol or self.symbol,
                 layer=raw.get('layer', 0),
                 pending_layer=raw.get('pending_layer', raw.get('layer', 0)),
                 phase=raw.get('phase', 'PHASE1'),
@@ -1917,12 +1947,13 @@ class MartinBot:
         with self.state_lock:
             self.state.last_update = self._now_str()
             payload = asdict(self.state)
+            payload['symbol'] = self.symbol
         self._save_json(self.runtime_file, payload)
 
     def _reset_state(self):
         self._clear_protective_stop(remote=True, force_all=True)
         with self.state_lock:
-            self.state = RuntimeState()
+            self.state = RuntimeState(symbol=self.symbol)
             self._last_risk_log_profit_pct = 0.0
             self._risk_context = None
             self._risk_context_at = 0.0
@@ -2430,24 +2461,124 @@ class MartinBot:
                 return True
         return False
 
-    def get_active_position(self) -> Optional[Dict[str, Any]]:
+    def _fetch_active_position(self, suppress_error: bool = False) -> Tuple[bool, Optional[Dict[str, Any]]]:
         try:
             positions = self.exchange.fetch_positions([self.symbol])
+            self._clear_state_sync_required()
             for pos in positions:
                 contracts = self._safe_float(pos.get('contracts', 0))
                 if contracts > 0:
-                    return pos
-            return None
+                    return True, pos
+            return True, None
         except Exception as e:
-            print(f"❌ 获取持仓失败: {e}")
-            return None
+            self._mark_state_sync_required(f"持仓查询失败: {e}")
+            if not suppress_error:
+                print(f"❌ 获取持仓失败: {e}")
+            return False, None
+
+    def get_active_position(self) -> Optional[Dict[str, Any]]:
+        _, position = self._fetch_active_position()
+        return position
 
     def fetch_open_orders(self) -> Optional[List[Dict[str, Any]]]:
         try:
             return self.exchange.fetch_open_orders(self.symbol)
         except Exception as e:
+            self._mark_state_sync_required(f"挂单查询失败: {e}")
             print(f"⚠️ 获取挂单失败: {e}")
             return None
+
+    def _wrong_direction_entry_orders(
+        self,
+        position_side: Optional[str],
+        open_orders: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        side = str(position_side or '').lower()
+        if side not in {'long', 'short'}:
+            return []
+        rows = open_orders if open_orders is not None else self.fetch_open_orders()
+        if not rows:
+            return []
+        wrong_side = 'sell' if side == 'long' else 'buy'
+        return [
+            order for order in rows
+            if not order.get('reduceOnly', False)
+            and str(order.get('side', '')).lower() == wrong_side
+        ]
+
+    def _cancel_wrong_direction_entry_orders(
+        self,
+        position_side: Optional[str],
+        open_orders: Optional[List[Dict[str, Any]]] = None,
+        reason: str = "",
+    ) -> bool:
+        wrong_orders = self._wrong_direction_entry_orders(position_side, open_orders=open_orders)
+        if not wrong_orders:
+            return True
+        reason_prefix = f"{reason}: " if reason else ""
+        print(
+            f"⚠️ {reason_prefix}检测到 {len(wrong_orders)} 个与真实持仓方向冲突的加仓挂单，准备撤销"
+        )
+        if not self._cancel_entry_orders(wrong_orders):
+            print(f"⚠️ {reason_prefix}撤销错误方向挂单失败")
+            return False
+        print(f"✅ {reason_prefix}已撤销错误方向挂单")
+        return True
+
+    def _force_sync_position_side(
+        self,
+        position: Optional[Dict[str, Any]],
+        reason: str = "",
+    ) -> bool:
+        if not position:
+            return True
+
+        exchange_side = str(position.get('side', '')).lower()
+        if exchange_side not in {'long', 'short'}:
+            return True
+
+        changed = False
+        with self.state_lock:
+            if self.state.position_side != exchange_side:
+                print(
+                    f"⚠️ {reason or '持仓同步'}: runtime.position_side={self.state.position_side}, "
+                    f"exchange.position_side={exchange_side}，已以交易所为准修正"
+                )
+                self.state.position_side = exchange_side
+                changed = True
+            contracts = self._safe_float(position.get('contracts', 0))
+            entry_price = self._safe_float(position.get('entryPrice', 0))
+            if abs(self.state.last_known_contracts - contracts) > 1e-9:
+                self.state.last_known_contracts = contracts
+                changed = True
+            if entry_price > 0 and abs(self.state.entry_price - entry_price) > 1e-9:
+                self.state.entry_price = entry_price
+                changed = True
+            if self.state.bot_state != "IN_STRATEGY":
+                self.state.bot_state = "IN_STRATEGY"
+                changed = True
+
+        if changed:
+            self._save_runtime_state()
+        return changed
+
+    def enforce_exchange_position_sync(self, reason: str = "") -> Tuple[bool, Optional[Dict[str, Any]]]:
+        ok, position = self._fetch_active_position()
+        if not ok:
+            print("⚠️ 无法确认真实持仓，保持当前运行态，下一轮再同步")
+            self._write_live_snapshot(force=True, include_market=False)
+            return False, None
+
+        self._force_sync_position_side(position, reason=reason or "主循环校准")
+        if position:
+            open_orders = self.fetch_open_orders()
+            if open_orders is not None:
+                self._cancel_wrong_direction_entry_orders(
+                    str(position.get('side', '')).lower(),
+                    open_orders=open_orders,
+                    reason=reason or "方向校准",
+                )
+        return True, position
 
     def cancel_all_orders(self):
         with self.action_lock:
@@ -2512,9 +2643,20 @@ class MartinBot:
                 if contracts <= 0:
                     return False
 
-                close_amount = self._normalize_amount(contracts * ratio)
+                requested_amount = contracts * ratio
+                close_amount = self._normalize_amount(requested_amount)
                 if close_amount <= 0:
-                    print(f"⚠️ {reason}: 平仓量过小，跳过")
+                    market = self._market() or {}
+                    precision = market.get('precision') or {}
+                    limits = market.get('limits') or {}
+                    min_amount = self._safe_float((limits.get('amount') or {}).get('min'), 0.0)
+                    amount_step = self._safe_float(precision.get('amount'), 0.0)
+                    print(
+                        f"⚠️ {reason}: 平仓量过小，跳过 "
+                        f"(symbol={self.symbol}, contracts={contracts:.8f}, ratio={ratio:.4f}, "
+                        f"requested={requested_amount:.8f}, normalized={close_amount:.8f}, "
+                        f"min_amount={min_amount:.8f}, amount_step={amount_step:.8f})"
+                    )
                     return False
 
                 side = 'buy' if str(position.get('side')).lower() == 'short' else 'sell'
@@ -3525,8 +3667,14 @@ class MartinBot:
         return self.max_layers
 
     def sync_state_with_exchange(self):
-        position = self.get_active_position()
+        position_ok, position = self._fetch_active_position()
+        if not position_ok:
+            print("⚠️ 持仓状态获取失败，保持当前运行态，稍后重试")
+            self._write_live_snapshot(force=True, include_market=False)
+            return
+
         open_orders = self.fetch_open_orders()
+        orders_available = open_orders is not None
         if open_orders is None:
             open_orders = []
         non_reduce_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
@@ -3535,6 +3683,15 @@ class MartinBot:
             contracts = self._safe_float(position.get('contracts', 0))
             side = str(position.get('side', '')).lower()
             entry_price = self._safe_float(position.get('entryPrice', 0))
+            self._force_sync_position_side(position, reason="sync_state_with_exchange")
+            if orders_available:
+                self._cancel_wrong_direction_entry_orders(side, open_orders=open_orders, reason="状态同步")
+                expected_order_side = 'buy' if side == 'long' else 'sell'
+                non_reduce_orders = [
+                    o for o in open_orders
+                    if not o.get('reduceOnly', False)
+                    and str(o.get('side', '')).lower() == expected_order_side
+                ]
 
             self.state.bot_state = "IN_STRATEGY"
             self.state.position_side = side
@@ -3550,15 +3707,18 @@ class MartinBot:
             self.state.layer = self.estimate_current_layer(contracts, price, balance)
             self.state.phase = self._current_phase(position, current_price=price)
             self._repair_phase2_start_layer()
-            self.state.pending_layer = (
-                min(self.max_layers, self.state.layer + 1)
-                if non_reduce_orders else self.state.layer
-            )
-            self.state.pending_entry_price = self._pending_entry_price_from_orders(non_reduce_orders)
-            self.state.pending_entry_amount = (
-                self._normalize_amount(self._safe_float(non_reduce_orders[0].get('amount', 0.0), 0.0))
-                if non_reduce_orders else 0.0
-            )
+            if orders_available:
+                self.state.pending_layer = (
+                    min(self.max_layers, self.state.layer + 1)
+                    if non_reduce_orders else self.state.layer
+                )
+                self.state.pending_entry_price = self._pending_entry_price_from_orders(non_reduce_orders)
+                self.state.pending_entry_amount = (
+                    self._normalize_amount(self._safe_float(non_reduce_orders[0].get('amount', 0.0), 0.0))
+                    if non_reduce_orders else 0.0
+                )
+            else:
+                print("⚠️ 挂单状态获取失败，本次仅同步持仓，不覆盖 pending 挂单状态")
             if self.state.last_fill_price <= 0:
                 self.state.last_fill_price = entry_price
             self._save_runtime_state()
@@ -3566,8 +3726,7 @@ class MartinBot:
 
             print(f"✅ 同步持仓成功: side={side}, contracts={contracts}, layer={self.state.layer}")
         else:
-            open_orders = self.fetch_open_orders()
-            if open_orders is None:
+            if not orders_available:
                 print("⚠️ 挂单状态获取失败，保持当前状态，稍后重试")
                 self._write_live_snapshot(force=True, include_market=False)
                 return
@@ -3614,7 +3773,7 @@ class MartinBot:
         print("=" * 60)
 
         self._bootstrap_exchange()
-        startup_position = self.get_active_position()
+        _, startup_position = self.enforce_exchange_position_sync(reason="启动阶段")
         print(f"🧭 启动阶段: {self._current_phase(startup_position)}")
         self._reconcile_startup_entry_orders()
         self._set_runtime_flag('last_phase', self.state.phase)
@@ -3624,7 +3783,10 @@ class MartinBot:
         try:
             while True:
                 try:
-                    position = self.get_active_position()
+                    sync_ok, position = self.enforce_exchange_position_sync(reason="主循环开始")
+                    if not sync_ok:
+                        time.sleep(min(self.error_sleep, max(self.loop_interval, 5)))
+                        continue
 
                     if self._exit_in_progress.is_set():
                         print("⏳ 平仓流程执行中，等待交易所状态同步")
