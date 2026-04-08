@@ -164,6 +164,7 @@ class RuntimeState:
     partial_tp_2_done: bool = False
     activated: bool = False
     entry_price: float = 0.0
+    initial_balance: float = 0.0            # 首仓时的余额基准，加仓仓位基于此计算
     last_update: str = ""
 
 
@@ -1123,6 +1124,9 @@ class MartinBot:
             print("❌ 余额不足")
             return None
 
+        # 使用首仓时的余额基准计算仓位，避免中途充值导致加仓过大
+        base_equity = self.state.initial_balance if self.state.initial_balance > 0 else equity
+
         if not self.state.position_side:
             print("⚠️ 未知持仓方向，无法加仓")
             return None
@@ -1171,7 +1175,7 @@ class MartinBot:
         if phase_layer_index < 0 or phase_layer_index >= len(layer_multipliers):
             print(f"⚠️ 当前阶段 {phase} 未配置第{layer_num}层倍率，跳过加仓")
             return None
-        desired_margin = equity * phase_cfg['first_order_ratio'] * layer_multipliers[phase_layer_index]
+        desired_margin = base_equity * phase_cfg['first_order_ratio'] * layer_multipliers[phase_layer_index]
         layer_margin = self._calculate_order_margin(
             desired_margin,
             balance_snapshot,
@@ -3525,6 +3529,9 @@ class MartinBot:
         if equity < self.min_balance:
             print("❌ 余额不足")
             return False
+
+        # 记住首仓时的余额作为基准，后续加仓基于此计算
+        self.state.initial_balance = equity
 
         order_side = 'sell' if trade_side.lower() == 'short' else 'buy'
 
