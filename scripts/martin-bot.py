@@ -3226,8 +3226,7 @@ class MartinBot:
         # 第3层: 1.5 ATR
         # 第4层: 2.0 ATR
         # 第5层: 2.5 ATR
-        # 第5层及之后间距加大: 前4层每层+0.5, 之后每层额外+0.5(即总共+1.0)
-        atr_mult = 1.0 + 0.5 * ((layer_num - 2) + max(layer_num - 5, 0))
+        atr_mult = 1.0 + max(layer_num - 2, 0) * 0.5
         distance = atr * atr_mult
 
         if side == 'long':
