@@ -3704,7 +3704,13 @@ class MartinBot:
                 price = self._safe_float(ticker.get('last', 0))
             balance = self.get_wallet_balance() or 0
 
-            self.state.layer = self.estimate_current_layer(contracts, price, balance)
+            # 优先使用 state.layer（runtime 中保存的真实值），避免用 contracts 反推导致误判
+            if self.state.layer is not None and self.state.layer > 0:
+                print(f"📌 使用 runtime 中的 layer={self.state.layer}")
+            else:
+                estimated = self.estimate_current_layer(contracts, price, balance)
+                print(f"⚠️ state.layer 缺失，回退到估算: {estimated}")
+                self.state.layer = estimated
             self.state.phase = self._current_phase(position, current_price=price)
             self._repair_phase2_start_layer()
             if orders_available:
