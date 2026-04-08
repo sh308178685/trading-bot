@@ -2185,6 +2185,8 @@ class MartinBot:
         activate_pct = context['activate_pct'] if context else 0.0
         trail_ratio = context['trail_ratio'] if context else 0.5
         live_position = self.get_active_position()
+        if live_position is self._POSITION_API_ERROR:
+            live_position = None
         partial_targets = self._dynamic_partial_tp_targets(position=live_position, context=context)
 
         return {
@@ -2480,8 +2482,14 @@ class MartinBot:
                 print(f"❌ 获取持仓失败: {e}")
             return False, None
 
+    # Sentinel value to distinguish API errors from genuine "no position"
+    _POSITION_API_ERROR = {"__api_error__": True}
+
     def get_active_position(self) -> Optional[Dict[str, Any]]:
-        _, position = self._fetch_active_position()
+        """Return position dict if active, None if no position, _POSITION_API_ERROR if API call failed."""
+        ok, position = self._fetch_active_position()
+        if not ok:
+            return self._POSITION_API_ERROR
         return position
 
     def fetch_open_orders(self) -> Optional[List[Dict[str, Any]]]:
@@ -2682,7 +2690,11 @@ class MartinBot:
     def _execute_partial_take_profit(self, position: Dict[str, Any], ratio: float, reason: str, state_flag: str) -> bool:
         if self._exit_in_progress.is_set():
             return False
-        live_position = self.get_active_position() or position
+        live_position = self.get_active_position()
+        if live_position is self._POSITION_API_ERROR:
+            live_position = position  # fall back to passed-in position
+        else:
+            live_position = live_position or position
         if not live_position:
             return False
         success = self._partial_close(live_position, ratio, reason)
@@ -3645,6 +3657,9 @@ class MartinBot:
             return False
 
         position = self.get_active_position()
+        if position is self._POSITION_API_ERROR:
+            print(f"⚠️ 获取持仓API失败，无法补挂第{layer_num}层，下一轮再试")
+            return False
         if not position:
             print(f"⚠️ 当前无持仓，跳过补挂第{layer_num}层")
             return False
