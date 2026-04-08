@@ -79,10 +79,10 @@ class DashboardBotProfile:
         self.config = config
         self.symbol = config.get("symbol", "ETH/USDT:USDT")
         self.timeframe = config.get("timeframe", "5m")
-        self.max_layers = int(config.get("max_layers", 10) or 10)
+        self.max_layers = int(config.get("max_layers", 5) or 5)
         self.leverage = safe_float(config.get("leverage", 3), 3)
         self.first_order_ratio = safe_float(config.get("first_order_ratio", 0.1), 0.1)
-        self.layer_multipliers = list(config.get("layer_multipliers", [1, 1.5, 2, 2.5, 3, 3.8, 4.5, 5.2, 6.0, 7.0]))
+        self.layer_multipliers = list(config.get("layer_multipliers", [1, 1.5, 2, 2.5, 3]))
         self.phase_switch_loss_pct = safe_float(config.get("phase_switch_loss_pct", 0.025), 0.025)
         self.phase_switch_layer = int(config.get("phase_switch_layer", 4) or 4)
         self.phase1_max_layers = int(config.get("phase1_max_layers", self.max_layers) or self.max_layers)
