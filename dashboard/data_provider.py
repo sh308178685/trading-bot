@@ -227,8 +227,7 @@ class DashboardBotProfile:
 
     def _select_atr_entry_price(self, side: str, layer_num: int, current_price: float, avg_price: float):
         atr = safe_float(self.latest_atr, current_price * 0.02)
-        # 第5层及之后间距加大: 前4层每层+0.5, 之后每层额外+0.5(即总共+1.0)
-        atr_mult = 1.0 + 0.5 * ((layer_num - 2) + max(layer_num - 5, 0))
+        atr_mult = 1.0 + max(layer_num - 2, 0) * 0.5
         distance = atr * atr_mult
         if side == "long":
             return min(avg_price, current_price) - distance
