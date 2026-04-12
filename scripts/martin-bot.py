@@ -1933,6 +1933,7 @@ class MartinBot:
                 partial_tp_2_done=raw.get('partial_tp_2_done', False),
                 activated=raw.get('activated', False),
                 entry_price=raw.get('entry_price', 0.0),
+                initial_balance=raw.get('initial_balance', 0.0),
                 last_update=raw.get('last_update', ""),
             )
             repaired = self._repair_phase2_start_layer()
@@ -2541,6 +2542,7 @@ class MartinBot:
         self,
         position: Optional[Dict[str, Any]],
         reason: str = "",
+        sync_contracts: bool = True,
     ) -> bool:
         if not position:
             return True
@@ -2560,7 +2562,7 @@ class MartinBot:
                 changed = True
             contracts = self._safe_float(position.get('contracts', 0))
             entry_price = self._safe_float(position.get('entryPrice', 0))
-            if abs(self.state.last_known_contracts - contracts) > 1e-9:
+            if sync_contracts and abs(self.state.last_known_contracts - contracts) > 1e-9:
                 self.state.last_known_contracts = contracts
                 changed = True
             if entry_price > 0 and abs(self.state.entry_price - entry_price) > 1e-9:
@@ -2574,14 +2576,22 @@ class MartinBot:
             self._save_runtime_state()
         return changed
 
-    def enforce_exchange_position_sync(self, reason: str = "") -> Tuple[bool, Optional[Dict[str, Any]]]:
+    def enforce_exchange_position_sync(
+        self,
+        reason: str = "",
+        sync_contracts: bool = True,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         ok, position = self._fetch_active_position()
         if not ok:
             print("⚠️ 无法确认真实持仓，保持当前运行态，下一轮再同步")
             self._write_live_snapshot(force=True, include_market=False)
             return False, None
 
-        self._force_sync_position_side(position, reason=reason or "主循环校准")
+        self._force_sync_position_side(
+            position,
+            reason=reason or "主循环校准",
+            sync_contracts=sync_contracts,
+        )
         if position:
             open_orders = self.fetch_open_orders()
             if open_orders is not None:
@@ -3729,6 +3739,14 @@ class MartinBot:
             # 优先使用 state.layer（runtime 中保存的真实值），避免用 contracts 反推导致误判
             if self.state.layer is not None and self.state.layer > 0:
                 print(f"📌 使用 runtime 中的 layer={self.state.layer}")
+                reference_balance = self._safe_float(self.state.initial_balance, 0.0) or balance
+                estimated = self.estimate_current_layer(contracts, price, reference_balance)
+                if estimated > self.state.layer:
+                    print(
+                        f"⚠️ 检测到 runtime.layer={self.state.layer} 低于仓位规模估算层级 {estimated}，"
+                        "已按只增不减原则修正"
+                    )
+                    self.state.layer = estimated
             else:
                 estimated = self.estimate_current_layer(contracts, price, balance)
                 print(f"⚠️ state.layer 缺失，回退到估算: {estimated}")
@@ -3811,7 +3829,10 @@ class MartinBot:
         try:
             while True:
                 try:
-                    sync_ok, position = self.enforce_exchange_position_sync(reason="主循环开始")
+                    sync_ok, position = self.enforce_exchange_position_sync(
+                        reason="主循环开始",
+                        sync_contracts=False,
+                    )
                     if not sync_ok:
                         time.sleep(min(self.error_sleep, max(self.loop_interval, 5)))
                         continue
@@ -3864,6 +3885,13 @@ class MartinBot:
                             # 检测加/减仓成交并同步已确认层级
                             previous_contracts = self.state.last_known_contracts
                             if abs(current_contracts - previous_contracts) > 1e-9:
+                                reference_price = self._safe_float(
+                                    position.get('entryPrice', 0),
+                                    self._safe_float(position.get('markPrice', 0), 0.0),
+                                )
+                                reference_balance = self._safe_float(self.state.initial_balance, 0.0)
+                                if reference_balance <= 0:
+                                    reference_balance = self.get_wallet_balance() or 0.0
                                 if current_contracts > previous_contracts:
                                     added = current_contracts - previous_contracts
                                     if previous_contracts > 0:
@@ -3879,7 +3907,7 @@ class MartinBot:
                                     if current_contracts > previous_contracts and previous_contracts <= 0 and self.state.last_fill_price <= 0:
                                         filled_price = self._safe_float(self.state.pending_entry_price, 0.0)
                                         if filled_price <= 0:
-                                            filled_price = self._safe_float(position.get('entryPrice', current_price), current_price)
+                                            filled_price = reference_price
                                         self.state.last_fill_price = filled_price
                                         self.state.last_fill_time = self._now_str()
                                         self.state.pending_entry_price = 0.0
@@ -3888,11 +3916,28 @@ class MartinBot:
                                         self.state.layer = self.state.pending_layer
                                         filled_price = self._safe_float(self.state.pending_entry_price, 0.0)
                                         if filled_price <= 0:
-                                            filled_price = self._safe_float(position.get('entryPrice', current_price), current_price)
+                                            filled_price = reference_price
                                         self.state.last_fill_price = filled_price
                                         self.state.last_fill_time = self._now_str()
                                         self.state.pending_entry_price = 0.0
                                         self.state.pending_entry_amount = 0.0
+                                    elif current_contracts > previous_contracts and reference_price > 0 and reference_balance > 0:
+                                        estimated_layer = self.estimate_current_layer(
+                                            current_contracts,
+                                            reference_price,
+                                            reference_balance,
+                                        )
+                                        if estimated_layer > self.state.layer:
+                                            print(
+                                                f"⚠️ pending_layer 未领先，按仓位规模兜底修正 layer: "
+                                                f"{self.state.layer} -> {estimated_layer}"
+                                            )
+                                            self.state.layer = estimated_layer
+                                            self.state.pending_layer = max(self.state.pending_layer, estimated_layer)
+                                            self.state.last_fill_price = reference_price
+                                            self.state.last_fill_time = self._now_str()
+                                            self.state.pending_entry_price = 0.0
+                                            self.state.pending_entry_amount = 0.0
                                     if self.state.pending_layer < self.state.layer:
                                         self.state.pending_layer = self.state.layer
                                 self._save_runtime_state()
@@ -3988,6 +4033,13 @@ class MartinBot:
                         # 2) 无持仓，但可能有挂单
                         else:
                             if self.state.last_known_contracts > 0:
+                                # 二次确认：API可能短暂返回无持仓，再查一次避免误判
+                                recheck = self.get_active_position()
+                                if recheck:
+                                    print(f"⚠️ API短暂返回无持仓，二次确认仍有仓位 {self._safe_float(recheck.get('contracts', 0)):.6f}，跳过重置")
+                                    self._write_live_snapshot(force=True, include_market=True)
+                                    time.sleep(self.loop_interval)
+                                    continue
                                 print("✅ 检测到持仓已关闭，本轮结束")
                                 self.cancel_all_orders()
                                 self._reset_state()
