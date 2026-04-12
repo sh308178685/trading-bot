@@ -791,8 +791,10 @@ class MartinBot:
                 'phase': 'PHASE2',
                 'max_layers': self.max_layers,
                 'first_order_ratio': self.phase1_first_order_ratio,
-                'layer_multipliers': self.phase2_layer_multipliers,
-                'layer_index_offset': self.phase1_max_layers,
+                # 提前切到 PHASE2 只改变风控/间距参数，倍率仍按全局层号映射：
+                # layer 4 固定对应 phase2_layer_multipliers[0]，不能从提前切换层重新计数。
+                'layer_multipliers': self.layer_multipliers,
+                'layer_index_offset': 0,
                 'layer_min_gap_pct': self.phase2_layer_min_gap_pct,
                 'layer_min_gap_atr_multiplier': self.phase2_layer_min_gap_atr_multiplier,
                 'layer_trigger_base_pct': self.phase2_layer_trigger_base_pct,
@@ -836,35 +838,11 @@ class MartinBot:
 
     def _resolve_phase_layer_index(self, phase_cfg: Dict[str, Any], layer_num: int) -> int:
         layer_multipliers = list(phase_cfg.get('layer_multipliers') or [])
-        phase = str(phase_cfg.get('phase', 'PHASE1')).upper()
         offset = int(phase_cfg.get('layer_index_offset', 0))
-        phase2_start_layer = 0
-        force_fallback = False
-
-        if phase == 'PHASE2':
-            phase2_start_layer = int(getattr(self.state, 'phase2_start_layer', 0) or 0)
-            if phase2_start_layer <= 0:
-                phase2_start_layer = self._infer_phase2_start_layer()
-            # PHASE2 允许因亏损提前切换。只要实际起点不是正常路径的起点，
-            # 就优先按实际起始层号计算阶段内索引，避免 primary_index 在覆盖区抢先命中。
-            force_fallback = (
-                phase2_start_layer > 0 and
-                phase2_start_layer != offset + 1
-            )
 
         primary_index = layer_num - offset - 1
-        if not force_fallback and 0 <= primary_index < len(layer_multipliers):
+        if 0 <= primary_index < len(layer_multipliers):
             return primary_index
-
-        if phase == 'PHASE2':
-            # PHASE2 允许因亏损提前切换，此时需要基于 PHASE2 实际起始层号
-            # 计算阶段内索引，保证倍率在提前切换路径下也保持递增。
-            if phase2_start_layer > 0:
-                fallback_index = layer_num - phase2_start_layer
-            else:
-                fallback_index = layer_num - offset - 1
-            if 0 <= fallback_index < len(layer_multipliers):
-                return fallback_index
 
         return -1
 
@@ -1253,6 +1231,10 @@ class MartinBot:
         if existing_amount <= 0:
             return plan
 
+        existing_price = self._price_to_precision(self._safe_float(existing_order.get('price', 0.0), 0.0))
+        if existing_price > 0 and existing_price != plan.get('execute_price'):
+            return plan
+
         if self._amount_delta_ratio(existing_amount, plan.get('amount', 0.0)) > self.entry_amount_refresh_tolerance:
             return plan
 
@@ -1452,9 +1434,16 @@ class MartinBot:
         stabilized_plan = dict(plan)
         stabilized_plan['entry_price'] = existing_price
         stabilized_plan['execute_price'] = existing_price
+        adjusted_amount = self._normalize_amount(
+            (self._safe_float(plan.get('layer_margin', 0.0), 0.0) * self.leverage) / existing_price
+        )
+        if adjusted_amount <= 0:
+            return plan
+        stabilized_plan['amount'] = adjusted_amount
         stabilized_plan['sticky_existing_price_for_rebuild'] = True
         stabilized_plan['sticky_rebuild_reason'] = (
-            f"数量需要重建，沿用旧挂单价 {existing_price:.2f}，仅更新数量 {existing_amount} -> {plan['amount']}"
+            f"数量需要重建，沿用旧挂单价 {existing_price:.2f}，"
+            f"按旧价重算数量 {existing_amount} -> {adjusted_amount}"
         )
         return stabilized_plan
 

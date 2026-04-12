@@ -21,6 +21,7 @@ def load_martin_module():
 def build_bot(module, phase2_start_layer: int, phase1_max_layers: int = 3):
     bot = module.MartinBot.__new__(module.MartinBot)
     bot.phase1_max_layers = phase1_max_layers
+    bot.phase_switch_layer = phase1_max_layers + 1
     bot.state = module.RuntimeState(
         layer=max(phase2_start_layer - 1, 0),
         phase="PHASE2",
@@ -33,8 +34,8 @@ def validate_scenario(module, name: str, phase2_start_layer: int, expected_layer
     bot = build_bot(module, phase2_start_layer=phase2_start_layer)
     phase_cfg = {
         "phase": "PHASE2",
-        "layer_index_offset": bot.phase1_max_layers,
-        "layer_multipliers": [2.4, 3.9, 5.3, 6.8, 8.4, 10.1],
+        "layer_index_offset": 0,
+        "layer_multipliers": [1, 1.15, 1.35, 2.4, 3.9, 5.3, 6.8, 8.3, 9.8],
     }
 
     actual_indexes = [
@@ -46,7 +47,7 @@ def validate_scenario(module, name: str, phase2_start_layer: int, expected_layer
         for index in actual_indexes
     ]
 
-    expected_indexes = list(range(len(expected_layers)))
+    expected_indexes = [layer_num - 1 for layer_num in expected_layers]
     if actual_indexes != expected_indexes:
         raise AssertionError(
             f"{name} 索引错误: expected={expected_indexes}, actual={actual_indexes}"
@@ -68,15 +69,15 @@ def main():
         module,
         name="正常路径",
         phase2_start_layer=4,
-        expected_layers=[4, 5, 6, 7],
-        expected_multipliers=[2.4, 3.9, 5.3, 6.8],
+        expected_layers=[4, 5, 6, 7, 8, 9],
+        expected_multipliers=[2.4, 3.9, 5.3, 6.8, 8.3, 9.8],
     )
     validate_scenario(
         module,
         name="提前切换路径",
         phase2_start_layer=2,
-        expected_layers=[2, 3, 4, 5],
-        expected_multipliers=[2.4, 3.9, 5.3, 6.8],
+        expected_layers=[2, 3, 4, 5, 8, 9],
+        expected_multipliers=[1.15, 1.35, 2.4, 3.9, 8.3, 9.8],
     )
 
     legacy_bot = module.MartinBot.__new__(module.MartinBot)
@@ -95,12 +96,12 @@ def main():
         )
     legacy_phase_cfg = {
         "phase": "PHASE2",
-        "layer_index_offset": legacy_bot.phase1_max_layers,
-        "layer_multipliers": [2.4, 3.9, 5.3, 6.8, 8.4, 10.1],
+        "layer_index_offset": 0,
+        "layer_multipliers": [1, 1.15, 1.35, 2.4, 3.9, 5.3, 6.8, 8.3, 9.8],
     }
     legacy_index = legacy_bot._resolve_phase_layer_index(legacy_phase_cfg, 3)
-    if legacy_index != 1:
-        raise AssertionError(f"历史状态索引错误: expected=1, actual={legacy_index}")
+    if legacy_index != 2:
+        raise AssertionError(f"历史状态索引错误: expected=2, actual={legacy_index}")
     print("历史状态修复:")
     print(
         f"  layer {legacy_bot.state.layer} -> "
