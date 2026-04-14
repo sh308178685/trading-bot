@@ -2603,6 +2603,7 @@ class MartinBot:
                 return False
 
     def close_position(self, position):
+        """限价平仓，防止插针滑点。做空用ask+滑点买入平仓，做多用bid-滑点卖出平仓。"""
         with self.action_lock:
             try:
                 contracts = self._safe_float(position.get('contracts', 0))
@@ -2617,20 +2618,83 @@ class MartinBot:
                 side = str(position.get('side', '')).lower()
                 close_side = 'sell' if side == 'long' else 'buy'
 
-                print(f"\n--- 市价平仓 {contracts} ---")
+                # 获取当前价格
+                current_price = self._live_price_from_ws(position, allow_rest=True)
+                if current_price <= 0:
+                    print("⚠️ 无法获取当前价格，回退到市价平仓")
+                    response = self.exchange.create_order(
+                        self.symbol, 'market', close_side, contracts, None,
+                        {'reduceOnly': True}
+                    )
+                    print("✅ 市价平仓完成（回退）")
+                    return response
+
+                # 滑点保护：做空买入平仓用 ask 方向偏移，做多卖出平仓用 bid 方向偏移
+                slippage_pct = self._safe_float(
+                    self.config.get('close_slippage_pct', 0.001), 0.001
+                )
+                ticker = self.exchange.fetch_ticker(self.symbol)
+                if close_side == 'buy':
+                    # 做空平仓：用 ask 价格 + 滑点，确保能成交
+                    base_price = self._safe_float(ticker.get('ask', current_price), current_price)
+                    limit_price = base_price * (1 + slippage_pct)
+                else:
+                    # 做多平仓：用 bid 价格 - 滑点，确保能成交
+                    base_price = self._safe_float(ticker.get('bid', current_price), current_price)
+                    limit_price = base_price * (1 - slippage_pct)
+
+                print(f"\n--- 限价平仓 {contracts} | 当前价={current_price:.2f} | 限价={limit_price:.2f} | 滑点={slippage_pct*100:.2f}% ---")
                 response = self.exchange.create_order(
                     self.symbol,
-                    'market',
+                    'limit',
                     close_side,
                     contracts,
-                    None,
+                    limit_price,
                     {'reduceOnly': True}
                 )
-                print("✅ 平仓完成")
+                order_id = response.get('id') if response else None
+                print(f"✅ 限价平仓单已挂出 (orderId={order_id})")
+
+                # 等待成交，最多等5秒
+                filled = self._wait_for_order_fill(order_id, timeout_sec=5.0)
+                if filled:
+                    print("✅ 限价平仓成交")
+                else:
+                    print("⚠️ 限价平仓未成交，尝试市价补单")
+                    # 撤掉未成交的限价单
+                    if order_id:
+                        try:
+                            self.exchange.cancel_order(order_id, self.symbol)
+                        except Exception:
+                            pass
+                    # 回退市价
+                    response = self.exchange.create_order(
+                        self.symbol, 'market', close_side, contracts, None,
+                        {'reduceOnly': True}
+                    )
+                    print("✅ 市价补单完成")
                 return response
             except Exception as e:
                 print(f"❌ 平仓失败: {e}")
                 return None
+
+    def _wait_for_order_fill(self, order_id: str, timeout_sec: float = 5.0) -> bool:
+        """等待限价单成交"""
+        if not order_id:
+            return False
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                order = self.exchange.fetch_order(order_id, self.symbol)
+                status = str(order.get('status', '')).lower()
+                if status in ('closed', 'filled'):
+                    return True
+                if status in ('canceled', 'cancelled', 'expired'):
+                    return False
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return False
 
     def _wait_for_position_close(self, expected_contracts: float, timeout_sec: float = 3.0) -> bool:
         deadline = time.time() + max(timeout_sec, 0.5)
@@ -2672,16 +2736,46 @@ class MartinBot:
 
                 side = 'buy' if str(position.get('side')).lower() == 'short' else 'sell'
 
-                self.exchange.create_order(
-                    self.symbol,
-                    'market',
-                    side,
-                    close_amount,
-                    None,
-                    {'reduceOnly': True}
-                )
-                print(f"✅ {reason}: 平仓 {close_amount} ({ratio*100:.0f}%)")
-                return True
+                # 限价分批平仓，防止滑点
+                current_price = self._live_price_from_ws(position, allow_rest=True)
+                if current_price > 0:
+                    slippage_pct = self._safe_float(
+                        self.config.get('close_slippage_pct', 0.001), 0.001
+                    )
+                    ticker = self.exchange.fetch_ticker(self.symbol)
+                    if side == 'buy':
+                        base_price = self._safe_float(ticker.get('ask', current_price), current_price)
+                        limit_price = base_price * (1 + slippage_pct)
+                    else:
+                        base_price = self._safe_float(ticker.get('bid', current_price), current_price)
+                        limit_price = base_price * (1 - slippage_pct)
+
+                    order_resp = self.exchange.create_order(
+                        self.symbol, 'limit', side, close_amount, limit_price,
+                        {'reduceOnly': True}
+                    )
+                    oid = order_resp.get('id') if order_resp else None
+                    print(f"📋 {reason}: 限价平仓 {close_amount} ({ratio*100:.0f}%) @ {limit_price:.2f}")
+                    # 等待成交
+                    filled = self._wait_for_order_fill(oid, timeout_sec=5.0)
+                    if not filled and oid:
+                        try:
+                            self.exchange.cancel_order(oid, self.symbol)
+                        except Exception:
+                            pass
+                        self.exchange.create_order(
+                            self.symbol, 'market', side, close_amount, None,
+                            {'reduceOnly': True}
+                        )
+                        print(f"⚠️ {reason}: 限价未成交，已市价补单")
+                    return True
+                else:
+                    self.exchange.create_order(
+                        self.symbol, 'market', side, close_amount, None,
+                        {'reduceOnly': True}
+                    )
+                    print(f"✅ {reason}: 市价平仓 {close_amount} ({ratio*100:.0f}%)（回退）")
+                    return True
             except Exception as e:
                 print(f"❌ {reason} 失败: {e}")
                 return False
