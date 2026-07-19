@@ -114,10 +114,28 @@
 - `layer_trigger_type="mark_price"`
 - `use_ema_structure=false`
 
+按币种滚动波动校准（不会改变各层下单金额）：
+
+- `volatility_percentile_enabled=true`
+- `volatility_percentile_lookback=288`：5 分钟周期约为最近 24 小时
+- `volatility_percentile_min_samples=80`：样本不足时先用原固定波动区间兜底
+- 波动档位分界：25% / 75% / 90% 分位
+- ATR 加仓间距系数：低波动 `0.9`、常态 `1.0`、高波动 `1.2`、极端波动 `1.5`
+
+分位数按当前交易对自己的 `ATR/价格` 历史计算，因此 BTC 与山寨币不会共用一个绝对 ATR 标准。该系数只作用于 ATR 距离和层间距，不修改 `first_order_ratio`、九层倍率或止损。
+
 ### 2.5 风控与止盈止损参数
 
 - `fee_rate=0.0005`
 - `max_loss_pct=0.5`
+- `phase1_quick_take_profit_enabled=true`：第一阶段启用快速整仓止盈
+- `phase1_quick_take_profit_dynamic_enabled=true`：根据成交后的 ADX 与 ATR 波动自动计算本仓位目标
+- `phase1_quick_take_profit_pct=0.006`：指标暂不可用或关闭动态模式时使用的 `0.60%` 备用目标
+- `phase1_quick_take_profit_min_net_pct=0.002`：在估算双边手续费之外至少保留 `0.20%` ROE 缓冲
+- `phase1_quick_take_profit_min_pct=0.005` / `max_pct=0.0075`：动态目标默认限制在 `0.50%～0.75%`
+- `phase1_quick_take_profit_adx_floor=18` / `adx_ceiling=40`：ADX 归一化范围
+- 第一阶段动态止盈优先使用当前交易对的 ATR 滚动分位；`phase1_quick_take_profit_volatility_floor_pct=0.001` / `volatility_ceiling_pct=0.005` 仅在滚动样本预热或数据不可用时兜底
+- `phase1_quick_take_profit_trend_weight=0.60`：趋势强度占 60%，ATR 波动占 40%
 - `protective_stop_enabled=true`
 - `protective_stop_trigger_type="mark_price"`
 - `protective_stop_execute_price=0.0`
@@ -125,6 +143,26 @@
 - `protective_stop_min_profit_pct=max(2*fee_rate*leverage+0.002, 0.005)`，默认杠杆 3 下等于 `0.005`
 - `protective_stop_update_step_pct=0.003`
 - `trailing_min_close_profit_pct=0.005`
+- `partial_tp_max_ratio_overshoot=0.10`：目标量不足最小成交量时，实际止盈比例最多可比目标高 10 个百分点
+- `partial_tp_confirm_timeout=3.0`：订单详情暂不可见时，等待多久后再启用历史订单兜底查询；不会因超时自动重发
+- `partial_tp_reconcile_interval_sec=1.0`：待确认的部分止盈每秒最多主动对账一次
+- `partial_tp_rejection_recheck_sec=30.0`：交易所明确拒绝部分止盈后，同仓位规模至少等待 30 秒再重算；仓位变化会立即解除冷却
+- `partial_tp_min_cost_buffer_ratio=0.01`：按标记价计算最小名义价值时额外保留 1% 价格波动余量
+- `partial_tp_authoritative_recheck_sec=5.0`：不可拆分仓位每隔 5 秒强制 REST 复核一次
+- `entry_submission_confirm_timeout=3.0`：开仓/加仓提交后暂不可见时，等待多久后启用历史订单兜底查询；不会因超时自动重发
+- `entry_submission_reconcile_interval_sec=1.0`：待确认的开仓/加仓订单每秒最多主动对账一次
+- `liquidity_gate_enabled=true`：只在新一轮首仓前检查流动性
+- `liquidity_max_spread_pct=0.002`：最大允许点差 `0.20%`
+- `liquidity_min_quote_volume_24h=2000000`：24 小时最低 USDT 成交额
+- `liquidity_depth_range_pct=0.005`：统计中间价上下 `0.5%` 内的盘口
+- `liquidity_min_depth_notional=10000`：买盘、卖盘各自至少 `10000 USDT` 深度
+- `liquidity_gate_fail_closed=true`：无法确认流动性时不启动新一轮
+
+运行交易主循环（`--run`）时会持有 `data/martin-bot.lock` OS 文件锁；同一工作区第二个机器人会直接拒绝启动，防止两个进程重复下单。手动同步（`--sync`）也必须先取得该锁，避免并发覆盖运行态；余额、持仓和趋势查询不占用该锁。
+
+如果 `data/martin-runtime.json` 存在但无法解析，机器人会 fail-closed 并拒绝 `--run`，避免丢失待确认的开仓、加仓或部分止盈状态后重复下单。应先在交易所核对持仓、普通委托、历史委托和成交，再用 `--sync` 重建本地运行态。
+
+本机器人只支持 Bitget `one_way_mode`。启动交易主循环时会通过单账户接口权威查询 `posMode`；如果账户处于 `hedge_mode` 或无法确认模式，会拒绝交易，不会自动修改账户级持仓模式。
 
 ### 2.6 资金与运行参数
 
@@ -236,8 +274,11 @@
 2. 账户权益 `equity` 不能低于 `min_balance(10 USDT)`
 3. 当前不能已有任何挂单
 4. 当前不能已有同方向未成交挂单
+5. 当前点差、24 小时成交额、买卖双边深度必须通过流动性准入闸门
 
 如果挂单状态获取失败，策略宁可跳过，也不冒险重复下单。
+
+流动性闸门只阻止 `place_first_order()`。已有持仓不会因为流动性短时下降而停止加仓、止盈或止损，避免仓位进入无人管理状态。
 
 ### 5.2 首仓资金大小
 
@@ -484,6 +525,7 @@ PHASE1 和 PHASE2 的最小层间距不同：
 公式：
 
 - `atr_mult = 1.0 + max(layer_num - 2, 0) * 0.5`
+- `distance = ATR * atr_mult * 当前波动档位间距系数`
 
 做多时：
 
@@ -513,6 +555,8 @@ PHASE1 和 PHASE2 的最小层间距不同：
 ### 7.7 非结构位价格还要再做层间距约束
 
 如果本层价格来源不是 `STRUCTURE`，策略会调用 `_enforce_layer_spacing()` 强制拉开距离。
+
+结构位候选的最小层间距、ATR 价格和非结构位兜底间距都会参考当前交易对的滚动波动档位系数。比如当前 `ATR/价格` 高于该币近 24 小时 90% 的样本，档位为 `EXTREME`，ATR 部分乘 `1.5`；各层仓位金额和倍率保持原值。
 
 锚点价格 `_layer_anchor_price()` 取以下候选中最“保守”的一个：
 
@@ -791,11 +835,28 @@ if phase == 'PHASE2':
 
 ---
 
-## 12. 动态止盈逻辑
+## 12. 第一阶段快速止盈与动态止盈逻辑
 
-止盈不是固定 5% 或 8%，而是动态的。
+第一阶段优先追求小仓位高周转；第二阶段继续使用原有的动态分批止盈和移动止盈。
 
-### 12.1 动态移动止盈激活阈值
+### 12.1 第一阶段快速整仓止盈
+
+仅当运行态仍是 `PHASE1` 且层数不超过 `phase1_max_layers` 时启用。开仓成交或加仓改变数量/均价后，策略在第一次风控检查中计算：
+
+- `trend_score = clamp((ADX - 18) / (40 - 18), 0, 1)`
+- `volatility_score = clamp((ATR/价格 - 0.001) / (0.005 - 0.001), 0, 1)`
+- `market_score = 60% * trend_score + 40% * volatility_score`
+- `target = effective_min + (effective_max - effective_min) * market_score`
+
+其中 `effective_min` 不得低于“双边手续费 ROE + 0.20% 缓冲”，`effective_max` 默认是 `0.75%`。在默认 3 倍杠杆和 `fee_rate=0.0005` 下，动态范围为 `0.50%～0.75%`；弱趋势、低波动更靠近下限，强趋势、高波动更靠近上限。指标暂不可用时使用 `0.60%` 备用目标。
+
+目标一旦计算，就连同仓位数量、均价和层级写入运行态并冻结；ADX 或 ATR 后续增强不会把目标向上抬。只有真实加仓成交或均价变化才清空并重新计算，重启后同一仓位继续沿用原目标。触发后直接走统一、幂等的总平仓流程，不做分批止盈。这样既能及时兑现第一阶段的小额浮盈，也不会因为小仓位的 20%/30% 数量低于交易所最小下单量而反复失败。
+
+该阈值按当前收益判断，不使用历史峰值补触发；手续费只是估算，实际净收益仍会受到滑点、资金费率和成交方式影响。
+
+这条规则同时存在于 WebSocket 实时风控和 REST 轮询兜底链路。已经进入 `PHASE2` 后不会再套用快速整仓止盈，原有九层加仓规则和总止损规则均未改变。
+
+### 12.2 动态移动止盈激活阈值
 
 `_dynamic_tp_values(adx, volatility_pct)` 输出两个值：
 
@@ -817,7 +878,9 @@ if phase == 'PHASE2':
 
 趋势越强、波动越大，激活阈值通常越高；趋势较弱时会更容易激活。
 
-### 12.2 风险上下文
+移动止盈只在“当前收益”本次真正达到激活阈值时激活，不再使用旧的历史最高收益补触发。加仓导致持仓数量或均价改变时，会清空旧仓位周期的峰值、激活标志和保护止损，再从新均价重新建立基准。因此不会出现“历史上曾盈利、现在已经亏损才激活移动止盈”的情况。
+
+### 12.3 风险上下文
 
 `_build_risk_context()` 会同时计算：
 
@@ -874,6 +937,8 @@ ATR 追踪乘数：
 - `tp1_threshold` 最低不低于约 `1.5%`，最高不超过 `8%`
 - `tp2_threshold` 至少比 TP1 多 `1.5%`，最高不超过 `14%`
 
+执行每一档前还会再次检查当前收益仍达到该档动态阈值。历史最高收益只用于计算激活后的回撤，不能单独触发 TP1/TP2。
+
 ---
 
 ## 14. 保护止损逻辑
@@ -921,15 +986,15 @@ ATR 追踪乘数：
 
 函数 `_allow_trailing_close()` 的逻辑很重要：
 
-- 如果当前收益还高于 `trailing_min_close_profit_pct`，允许直接执行追踪平仓
-- 如果当前收益太低，不想因为轻微回撤把本来不大的利润全部抹掉
-- 那就改挂保护止损，不立即总平
+- 移动止盈尚未激活时，不允许追踪平仓
+- 一旦已经由当前收益跨越阈值激活，后续达到回撤或 ATR 退出条件就允许直接平仓
+- 不再用 `trailing_min_close_profit_pct` 否决已经触发的退出，避免行情回撤到亏损后反而被持续拒绝平仓
 
 默认：
 
 - `trailing_min_close_profit_pct=0.5%`
 
-所以这套策略不是“只要触发回撤就立刻平”，而是会先判断值不值得直接平。
+`trailing_min_close_profit_pct` 仍保留为兼容配置，但不再覆盖已经激活的追踪退出。
 
 ---
 
@@ -951,6 +1016,8 @@ ATR 追踪乘数：
 - `_ws_risk_step()` 的 WS 实时风控
 
 因此即便轮询还没到时间，只要 WS 价格更新正常，也会更快触发。
+
+本轮可靠性修复没有新增“中间层账户亏损 4%～8% 停加仓/强平”规则，也没有修改九层资金倍率。中间层仍按原马丁逻辑管理，现有 `max_loss_pct` 总止损保持原值。
 
 ---
 
@@ -1021,24 +1088,33 @@ ATR 追踪乘数：
 
 特点：
 
-- 使用市价单
+- 同时检查数量步长、最小数量和最小名义价值
+- 目标量不足最小成交量时，可在允许的比例偏差内提升到最小成交量
+- 无法拆分且会留下尘仓时跳过；同一仓位规模只记录一次，仓位变化后重新评估
+- 使用单笔市价 `reduceOnly` 委托，不再采用“限价超时后补市价”的双订单流程
+- 下单前持久化确定性 `clientOid`；结果未知时进入 pending 并持续对账，不重复提交
 - 带 `reduceOnly=True`
-- 平仓成功后更新 `partial_tp_1_done` 或 `partial_tp_2_done`
+- 只有成交状态或权威仓位变化确认成功后，才更新 `partial_tp_1_done` 或 `partial_tp_2_done`
 
 ### 18.2 总平仓
 
-总平流程统一由 `_execute_exit_pipeline()` 管理，顺序是：
+总平流程统一由 `_execute_exit_pipeline()` 管理，并使用持久化状态机：
 
-1. 设置 `_exit_in_progress`
+`IDLE → CLAIMED → ORDER_SUBMITTED → CONFIRMED`
+
+顺序是：
+
+1. 在 `action_lock` 内原子抢占退出权并写入 `CLAIMED`
 2. 获取最新持仓
-3. 调用 `close_position()` 市价全平
-4. 取消保护止损 `_clear_protective_stop()`
-5. `cancel_all_orders()` 撤所有挂单
-6. `sync_state_with_exchange()` 与交易所再同步一次
-7. 写本地快照
-8. 清掉 `_exit_in_progress`
+3. 发送一笔市价 `reduceOnly` 全平单，发送前持久化确定性 `clientOid`
+4. 响应未知时只按 `clientOid`、订单历史和权威仓位对账，不自动重发
+5. 只有权威持仓确认归零后才进入 `CONFIRMED`
+6. 取消保护止损和普通挂单，并再次与交易所同步
+7. 清理确认成功后才重置运行态；否则保留 `EXITING`，禁止重新开仓
 
 这个统一出口很重要，因为它避免了不同风控路径各自平仓，导致状态不一致。
+
+如果总平时仍有响应未知的开仓/加仓请求，机器人会按持久化 `clientOid` 定向撤单，并保留 fail-closed 运行态；只有订单已确认取消/终止且仓位为空，才重置为 `IDLE`。若迟到订单在退出后成交，WS 风控或主循环会立即再次执行总平，避免意外重新开仓。
 
 ---
 
@@ -1080,7 +1156,13 @@ ATR 追踪乘数：
 - `_exit_in_progress`
 - `action_lock`
 
-只要一条链路已经进入平仓流程，另一条链路会自动跳过。
+再加上持久化的 `exit_state/clientOid`。只要一条链路已经抢占，另一条链路会自动跳过；即使进程在 POST 后重启，也会先对账，不会提交第二张全平单。分批止盈同样先在锁内占用对应 TP 档位，再下单确认，主循环和 WS 线程不能重复执行同一档。
+
+### 19.4 WebSocket 重连与新增敞口健康闸门
+
+公共和私有通道的连接循环在 ping 任务取消时会显式处理 `asyncio.CancelledError`，随后按退避时间继续重连，不会永久退出重连循环。健康状态同时记录连接、最近业务消息、最近 pong、错误和重连次数。
+
+启用 `ws_entry_health_gate_enabled` 后，只要已启用的 WS 通道断开或超过 `ws_entry_max_stale_sec` 没有消息/pong，就禁止首仓和加仓。这个闸门只限制“增加敞口”；已有仓位仍继续使用 REST 轮询执行现有止盈止损。显式关闭 WS 的 REST-only 配置不受该闸门影响。
 
 ---
 
@@ -1163,6 +1245,8 @@ ATR 追踪乘数：
 
 这意味着策略设计目标是“常驻进程”，不是一次报错就停。
 
+所有首仓和加仓下单都会在发送 POST 前先把 `clientOid`、目标层、方向、数量、价格及下单前仓位写入运行态。响应丢失、网络超时、5xx 或交易所系统错误只会进入待确认状态；机器人会通过强制 REST 挂单、订单详情、历史订单、触发单历史和仓位变化对账，不会生成新 `clientOid` 重复提交。只有明确拒绝，或历史订单确认已取消且完全未成交，才允许重新规划。
+
 ### 21.3 状态同步逻辑
 
 `sync_state_with_exchange()` 分三种情况。
@@ -1208,6 +1292,7 @@ ATR 追踪乘数：
 - 挂单价
 - 最近成交价
 - 保护止损信息
+- 开仓/加仓、分批止盈、保护止损和整仓退出的提交状态与 `clientOid`
 
 ### 21.5 本地实时快照
 
@@ -1227,6 +1312,12 @@ ATR 追踪乘数：
 
 这主要服务监控和 dashboard，也有助于异常排查。
 
+快照写文件和各 REST 数据源已拆开缓存：默认文件每 5 秒更新，账户 15 秒、仓位 5 秒、挂单和行情 10 秒、成交 60 秒、资金流水 300 秒。交易动作要求立即写快照时，也不会强制突发查询全部接口。所有 REST 请求还共享最小间隔；遇到 HTTP 429 会尊重 `Retry-After` 并加入随机退避。
+
+成交和资金流水分别增量保存在 `data/martin-trades.json` 与 `data/martin-ledger.json`，不再把分析范围固定为最近 60 笔。dashboard 的 `roi_pct` 表示自本地权益基线以来、扣除可识别外部划转后的账户收益率；`position_roe_pct` 才是当前持仓 ROE，同时持久化跟踪峰值和最大回撤。Bitget 接口只提供有限历史窗口，因此首次启用前更早的数据仍需另行导入，之后本地日志会持续积累。
+
+运行日志固定写入 `data/logs/martin.log`，每行带时间、级别、PID、线程、交易周期和当前订单上下文；默认单文件 10 MB、保留 5 个轮转备份，因此跨进程重启也不会绕过总量约束。可以用 `MARTIN_LOG_MAX_BYTES` 和 `MARTIN_LOG_BACKUP_COUNT` 调整。历史遗留的时间戳日志不会被程序自动删除，避免丢失审计记录，可在确认不再需要后人工归档。
+
 ---
 
 ## 22. 用一句话总结完整交易流程
@@ -1238,10 +1329,11 @@ ATR 追踪乘数：
 3. 首仓成交后进入持仓管理，只挂下一层，不一次性挂满
 4. 加仓价格优先用结构位，其次 ATR，再次固定偏移，并带挂单粘性与价格校准
 5. 持仓过程中根据层数或浮亏切换 `PHASE1/PHASE2`
-6. 盈利后先激活动态移动止盈，再执行两档分批止盈
-7. 剩余仓位继续受保护止损、回撤保护和 ATR 追踪止盈管理
-8. 如果亏损超过硬阈值，立即总平
-9. 平仓后撤掉所有挂单，重置状态，回到 `IDLE`
+6. 第一阶段当前收益达到快速止盈线时直接整仓退出
+7. 未触发第一阶段快速止盈或已经进入第二阶段时，使用动态移动止盈与两档分批止盈
+8. 剩余仓位继续受保护止损、回撤保护和 ATR 追踪止盈管理
+9. 如果亏损超过硬阈值，立即总平
+10. 平仓后撤掉所有挂单，重置状态，回到 `IDLE`
 
 ---
 
@@ -1252,6 +1344,8 @@ ATR 追踪乘数：
 - 它不是“固定止盈线”，而是根据趋势、波动、层数、阶段动态调整
 - 它不是“简单马丁翻倍”，而是分 `PHASE1/PHASE2` 两阶段扩张风险
 - 它对挂单管理非常谨慎，尽量保证任一时刻只有一个明确的下一步动作
+
+`martin-backtest.pine` 已同步为 `pyramiding=9`、九层倍率和九层状态，入场方向使用与实盘相同的趋势跟随/均值回归信号，移动止盈使用当前收益跨阈值激活，并在加仓均价改变后重置峰值。Pine 仍受 TradingView K 线内成交模型限制，不能替代交易所模拟集成测试；网络响应丢失、订单对账和线程竞态由 `tests/` 中的模拟交易所测试覆盖。
 
 如果后续你还需要，我可以继续把这份文档再补成两版：
 

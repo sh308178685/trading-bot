@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+set -eu
+
+# Never publish a ref whose reachable history contains the live credential file.
+# config/config.json is ignored today, but older local commits still contain it.
+zero_sha=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero_sha" ] && continue
+    if [ -n "$(git rev-list "$local_sha" -- config/config.json)" ]; then
+        echo "BLOCKED: $local_ref contains config/config.json in Git history." >&2
+        echo "Rotate the Bitget credentials and rewrite the local history before pushing." >&2
+        exit 1
+    fi
+done
+
+exit 0

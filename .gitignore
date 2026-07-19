@@ -1,5 +1,7 @@
 # Local secrets
 /config/config.json
+/config/config.json--bak
+/config/sandbox/
 /.env
 /.env.*
 !/config/config.example.json
@@ -24,3 +26,4 @@ __pycache__/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+/.vs/

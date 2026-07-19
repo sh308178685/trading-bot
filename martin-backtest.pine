@@ -3,28 +3,48 @@
 // 策略逻辑忠实还原自 martin-bot.py
 
 //@version=5
-strategy("马丁策略 - Bitget版回测", overlay=true, initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.06, slippage=2, pyramiding=0)
+strategy("马丁策略 - Bitget版回测", overlay=true, initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.06, slippage=2, pyramiding=9)
 
 // ==================== 参数 ====================
 i_leverage             = input.int(3, "杠杆倍数", minval=1, maxval=125)
 i_fast_ema             = input.int(20, "快线EMA周期", minval=5, maxval=100)
 i_slow_ema             = input.int(50, "慢线EMA周期", minval=10, maxval=200)
 i_rsi_threshold        = input.float(50.0, "RSI阈值")
-i_adx_threshold        = input.float(16.5, "ADX阈值", step=0.5)
-i_max_layers           = input.int(5, "最大加仓层数", minval=1, maxval=10)
-i_first_order_ratio    = input.float(0.10, "首仓保证金比例", step=0.01)
+i_trend_adx_threshold  = input.float(28.0, "趋势跟随 ADX 阈值", step=0.5)
+i_range_adx_max        = input.float(20.0, "均值回归 ADX 上限", step=0.5)
+i_range_long_rsi       = input.float(35.0, "均值回归做多 RSI")
+i_range_short_rsi      = input.float(65.0, "均值回归做空 RSI")
+i_range_atr_ratio      = input.float(0.35, "均值回归 ATR 偏离倍数", step=0.05)
+i_max_layers           = input.int(9, "最大加仓层数", minval=1, maxval=9)
+i_first_order_ratio    = input.float(0.025, "首仓保证金比例", step=0.005)
 i_layer_mult_1         = input.float(1.0, "第1层倍率")
-i_layer_mult_2         = input.float(1.5, "第2层倍率")
-i_layer_mult_3         = input.float(2.0, "第3层倍率")
-i_layer_mult_4         = input.float(2.5, "第4层倍率")
-i_layer_mult_5         = input.float(3.0, "第5层倍率")
+i_layer_mult_2         = input.float(1.15, "第2层倍率")
+i_layer_mult_3         = input.float(1.35, "第3层倍率")
+i_layer_mult_4         = input.float(2.4, "第4层倍率")
+i_layer_mult_5         = input.float(3.9, "第5层倍率")
+i_layer_mult_6         = input.float(5.3, "第6层倍率")
+i_layer_mult_7         = input.float(6.8, "第7层倍率")
+i_layer_mult_8         = input.float(8.3, "第8层倍率")
+i_layer_mult_9         = input.float(9.8, "第9层倍率")
 i_level_offset_pct     = input.float(0.001, "结构位偏移", step=0.0001)   // 0.1%
 i_add_layer_base_off   = input.float(0.005, "加仓固定偏移", step=0.001) // 0.5% * layer
 i_max_loss_pct         = input.float(0.50, "最大亏损%", step=0.01)      // -50%
 i_fee_rate             = input.float(0.0006, "手续费率", step=0.0001)    // 0.06%
-i_partial_tp1_pct      = input.float(5.0, "分批止盈1 阈值%", step=0.5)
+i_phase1_dynamic_tp    = input.bool(true, "第一阶段止盈根据 ADX/ATR 自动计算")
+i_phase1_quick_tp      = input.float(0.006, "第一阶段指标不可用时的止盈 ROE", step=0.001)
+i_phase1_min_net       = input.float(0.002, "第一阶段手续费外收益缓冲", step=0.001)
+i_phase1_tp_min        = input.float(0.005, "第一阶段动态止盈下限", step=0.001)
+i_phase1_tp_max        = input.float(0.0075, "第一阶段动态止盈上限", step=0.0005)
+i_phase1_adx_floor     = input.float(18.0, "第一阶段动态止盈 ADX 下界", step=1.0)
+i_phase1_adx_ceiling   = input.float(40.0, "第一阶段动态止盈 ADX 上界", step=1.0)
+i_phase1_vol_floor     = input.float(0.001, "第一阶段动态止盈 ATR 波动下界", step=0.0001)
+i_phase1_vol_ceiling   = input.float(0.005, "第一阶段动态止盈 ATR 波动上界", step=0.0001)
+i_phase1_trend_weight  = input.float(0.60, "第一阶段动态止盈趋势权重", minval=0.0, maxval=1.0, step=0.05)
+i_vol_percentile_len   = input.int(288, "ATR滚动分位回看", minval=80)
+i_vol_low_cutoff       = input.float(0.25, "低波动分位上界", minval=0.0, maxval=1.0, step=0.05)
+i_vol_high_cutoff      = input.float(0.75, "高波动分位下界", minval=0.0, maxval=1.0, step=0.05)
+i_vol_extreme_cutoff   = input.float(0.90, "极端波动分位下界", minval=0.0, maxval=1.0, step=0.05)
 i_partial_tp1_ratio    = input.float(0.3, "分批止盈1 平仓比例", step=0.05)
-i_partial_tp2_pct      = input.float(8.0, "分批止盈2 阈值%", step=0.5)
 i_partial_tp2_ratio    = input.float(0.2, "分批止盈2 平仓比例", step=0.05)
 
 // ==================== 状态变量 ====================
@@ -35,6 +55,8 @@ var float  best_profit = 0.0
 var bool   activated   = false
 var bool   pt1_done    = false
 var bool   pt2_done    = false
+var bool   phase2_mode = false
+var float  phase1_frozen_target = 0.0
 var float  entry_price = 0.0
 var float  avg_price   = 0.0
 var float  total_qty   = 0.0       // 总持仓张数
@@ -47,6 +69,10 @@ var float  l2_price = 0.0, l2_qty = 0.0
 var float  l3_price = 0.0, l3_qty = 0.0
 var float  l4_price = 0.0, l4_qty = 0.0
 var float  l5_price = 0.0, l5_qty = 0.0
+var float  l6_price = 0.0, l6_qty = 0.0
+var float  l7_price = 0.0, l7_qty = 0.0
+var float  l8_price = 0.0, l8_qty = 0.0
+var float  l9_price = 0.0, l9_qty = 0.0
 
 // ==================== 指标计算 ====================
 // EMA
@@ -62,11 +88,16 @@ rsi_val = ta.rsi(close, 14)
 // ATR
 atr_val = ta.atr(14)
 
-// ==================== 趋势判断 ====================
-is_uptrend   = ema_fast > ema_slow and rsi_val > i_rsi_threshold and adx_val > i_adx_threshold
-is_downtrend = ema_fast < ema_slow and rsi_val < i_rsi_threshold and adx_val > i_adx_threshold
-
-trend_signal = is_uptrend ? "UP" : (is_downtrend ? "DOWN" : "CHOPPY")
+// ==================== 入场信号（与实盘 _entry_bias_from_row 一致） ====================
+is_bullish = ema_fast > ema_slow and rsi_val > i_rsi_threshold
+is_bearish = ema_fast < ema_slow and rsi_val < i_rsi_threshold
+atr_band = atr_val * i_range_atr_ratio
+trend_long = adx_val >= i_trend_adx_threshold and is_bullish
+trend_short = adx_val >= i_trend_adx_threshold and is_bearish
+range_long = adx_val <= i_range_adx_max and rsi_val <= i_range_long_rsi and close <= ema_fast - atr_band
+range_short = adx_val <= i_range_adx_max and rsi_val >= i_range_short_rsi and close >= ema_fast + atr_band
+trade_signal = trend_long or range_long ? "LONG" : (trend_short or range_short ? "SHORT" : "WAIT")
+market_state = trend_long ? "TREND_UP" : (trend_short ? "TREND_DOWN" : (range_long or range_short ? "RANGE_MEAN_REVERSION" : (is_bullish ? "BULLISH_STRETCHED" : (is_bearish ? "BEARISH_STRETCHED" : "NEUTRAL"))))
 
 // ==================== 支撑阻力计算 ====================
 // 简化版：用1h级别数据（在Pine中只能用当前周期或更高的数据，这里用近期高低+pivot+EMA）
@@ -147,12 +178,17 @@ if array.size(raw_res) > 0
                 array.push(res_sorted, curr)
 
 // ==================== 动态止盈参数 ====================
-base_threshold = math.max(2.0 * i_fee_rate * i_leverage, 0.03)
+fee_floor = 2.0 * i_fee_rate * i_leverage
+profit_floor = math.max(math.max(0.005, fee_floor + 0.001), 0.005)
+base_threshold = math.max(fee_floor * 3.0, profit_floor * 2.4)
 adx_mult   = adx_val > 30 ? 1.5 : (adx_val > 25 ? 1.2 : (adx_val > 20 ? 1.0 : 0.7))
 trail_ratio = adx_val > 30 ? 0.4  : (adx_val > 25 ? 0.45 : (adx_val > 20 ? 0.5 : 0.6))
 vol_pct    = atr_val / close
+atr_percentile = ta.percentrank(vol_pct, i_vol_percentile_len) / 100.0
+atr_percentile_ready = not na(atr_percentile)
+vol_spacing_mult = not atr_percentile_ready ? 1.0 : (atr_percentile <= i_vol_low_cutoff ? 0.9 : (atr_percentile < i_vol_high_cutoff ? 1.0 : (atr_percentile < i_vol_extreme_cutoff ? 1.2 : 1.5)))
 vol_mult   = vol_pct > 0.03 ? 1.3 : (vol_pct > 0.02 ? 1.1 : (vol_pct > 0.01 ? 1.0 : 0.8))
-activate_pct = math.max(math.min(base_threshold * adx_mult * vol_mult, 0.15), 0.03)
+activate_pct = math.min(math.max(base_threshold * adx_mult * vol_mult, math.max(profit_floor, fee_floor * 1.5)), 0.15)
 
 // ATR追踪止盈价
 atr_mult = layer < 4 ? 4.0 : 3.0
@@ -172,6 +208,29 @@ calc_profit() =>
 
 current_profit = calc_profit()
 
+// 与实盘 _dynamic_partial_tp_targets() 同一套动态阈值。
+partial_trend_mult = adx_val >= 30 ? 1.20 : (adx_val >= 20 ? 1.00 : 0.85)
+partial_vol_mult = vol_pct > 0.03 ? 1.25 : (vol_pct > 0.015 ? 1.05 : 0.90)
+partial_layer_mult = layer >= 4 ? 0.88 : (layer == 3 ? 0.95 : 1.00)
+if layer >= 4 or current_profit <= -0.025
+    phase2_mode := true
+partial_phase_mult = phase2_mode ? 0.92 : 1.00
+partial_total_mult = partial_trend_mult * partial_vol_mult * partial_layer_mult * partial_phase_mult
+dynamic_tp1 = math.min(math.max(math.max(profit_floor, 0.04 * partial_total_mult), 0.015), 0.08)
+dynamic_tp2 = math.min(math.max(dynamic_tp1 + 0.015, 0.07 * partial_total_mult), 0.14)
+phase1_cost_floor = 2.0 * i_fee_rate * i_leverage + i_phase1_min_net
+phase1_effective_min = math.max(i_phase1_tp_min, phase1_cost_floor)
+phase1_effective_max = math.max(i_phase1_tp_max, phase1_effective_min)
+phase1_adx_span = math.max(i_phase1_adx_ceiling - i_phase1_adx_floor, 1.0)
+phase1_vol_span = math.max(i_phase1_vol_ceiling - i_phase1_vol_floor, 0.000001)
+phase1_trend_score = math.min(math.max((adx_val - i_phase1_adx_floor) / phase1_adx_span, 0.0), 1.0)
+phase1_fixed_vol_score = math.min(math.max((vol_pct - i_phase1_vol_floor) / phase1_vol_span, 0.0), 1.0)
+phase1_vol_score = atr_percentile_ready ? atr_percentile : phase1_fixed_vol_score
+phase1_market_score = i_phase1_trend_weight * phase1_trend_score + (1.0 - i_phase1_trend_weight) * phase1_vol_score
+phase1_dynamic_target = phase1_effective_min + (phase1_effective_max - phase1_effective_min) * phase1_market_score
+phase1_fallback_target = math.min(math.max(i_phase1_quick_tp, phase1_effective_min), phase1_effective_max)
+phase1_target_candidate = i_phase1_dynamic_tp ? phase1_dynamic_target : phase1_fallback_target
+
 // 更新最高浮盈
 if current_profit > best_profit
     best_profit := current_profit
@@ -186,8 +245,16 @@ get_layer_mult(l) =>
         i_layer_mult_3
     else if l == 4
         i_layer_mult_4
-    else
+    else if l == 5
         i_layer_mult_5
+    else if l == 6
+        i_layer_mult_6
+    else if l == 7
+        i_layer_mult_7
+    else if l == 8
+        i_layer_mult_8
+    else
+        i_layer_mult_9
 
 // ==================== 买入/卖出数量计算 ====================
 calc_margin_amount(mult_val) =>
@@ -211,6 +278,8 @@ close_all() =>
     activated := false
     pt1_done  := false
     pt2_done  := false
+    phase2_mode := false
+    phase1_frozen_target := 0.0
     entry_price := 0.0
     avg_price := 0.0
     total_qty := 0.0
@@ -220,6 +289,10 @@ close_all() =>
     l3_price := 0.0, l3_qty := 0.0
     l4_price := 0.0, l4_qty := 0.0
     l5_price := 0.0, l5_qty := 0.0
+    l6_price := 0.0, l6_qty := 0.0
+    l7_price := 0.0, l7_qty := 0.0
+    l8_price := 0.0, l8_qty := 0.0
+    l9_price := 0.0, l9_qty := 0.0
 
 // ==================== 重置状态 ====================
 reset_state() =>
@@ -230,6 +303,8 @@ reset_state() =>
     activated := false
     pt1_done  := false
     pt2_done  := false
+    phase2_mode := false
+    phase1_frozen_target := 0.0
     entry_price := 0.0
     avg_price := 0.0
     total_qty := 0.0
@@ -239,6 +314,10 @@ reset_state() =>
     l3_price := 0.0, l3_qty := 0.0
     l4_price := 0.0, l4_qty := 0.0
     l5_price := 0.0, l5_qty := 0.0
+    l6_price := 0.0, l6_qty := 0.0
+    l7_price := 0.0, l7_qty := 0.0
+    l8_price := 0.0, l8_qty := 0.0
+    l9_price := 0.0, l9_qty := 0.0
 
 // ==================== 首仓入场 ====================
 place_first_order(side_str) =>
@@ -268,6 +347,8 @@ place_first_order(side_str) =>
         activated   := false
         pt1_done    := false
         pt2_done    := false
+        phase2_mode := false
+        phase1_frozen_target := 0.0
         entry_price := ep
         avg_price   := ep
         total_qty   := qty
@@ -295,7 +376,7 @@ place_add_order(layer_num) =>
         if na(ep) or ep == 0.0
             // ATR兜底
             atr_mult_add = 1.0 + math.max(layer_num - 2, 0) * 0.5
-            distance = atr_val * atr_mult_add
+            distance = atr_val * atr_mult_add * vol_spacing_mult
             ep := math.min(avg_price, close) - distance
         if na(ep) or ep == 0.0
             // 固定偏移兜底
@@ -310,7 +391,7 @@ place_add_order(layer_num) =>
             ep := math.max(preferred, min_ep)
         if na(ep) or ep == 0.0
             atr_mult_add = 1.0 + math.max(layer_num - 2, 0) * 0.5
-            distance = atr_val * atr_mult_add
+            distance = atr_val * atr_mult_add * vol_spacing_mult
             ep := math.max(avg_price, close) + distance
         if na(ep) or ep == 0.0
             offset = i_add_layer_base_off * layer_num
@@ -339,6 +420,19 @@ place_add_order(layer_num) =>
             l4_price := ep, l4_qty := qty
         else if layer_num == 5
             l5_price := ep, l5_qty := qty
+        else if layer_num == 6
+            l6_price := ep, l6_qty := qty
+        else if layer_num == 7
+            l7_price := ep, l7_qty := qty
+        else if layer_num == 8
+            l8_price := ep, l8_qty := qty
+        else if layer_num == 9
+            l9_price := ep, l9_qty := qty
+
+        // 实盘在加仓/均价变化后重新建立移动止盈峰值。
+        best_profit := 0.0
+        activated := false
+        phase1_frozen_target := 0.0
 
 // ==================== 主逻辑 ====================
 // 使用 limit order 模拟挂单成交：当价格触及挂单价时入场
@@ -350,11 +444,11 @@ place_add_order(layer_num) =>
 if barstate.isconfirmed
     // ========== IDLE 状态 ==========
     if bot_state == "IDLE"
-        if trend_signal == "DOWN"
+        if trade_signal == "LONG"
             place_first_order("long")
-        else if trend_signal == "UP"
+        else if trade_signal == "SHORT"
             place_first_order("short")
-        // CHOPPY 什么都不做
+        // WAIT 什么都不做
     
     // ========== IN_STRATEGY 状态 ==========
     else if bot_state == "IN_STRATEGY"
@@ -371,17 +465,24 @@ if barstate.isconfirmed
                 total_qty := math.abs(strategy.position_size)
             
             current_p = calc_profit()
+
+            // 成交或均价变化后的第一次风控计算目标，之后本仓位基准内保持冻结。
+            if layer <= 3 and not phase2_mode and phase1_frozen_target <= 0
+                phase1_frozen_target := phase1_target_candidate
             
             // 硬止损
             if current_p < -i_max_loss_pct
+                close_all()
+            // 第一阶段以高周转为目标，达到覆盖成本后的阈值就整仓退出。
+            else if layer <= 3 and not phase2_mode and current_p >= phase1_frozen_target
                 close_all()
             
             // 更新最高浮盈
             if current_p > best_profit
                 best_profit := current_p
             
-            // 分批止盈2 (8%)
-            if best_profit >= i_partial_tp2_pct / 100.0 and not pt2_done
+            // 分批止盈必须在执行当下仍高于目标，不能只看历史峰值。
+            if current_p >= dynamic_tp2 and not pt2_done
                 close_qty = total_qty * i_partial_tp2_ratio
                 if pos_side == "long"
                     strategy.close("MartinLong", qty=close_qty, comment="TP2")
@@ -389,8 +490,7 @@ if barstate.isconfirmed
                     strategy.close("MartinShort", qty=close_qty, comment="TP2")
                 pt2_done := true
             
-            // 分批止盈1 (5%)
-            if best_profit >= i_partial_tp1_pct / 100.0 and not pt1_done
+            if current_p >= dynamic_tp1 and not pt1_done
                 close_qty = total_qty * i_partial_tp1_ratio
                 if pos_side == "long"
                     strategy.close("MartinLong", qty=close_qty, comment="TP1")
@@ -399,7 +499,7 @@ if barstate.isconfirmed
                 pt1_done := true
             
             // 移动止盈已激活
-            if best_profit >= activate_pct
+            if current_p >= activate_pct
                 activated := true
             
             // 回撤保护
@@ -434,17 +534,17 @@ if barstate.isconfirmed
             reset_state()
     
     // ========== 趋势反转检测 ==========
-    if bot_state == "IN_STRATEGY" and pos_side == "long" and trend_signal == "UP"
+    if bot_state == "IN_STRATEGY" and pos_side == "long" and trade_signal == "SHORT"
         close_all()
-    else if bot_state == "IN_STRATEGY" and pos_side == "short" and trend_signal == "DOWN"
+    else if bot_state == "IN_STRATEGY" and pos_side == "short" and trade_signal == "LONG"
         close_all()
-    else if bot_state == "IN_STRATEGY" and trend_signal == "CHOPPY" and layer == 1
+    else if bot_state == "IN_STRATEGY" and trade_signal == "WAIT" and layer == 1
         // 横盘且只有一层，平掉等信号
         close_all()
 
 // ==================== 可视化 ====================
 // 趋势背景色
-bgcolor(trend_signal == "UP" ? color.new(color.green, 90) : (trend_signal == "DOWN" ? color.new(color.red, 90) : na), title="趋势背景")
+bgcolor(trade_signal == "LONG" ? color.new(color.green, 90) : (trade_signal == "SHORT" ? color.new(color.red, 90) : na), title="信号背景")
 
 // EMA线
 plot(ema_fast, "EMA快线", color=color.blue, linewidth=1)
@@ -457,8 +557,8 @@ plot(array.size(res_sorted) > 0 ? array.get(res_sorted, 0) : na, "阻力1", colo
 plot(array.size(res_sorted) > 1 ? array.get(res_sorted, 1) : na, "阻力2", color=color.new(color.red, 50), style=plot.style_linebr, linewidth=1)
 
 // 信号标签
-plotshape(trend_signal == "DOWN" and bot_state == "IDLE", title="做多信号", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="L")
-plotshape(trend_signal == "UP" and bot_state == "IDLE", title="做空信号", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+plotshape(trade_signal == "LONG" and bot_state == "IDLE", title="做多信号", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="L")
+plotshape(trade_signal == "SHORT" and bot_state == "IDLE", title="做空信号", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
 
 // 信息表格
 var table info_tbl = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
@@ -478,4 +578,4 @@ if barstate.islast
     table.cell(info_tbl, 0, 6, "最高浮盈%", text_color=color.white)
     table.cell(info_tbl, 1, 6, str.tostring(best_profit * 100, "#.##") + "%", text_color=color.yellow)
     table.cell(info_tbl, 0, 7, "趋势", text_color=color.white)
-    table.cell(info_tbl, 1, 7, trend_signal, text_color=trend_signal == "UP" ? color.green : (trend_signal == "DOWN" ? color.red : color.gray))
+    table.cell(info_tbl, 1, 7, market_state + " / " + trade_signal, text_color=trade_signal == "LONG" ? color.green : (trade_signal == "SHORT" ? color.red : color.gray))

@@ -406,6 +406,16 @@ p {
   border-bottom: 1px solid var(--line);
 }
 
+.definition-row span {
+  flex: 0 0 42%;
+}
+
+.definition-row strong {
+  min-width: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
 .definition-row:last-child {
   border-bottom: 0;
   padding-bottom: 0;

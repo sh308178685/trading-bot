@@ -21,6 +21,9 @@ LIVE_FILE = DATA_DIR / "martin-live.json"
 HISTORY_FILE = DATA_DIR / "dashboard-history.json"
 EVENTS_FILE = DATA_DIR / "dashboard-events.json"
 CACHE_FILE = DATA_DIR / "dashboard-cache.json"
+TRADE_JOURNAL_FILE = DATA_DIR / "martin-trades.json"
+LEDGER_JOURNAL_FILE = DATA_DIR / "martin-ledger.json"
+PERFORMANCE_FILE = DATA_DIR / "martin-performance.json"
 
 def load_json(path: Path, default: Any) -> Any:
     if path.exists():
@@ -283,8 +286,14 @@ class DashboardService:
         balance = live_snapshot.get("account") or self._default_balance()
         position = live_snapshot.get("position")
         open_orders = live_snapshot.get("open_orders") or []
-        trades = live_snapshot.get("recent_trades") or []
-        ledger = live_snapshot.get("ledger") or []
+        trades = load_json(TRADE_JOURNAL_FILE, None)
+        if not isinstance(trades, list):
+            trades = live_snapshot.get("recent_trades") or []
+        ledger = load_json(LEDGER_JOURNAL_FILE, None)
+        if not isinstance(ledger, list):
+            ledger = live_snapshot.get("ledger") or []
+        trades = [row for row in trades if isinstance(row, dict)]
+        ledger = [row for row in ledger if isinstance(row, dict)]
         market = live_snapshot.get("market") or self._default_market_bundle()
 
         self.bot.update_from_live(live_snapshot)
@@ -417,6 +426,9 @@ class DashboardService:
         cutoff = now.timestamp() - 24 * 60 * 60
 
         for trade in trades:
+            trade_ts = safe_float(trade.get("timestamp_ms", 0)) / 1000
+            if trade_ts and trade_ts < cutoff:
+                continue
             turnover += safe_float(trade.get("cost", 0))
             fees += safe_float(trade.get("fee", 0))
 
@@ -430,11 +442,59 @@ class DashboardService:
                     pass
             entry_type = str(entry.get("type", "")).lower()
             amount = safe_float(entry.get("amount", 0))
-            if any(token in entry_type for token in ("pnl", "profit", "realized", "settle")):
-                realized += amount
+            if any(token in entry_type for token in ("close", "pnl", "profit", "realized", "settle")):
+                realized += amount + safe_float(entry.get("fee", 0))
 
-        equity_estimate = safe_float(balance.get("total", 0)) + unrealized
-        roi = safe_float(position["percentage"]) if position else 0.0
+        # Bitget accountEquity/CCXT total already includes unrealized PnL; adding it a
+        # second time inflated the old dashboard estimate.
+        equity_estimate = safe_float(balance.get("total", 0))
+        history_rows = load_json(HISTORY_FILE, [])
+        history_rows = history_rows if isinstance(history_rows, list) else []
+        performance_tracker = load_json(PERFORMANCE_FILE, {})
+        performance_tracker = performance_tracker if isinstance(performance_tracker, dict) else {}
+        equity_points = [
+            safe_float(row.get("equity_estimate", 0))
+            for row in history_rows
+            if isinstance(row, dict) and safe_float(row.get("equity_estimate", 0)) > 0
+        ]
+        baseline_equity = safe_float(performance_tracker.get("baseline_equity", 0))
+        if baseline_equity <= 0:
+            baseline_equity = equity_points[0] if equity_points else equity_estimate
+        baseline_timestamp = str(performance_tracker.get("tracking_started_at") or "") or (
+            str(history_rows[0].get("timestamp") or "")
+            if history_rows and isinstance(history_rows[0], dict)
+            else ""
+        )
+        baseline_epoch = 0.0
+        if baseline_timestamp:
+            try:
+                baseline_epoch = datetime.fromisoformat(baseline_timestamp).timestamp()
+            except (TypeError, ValueError):
+                baseline_epoch = 0.0
+
+        net_external_flows = 0.0
+        for entry in ledger:
+            entry_type = str(entry.get("type", "")).lower()
+            if not any(token in entry_type for token in ("trans_from", "trans_to", "deposit", "withdraw")):
+                continue
+            entry_epoch = safe_float(entry.get("timestamp_ms", 0)) / 1000
+            if not entry_epoch and entry.get("timestamp"):
+                try:
+                    entry_epoch = datetime.fromisoformat(str(entry.get("timestamp"))).timestamp()
+                except (TypeError, ValueError):
+                    entry_epoch = 0.0
+            if baseline_epoch and entry_epoch and entry_epoch < baseline_epoch:
+                continue
+            net_external_flows += safe_float(entry.get("amount", 0))
+
+        account_profit = equity_estimate - baseline_equity - net_external_flows
+        roi = safe_div(account_profit, baseline_equity) * 100 if baseline_equity > 0 else 0.0
+        peak = safe_float(performance_tracker.get("peak_equity", 0))
+        max_drawdown_pct = safe_float(performance_tracker.get("max_drawdown_pct", 0))
+        for value in equity_points + ([equity_estimate] if equity_estimate > 0 else []):
+            peak = max(peak, value)
+            if peak > 0:
+                max_drawdown_pct = max(max_drawdown_pct, (peak - value) / peak * 100)
         return {
             "equity_estimate": equity_estimate,
             "unrealized_pnl": unrealized,
@@ -442,12 +502,54 @@ class DashboardService:
             "fees_recent": fees,
             "turnover_recent": turnover,
             "roi_pct": roi,
+            "position_roe_pct": safe_float(position["percentage"]) if position else 0.0,
+            "account_profit_since_tracking": account_profit,
+            "baseline_equity": baseline_equity,
+            "net_external_flows": net_external_flows,
+            "max_drawdown_pct": max_drawdown_pct,
+            "tracking_started_at": baseline_timestamp or None,
             "mark_price": current_price,
         }
 
     def _build_trade_analytics(self, trades: list[dict[str, Any]]) -> dict[str, Any]:
-        entries = [trade for trade in trades if not trade.get("reduce_only")]
-        exits = [trade for trade in trades if trade.get("reduce_only")]
+        # In one-way mode Bitget may report ``buy_single``/``sell_single`` without a
+        # reliable reduceOnly flag. Classify fills from the inventory transition so
+        # opposite-side closes are not mislabeled as entries.
+        entries: list[dict[str, Any]] = []
+        exits: list[dict[str, Any]] = []
+        classify_qty = 0.0
+        classify_direction = 0
+        for trade in trades:
+            side = str(trade.get("side") or "").lower()
+            qty = safe_float(trade.get("amount", 0))
+            if qty <= 0 or side not in {"buy", "sell"}:
+                continue
+            direction = 1 if side == "buy" else -1
+            if bool(trade.get("reduce_only")):
+                exits.append(trade)
+                classify_qty = max(classify_qty - qty, 0.0)
+                if classify_qty <= 1e-12:
+                    classify_direction = 0
+                continue
+            if classify_direction == 0:
+                entries.append(trade)
+                classify_direction = direction
+                classify_qty = qty
+            elif classify_direction == direction:
+                entries.append(trade)
+                classify_qty += qty
+            else:
+                exits.append(trade)
+                close_qty = min(classify_qty, qty)
+                classify_qty -= close_qty
+                remaining = qty - close_qty
+                if classify_qty <= 1e-12:
+                    classify_qty = 0.0
+                    classify_direction = 0
+                if remaining > 1e-12:
+                    entries.append(trade)
+                    classify_direction = direction
+                    classify_qty = remaining
 
         inventory_qty = 0.0
         inventory_avg_price = 0.0
@@ -1048,6 +1150,7 @@ class DashboardService:
 
     def _record_history(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         history = load_json(HISTORY_FILE, [])
+        history = history if isinstance(history, list) else []
         point = {
             "timestamp": snapshot["timestamp"],
             "price": safe_float(snapshot["market"]["indicators"].get("price", 0)),
@@ -1058,8 +1161,30 @@ class DashboardService:
         }
         if not history or history[-1]["timestamp"] != point["timestamp"]:
             history.append(point)
-        history = history[-480:]
+        # Keep a useful chart window while preserving all-time peak/drawdown in a
+        # compact tracker that never loses the tail event when chart points roll off.
+        history = history[-20160:]
         save_json(HISTORY_FILE, history)
+
+        equity = safe_float(point.get("equity_estimate", 0))
+        tracker = load_json(PERFORMANCE_FILE, {})
+        tracker = tracker if isinstance(tracker, dict) else {}
+        if equity > 0:
+            baseline = safe_float(tracker.get("baseline_equity", 0))
+            if baseline <= 0:
+                baseline = equity
+                tracker["baseline_equity"] = baseline
+                tracker["tracking_started_at"] = point["timestamp"]
+            peak = max(safe_float(tracker.get("peak_equity", 0)), equity)
+            drawdown = (peak - equity) / peak * 100 if peak > 0 else 0.0
+            tracker["peak_equity"] = peak
+            tracker["max_drawdown_pct"] = max(
+                safe_float(tracker.get("max_drawdown_pct", 0)),
+                drawdown,
+            )
+            tracker["last_equity"] = equity
+            tracker["last_timestamp"] = point["timestamp"]
+            save_json(PERFORMANCE_FILE, tracker)
         return {"points": history}
 
     def _update_event_log(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:

@@ -7,13 +7,15 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import ccxt
-import pandas as pd
-
-
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+for dependency_dir in (ROOT / ".deps-local", ROOT / ".deps"):
+    if dependency_dir.exists() and str(dependency_dir) not in sys.path:
+        sys.path.insert(0, str(dependency_dir))
+
+import ccxt
+import pandas as pd
 
 from trading.runtime_config import load_runtime_config
 
@@ -245,6 +247,38 @@ class MartinStatusChecker:
                     "pending_layer",
                     self.runtime_state.get("layer", 0),
                 ),
+                "pending_entry_submission_state": self.runtime_state.get(
+                    "pending_entry_submission_state",
+                    "",
+                ),
+                "pending_entry_client_oid": self.runtime_state.get(
+                    "pending_entry_client_oid",
+                    "",
+                ),
+                "pending_entry_order_id": self.runtime_state.get(
+                    "pending_entry_order_id",
+                    "",
+                ),
+                "pending_entry_cancel_requested": bool(
+                    self.runtime_state.get("pending_entry_cancel_requested", False)
+                ),
+                "partial_tp_pending_flag": self.runtime_state.get(
+                    "partial_tp_pending_flag",
+                    "",
+                ),
+                "cycle_id": self.runtime_state.get("cycle_id", ""),
+                "exit_state": self.runtime_state.get("exit_state", "IDLE"),
+                "exit_reason": self.runtime_state.get("exit_reason", ""),
+                "exit_client_oid": self.runtime_state.get("exit_client_oid", ""),
+                "exit_order_id": self.runtime_state.get("exit_order_id", ""),
+                "protective_stop_submission_state": self.runtime_state.get(
+                    "protective_stop_submission_state",
+                    "IDLE",
+                ),
+                "protective_stop_client_oid": self.runtime_state.get(
+                    "protective_stop_client_oid",
+                    "",
+                ),
                 "position_side": self.runtime_state.get("position_side"),
                 "best_profit_pct": safe_float(self.runtime_state.get("best_profit_pct", 0)),
                 "protective_stop_active": bool(
@@ -377,6 +411,27 @@ def format_text_report(status, events=None):
         )
     else:
         lines.append("📍 持仓: 无")
+
+    if runtime.get("pending_entry_submission_state") not in {"", "IDLE"}:
+        lines.append(
+            "⏳ 开仓/加仓待确认: "
+            f"{runtime['pending_entry_submission_state']} | "
+            f"clientOid={runtime.get('pending_entry_client_oid') or '--'}"
+        )
+    if runtime.get("partial_tp_pending_flag"):
+        lines.append(f"⏳ 分批止盈待确认: TP{runtime['partial_tp_pending_flag']}")
+    if runtime.get("exit_state") not in {"", "IDLE", "CONFIRMED"}:
+        lines.append(
+            "⏳ 整仓退出待确认: "
+            f"{runtime['exit_state']} | 原因={runtime.get('exit_reason') or '--'} | "
+            f"clientOid={runtime.get('exit_client_oid') or '--'}"
+        )
+    if runtime.get("protective_stop_submission_state") not in {"", "IDLE", "CONFIRMED"}:
+        lines.append(
+            "⏳ 保护止损待确认: "
+            f"{runtime['protective_stop_submission_state']} | "
+            f"clientOid={runtime.get('protective_stop_client_oid') or '--'}"
+        )
 
     if events:
         lines.append("🔔 事件:")

@@ -8,7 +8,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 
@@ -64,7 +63,9 @@ def action_to_args(action: str) -> list[str]:
 
 
 def build_log_file() -> Path:
-    return LOG_DIR / f"martin-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    # A stable filename lets RotatingFileHandler enforce a total retention bound
+    # across process restarts. Timestamped files bypassed rotation on every launch.
+    return LOG_DIR / "martin.log"
 
 
 def main():

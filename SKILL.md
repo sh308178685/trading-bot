@@ -21,6 +21,12 @@ This project now keeps only the Bitget martingale strategy.
 
 ## Quick start
 
+Install isolated runtime dependencies once (recommended):
+
+```bash
+python -m pip install --upgrade --target .deps-local -r requirements.txt
+```
+
 Run the bot:
 
 ```bash
@@ -83,3 +89,5 @@ http://YOUR_PC_IP:8765
 - `sandbox: true` means Bitget demo mode.
 - `sandbox: false` means live trading.
 - Start with demo mode before touching live capital.
+- Keep Bitget credentials in environment variables where possible; `config/config.json` is ignored and must never be committed.
+- The repository's pre-push hook rejects any ref whose history contains `config/config.json`. Rotate exposed keys and rewrite that local history before publishing it.

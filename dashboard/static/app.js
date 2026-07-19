@@ -90,6 +90,16 @@ function translatePhase(value) {
   return value || "--";
 }
 
+function translateVolatilityRegime(value) {
+  if (value === "LOW") return "低波动";
+  if (value === "NORMAL") return "常态波动";
+  if (value === "HIGH") return "高波动";
+  if (value === "EXTREME") return "极端波动";
+  if (value === "WARMING_UP") return "样本预热中";
+  if (value === "DISABLED") return "已关闭";
+  return value || "--";
+}
+
 function translateOrderType(item) {
   if (item.reduce_only) return "减仓";
   if (item.type === "limit") return "限价";
@@ -138,9 +148,25 @@ function renderMetrics(snapshot) {
     {
       label: "浮动盈亏",
       value: fmtMoney(snapshot.performance.unrealized_pnl),
-      detail: `收益率 ${fmtPct(snapshot.performance.roi_pct)}`,
+      detail: `当前持仓 ROE ${fmtPct(snapshot.performance.position_roe_pct)}`,
       emphasis: signClass(snapshot.performance.unrealized_pnl),
       deltaClass: signClass(snapshot.performance.unrealized_pnl),
+    },
+    {
+      label: "跟踪期账户盈亏",
+      value: fmtMoney(snapshot.performance.account_profit_since_tracking),
+      detail: `账户收益率 ${fmtPct(snapshot.performance.roi_pct)}`,
+      emphasis: signClass(snapshot.performance.account_profit_since_tracking),
+      deltaClass: signClass(snapshot.performance.account_profit_since_tracking),
+    },
+    {
+      label: "跟踪期最大回撤",
+      value: fmtPct(snapshot.performance.max_drawdown_pct),
+      detail: snapshot.performance.tracking_started_at
+        ? `起始 ${snapshot.performance.tracking_started_at}`
+        : "等待建立权益基线",
+      emphasis: Number(snapshot.performance.max_drawdown_pct || 0) > 0 ? "negative" : "",
+      deltaClass: Number(snapshot.performance.max_drawdown_pct || 0) > 0 ? "negative" : "",
     },
     {
       label: "当前层级",
@@ -373,7 +399,18 @@ function renderNextAction(snapshot) {
 
 function renderIndicators(snapshot) {
   const indicators = snapshot.market.indicators;
+  const strategy = snapshot.strategy || {};
   const target = document.getElementById("indicator-list");
+  const percentileText = indicators.volatility_profile_ready
+    ? `${fmtPct(indicators.atr_percentile_pct, 1)}（${indicators.volatility_sample_count || 0}/${indicators.volatility_lookback || 0}）`
+    : `预热中（${indicators.volatility_sample_count || 0}/${indicators.volatility_lookback || 0}）`;
+  const liquidityStatus = !indicators.liquidity_gate_enabled
+    ? "已关闭"
+    : indicators.liquidity_entry_allowed
+      ? indicators.liquidity_status === "error" ? "数据异常，按配置放行" : "允许新首仓"
+      : "阻止新首仓";
+  const liquidityReason = (indicators.liquidity_reasons || []).join("；") || "--";
+  const depthRange = fmtPct(indicators.liquidity_depth_range_pct, 2);
   const rows = [
     ["最新价格", fmtMoney(indicators.price)],
     ["快速 EMA", fmtMoney(indicators.ema_fast)],
@@ -381,6 +418,16 @@ function renderIndicators(snapshot) {
     ["RSI", fmtNumber(indicators.rsi)],
     ["ADX", fmtNumber(indicators.adx)],
     ["ATR", fmtMoney(indicators.atr)],
+    ["ATR / 价格", fmtPct(indicators.atr_pct, 3)],
+    ["ATR滚动分位", percentileText],
+    ["当前波动档位", translateVolatilityRegime(indicators.volatility_regime)],
+    ["加仓ATR间距系数", `x${fmtNumber(indicators.volatility_spacing_multiplier || 1, 2)}`],
+    ["流动性准入", liquidityStatus],
+    ["买卖点差 当前 / 上限", `${fmtPct(indicators.liquidity_spread_pct, 3)} / ${fmtPct((strategy.liquidity_max_spread_pct || 0) * 100, 3)}`],
+    ["24h成交额 当前 / 下限", `${fmtMoney(indicators.liquidity_quote_volume_24h)} / ${fmtMoney(strategy.liquidity_min_quote_volume_24h)}`],
+    [`${depthRange} 买盘 / 卖盘 / 单边下限`, `${fmtMoney(indicators.liquidity_bid_depth_notional)} / ${fmtMoney(indicators.liquidity_ask_depth_notional)} / ${fmtMoney(strategy.liquidity_min_depth_notional)}`],
+    ["流动性闸门原因", liquidityReason],
+    ["第一阶段当前/备用止盈", fmtPct(indicators.phase1_quick_take_profit_pct)],
     ["止盈激活值", fmtPct(indicators.dynamic_tp_activate_pct)],
     ["回撤比例", fmtPct(indicators.dynamic_tp_trail_ratio)],
     ["动态分批止盈 1", fmtPct(indicators.dynamic_partial_tp1_pct)],
@@ -405,11 +452,32 @@ function renderPhaseOverview(snapshot) {
     return;
   }
 
+  const frozenPhase1Target = Number(snapshot.runtime.phase1_quick_tp_target_pct || 0);
   const rows = [
     ["当前阶段", translatePhase(snapshot.runtime.phase)],
     ["切换亏损阈值", fmtPct((snapshot.strategy.phase_switch_loss_pct || 0) * 100)],
     ["切换层数阈值", `第 ${snapshot.strategy.phase_switch_layer || "--"} 层`],
     ["Phase1 层数", `${snapshot.strategy.phase1_max_layers || 0} 层`],
+    [
+      "Phase1 当前冻结目标",
+      snapshot.strategy.phase1_quick_take_profit_enabled
+        ? frozenPhase1Target > 0
+          ? fmtPct(frozenPhase1Target * 100)
+          : "待成交后计算"
+        : "关闭",
+    ],
+    [
+      "Phase1 自动范围",
+      snapshot.strategy.phase1_quick_take_profit_dynamic_enabled
+        ? `${fmtPct((snapshot.strategy.phase1_quick_take_profit_min_pct || 0) * 100)} ～ ${fmtPct((snapshot.strategy.phase1_quick_take_profit_max_pct || 0) * 100)}`
+        : `固定 ${fmtPct((snapshot.strategy.phase1_quick_take_profit_effective_pct || 0) * 100)}`,
+    ],
+    [
+      "本轮目标计算依据",
+      frozenPhase1Target > 0
+        ? `ADX ${fmtNumber(snapshot.runtime.phase1_quick_tp_target_adx)} / ATR波动 ${fmtPct((snapshot.runtime.phase1_quick_tp_target_volatility_pct || 0) * 100, 3)} / ATR分位 ${fmtPct((snapshot.runtime.phase1_quick_tp_target_atr_percentile || 0) * 100, 1)} / ${translateVolatilityRegime(snapshot.runtime.phase1_quick_tp_target_volatility_regime)}`
+        : "--",
+    ],
     ["Phase2 额外层数", `${snapshot.strategy.phase2_extra_layers || 0} 层`],
     ["Phase1 倍率", (snapshot.strategy.phase1_layer_multipliers || []).join(" / ") || "--"],
     ["Phase2 倍率", (snapshot.strategy.phase2_layer_multipliers || []).join(" / ") || "--"],
@@ -482,7 +550,7 @@ function renderPosition(snapshot) {
       <div class="definition-row"><span>标记价</span><strong>${fmtMoney(position.mark_price)}</strong></div>
       <div class="definition-row"><span>合约数量</span><strong>${qty.format(position.contracts)}</strong></div>
       <div class="definition-row"><span>浮动盈亏</span><strong class="${signClass(position.unrealized_pnl)}">${fmtMoney(position.unrealized_pnl)}</strong></div>
-      <div class="definition-row"><span>收益率</span><strong class="${signClass(position.percentage)}">${fmtPct(position.percentage)}</strong></div>
+      <div class="definition-row"><span>当前持仓 ROE</span><strong class="${signClass(position.percentage)}">${fmtPct(position.percentage)}</strong></div>
       <div class="definition-row"><span>强平价</span><strong>${position.liquidation_price ? fmtMoney(position.liquidation_price) : "--"}</strong></div>
       <div class="definition-row"><span>距强平</span><strong>${fmtPct(position.distance_to_liquidation_pct)}</strong></div>
     </div>
