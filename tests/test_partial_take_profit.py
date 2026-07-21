@@ -17,6 +17,7 @@ MARTIN_BOT = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(MARTIN_BOT)
 MartinBot = MARTIN_BOT.MartinBot
+FatalTradingConfigurationError = MARTIN_BOT.FatalTradingConfigurationError
 
 
 def floor_to_step(value: float, step: float) -> float:
@@ -296,6 +297,41 @@ class PartialCloseOrderTests(unittest.TestCase):
         self.assertEqual(result, bot._PARTIAL_PENDING)
         self.assertEqual(bot.state.partial_tp_pending_flag, "")
 
+    def test_weex_hedge_mode_partial_close_uses_explicit_position_side_adapter(self):
+        bot = execution_bot()
+        create_calls = []
+
+        class FakeWeexExchange:
+            supports_single_direction_hedge_mode = True
+
+            @staticmethod
+            def create_order(*args, **kwargs):
+                create_calls.append((args, kwargs))
+                return {"id": "weex-close-1"}
+
+        bot.exchange = FakeWeexExchange()
+        bot._reconcile_pending_partial_tp = lambda _reason: bot._PARTIAL_COMPLETED
+        position = {
+            "contracts": 0.0003,
+            "side": "long",
+            "markPrice": 63_000.0,
+            "info": {"posMode": "hedge_mode"},
+        }
+
+        result = bot._partial_close(
+            position,
+            0.30,
+            "分批止盈1",
+            "partial_tp_1_done",
+        )
+
+        self.assertEqual(result, bot._PARTIAL_COMPLETED)
+        self.assertEqual(len(create_calls), 1)
+        args, _kwargs = create_calls[0]
+        self.assertEqual(args[2], "sell")
+        self.assertTrue(args[5]["reduceOnly"])
+
+
     def test_definite_exchange_rejection_clears_pending_and_is_cooled_down(self):
         bot = execution_bot()
         create_calls = []
@@ -430,6 +466,59 @@ class PartialCloseOrderTests(unittest.TestCase):
             self.assertEqual(bot.state.partial_tp_pending_flag, "partial_tp_1_done")
 
         self.assertEqual(len(create_calls), 1)
+
+
+class HedgeModeSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _bot():
+        bot = MartinBot.__new__(MartinBot)
+        bot.symbol = "BTC/USDT:USDT"
+        bot._account_position_mode = "hedge_mode"
+        bot._clear_state_sync_required = lambda: None
+        bot._mark_state_sync_required = lambda *_args, **_kwargs: None
+        return bot
+
+    def test_weex_hedge_mode_is_supported_but_generic_hedge_mode_is_not(self):
+        bot = self._bot()
+        bot.exchange = SimpleNamespace(supports_single_direction_hedge_mode=True)
+        self.assertTrue(bot._position_mode_is_supported("hedge_mode"))
+
+        bot.exchange = SimpleNamespace()
+        self.assertFalse(bot._position_mode_is_supported("hedge_mode"))
+        self.assertTrue(bot._position_mode_is_supported("one_way_mode"))
+
+    def test_two_active_positions_fail_closed(self):
+        bot = self._bot()
+        bot.exchange = SimpleNamespace(
+            name="WEEX",
+            supports_single_direction_hedge_mode=True,
+            fetch_positions=lambda *_args, **_kwargs: [
+                {"contracts": 0.01, "side": "long", "info": {"posMode": "hedge_mode"}},
+                {"contracts": 0.02, "side": "short", "info": {"posMode": "hedge_mode"}},
+            ],
+        )
+
+        with self.assertRaises(FatalTradingConfigurationError):
+            bot._fetch_active_position(force_rest=True)
+
+    def test_opposite_hedge_entry_orders_fail_closed(self):
+        bot = self._bot()
+        bot.exchange = SimpleNamespace(supports_single_direction_hedge_mode=True)
+        orders = [
+            {"side": "buy", "positionSide": "long", "reduceOnly": False},
+            {"side": "sell", "positionSide": "short", "reduceOnly": False},
+        ]
+
+        with self.assertRaises(FatalTradingConfigurationError):
+            bot._assert_single_direction_entry_orders(orders)
+
+    def test_opposite_entry_order_to_live_position_fails_closed(self):
+        bot = self._bot()
+        bot.exchange = SimpleNamespace(supports_single_direction_hedge_mode=True)
+        orders = [{"side": "sell", "positionSide": "short", "reduceOnly": False}]
+
+        with self.assertRaises(FatalTradingConfigurationError):
+            bot._assert_single_direction_entry_orders(orders, {"side": "long"})
 
 
 class FullCloseConfirmationTests(unittest.TestCase):

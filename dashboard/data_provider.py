@@ -116,7 +116,11 @@ class DashboardBotProfile:
             config.get("mean_reversion_entry_atr_ratio", 0.35),
             0.35,
         )
-        self.exchange_name = str(config.get("exchange", "bitget")).strip().capitalize() or "Bitget"
+        exchange_id = str(config.get("exchange", "bitget")).strip().lower()
+        self.exchange_name = {"bitget": "Bitget", "weex": "WEEX"}.get(
+            exchange_id,
+            exchange_id or "Bitget",
+        )
         self.mode = "sandbox" if config.get("sandbox", True) else "live"
         self.transport = "rest"
         self.price_precision: Any = None
@@ -164,7 +168,7 @@ class DashboardBotProfile:
 
     def strategy_payload(self) -> dict[str, Any]:
         payload = {
-            "name": "Bitget 马丁策略机器人",
+            "name": f"{self.exchange_name} 马丁策略机器人",
             "exchange": self.exchange_name,
             "mode": self.mode,
             "symbol": self.symbol,

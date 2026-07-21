@@ -1,1 +1,1 @@
-"""Web dashboard package for the Bitget martingale bot."""
+"""Web dashboard package for the multi-exchange martingale bot."""

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,8 +28,8 @@ def load_config() -> dict:
 
 
 def choose_python() -> list[str]:
-    if sys.platform.startswith("win") and shutil.which("py"):
-        return ["py", "-3"]
+    # Keep the bot in the same interpreter/environment as this launcher.
+    # Selecting the Windows `py` launcher here silently escaped `.venv`.
     return [sys.executable]
 
 
@@ -77,7 +76,7 @@ def main():
     timeframe = config.get("timeframe", "5m")
     exchange = config.get("exchange", "bitget")
     sandbox = bool(config.get("sandbox", True))
-    ws_enabled = bool(config.get("wsEnabled", True))
+    ws_enabled = str(exchange).strip().lower() in {"bitget", "weex"} and bool(config.get("wsEnabled", True))
 
     print("=" * 68)
     print("Martin Bot Launcher")
@@ -105,7 +104,10 @@ def main():
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env["MARTIN_LOG_FILE"] = str(log_file)
-    deps_paths = [path for path in (DEPS_DIR, LEGACY_DEPS_DIR) if path.exists()]
+    in_virtualenv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    deps_paths = [] if in_virtualenv else [
+        path for path in (DEPS_DIR, LEGACY_DEPS_DIR) if path.exists()
+    ]
     if deps_paths:
         existing_pythonpath = env.get("PYTHONPATH", "")
         joined = os.pathsep.join(str(path) for path in deps_paths)

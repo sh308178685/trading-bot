@@ -136,6 +136,79 @@ class WebSocketReliabilityTests(unittest.TestCase):
         self.assertEqual(reason, "")
 
 
+class IndicatorPandasCompatibilityTests(unittest.TestCase):
+    def test_flat_string_candles_keep_rolling_indicators_numeric(self):
+        bot = MartinBot.__new__(MartinBot)
+        bot.fast_ema_period = 20
+        bot.slow_ema_period = 50
+        bot.rsi_period = 14
+        bot.atr_period = 14
+        bot.adx_period = 14
+        frame = MARTIN_BOT.pd.DataFrame(
+            {
+                "timestamp": list(range(80)),
+                "open": ["65000"] * 80,
+                "high": ["65000"] * 80,
+                "low": ["65000"] * 80,
+                "close": ["65000"] * 80,
+                "volume": ["1.25"] * 80,
+            }
+        )
+
+        result = bot.add_indicators(frame)
+
+        for column in ("open", "high", "low", "close", "volume", "rsi", "atr", "adx"):
+            self.assertTrue(
+                MARTIN_BOT.pd.api.types.is_numeric_dtype(result[column].dtype),
+                f"{column} unexpectedly has dtype {result[column].dtype}",
+            )
+
+
+class MarketDataQualityTests(unittest.TestCase):
+    def _bot(self):
+        bot = MartinBot.__new__(MartinBot)
+        bot.symbol = "BTC/USDT:USDT"
+        bot.timeframe = "5m"
+        bot.market_data_max_candle_range_pct = 0.20
+        bot.market_data_max_close_jump_pct = 0.20
+        bot._market_data_errors = {}
+        bot._market_data_error_log_at = {}
+        return bot
+
+    def test_zero_price_candle_fails_closed_before_indicator_calculation(self):
+        bot = self._bot()
+        candles = [
+            [index + 1, 65_000.0, 65_100.0, 64_900.0, 65_000.0, 1.0]
+            for index in range(40)
+        ]
+        candles[-2] = [39, 65_000.0, 65_100.0, 0.0, 65_000.0, 1.0]
+        bot.exchange = SimpleNamespace(fetch_ohlcv=lambda *_args, **_kwargs: candles)
+
+        self.assertIsNone(bot.fetch_ohlcv_df(limit=40))
+        self.assertIn("零价", bot._market_data_errors["5m"])
+
+    def test_large_positive_price_spike_also_fails_closed(self):
+        bot = self._bot()
+        candles = [
+            [index + 1, 65_000.0, 65_100.0, 64_900.0, 65_000.0, 1.0]
+            for index in range(40)
+        ]
+        candles[-1] = [40, 90_000.0, 90_100.0, 89_900.0, 90_000.0, 1.0]
+        bot.exchange = SimpleNamespace(fetch_ohlcv=lambda *_args, **_kwargs: candles)
+
+        self.assertIsNone(bot.fetch_ohlcv_df(limit=40))
+        self.assertIn("跳变", bot._market_data_errors["5m"])
+
+    def test_support_resistance_dedupe_drops_nonpositive_and_nonfinite_prices(self):
+        bot = self._bot()
+
+        levels = bot._dedupe_price_levels(
+            [0.0, -1.0, float("nan"), float("inf"), 65_000.0, 65_150.0]
+        )
+
+        self.assertEqual(levels, [65_000.0, 65_150.0])
+
+
 class TrailingProfitSafetyTests(unittest.TestCase):
     def _bot(self):
         bot = MartinBot.__new__(MartinBot)
@@ -635,6 +708,9 @@ class SymbolAdaptiveVolatilityTests(unittest.TestCase):
             "HIGH": 1.2,
             "EXTREME": 1.5,
         }
+        bot.market_data_max_atr_pct = 0.05
+        bot.market_data_atr_spike_multiplier = 8.0
+        bot.market_data_atr_spike_floor_pct = 0.02
         return bot
 
     def test_percentile_profile_uses_each_symbols_own_history(self):
@@ -666,6 +742,67 @@ class SymbolAdaptiveVolatilityTests(unittest.TestCase):
 
         self.assertEqual(profile["regime"], "LOW")
         self.assertAlmostEqual(adaptive_gap, normal_gap * 0.9)
+
+    def test_absurd_atr_ratio_trips_market_data_circuit_breaker(self):
+        bot = self._bot()
+        frame = self._Frame([100.0] * 101, [0.1] * 100 + [14.0])
+
+        profile = bot._volatility_profile_from_frame(frame)
+
+        self.assertEqual(profile["status"], "invalid")
+        self.assertEqual(profile["atr"], 0.0)
+        self.assertIn("安全上限", profile["reason"])
+
+
+class PendingEntryPriceSafetyTests(unittest.TestCase):
+    def _bot(self):
+        bot = MartinBot.__new__(MartinBot)
+        bot.state = RuntimeState(
+            symbol="BTC/USDT:USDT",
+            bot_state="IN_STRATEGY",
+            position_side="short",
+            entry_price=65_181.7,
+            last_fill_price=65_181.7,
+            pending_entry_price=79_278.5,
+        )
+        bot.pending_entry_max_deviation_pct = 0.10
+        bot.entry_amount_refresh_tolerance = 0.01
+        bot.structure_refresh_threshold = 0.008
+        bot.leverage = 3
+        bot._price_to_precision = lambda value: round(float(value), 1)
+        bot._normalize_amount = lambda value: round(float(value), 4)
+        return bot
+
+    def test_old_79k_order_is_not_accepted_as_its_own_sanity_anchor(self):
+        bot = self._bot()
+        orders = [{"side": "sell", "price": 79_278.5, "amount": 0.0003}]
+
+        self.assertEqual(
+            bot._pending_entry_price_from_orders(orders, reference_price=65_200.0),
+            0.0,
+        )
+
+    def test_materially_better_recalculated_price_is_not_replaced_by_old_price(self):
+        bot = self._bot()
+        orders = [{"side": "sell", "price": 79_278.5, "amount": 0.0003}]
+        plan = {
+            "order_side": "sell",
+            "amount": 0.0004,
+            "entry_price": 65_320.0,
+            "execute_price": 65_320.0,
+            "side": "short",
+            "avg_price": 65_181.7,
+            "layer_margin": 8.83,
+        }
+
+        result = bot._preserve_existing_entry_price_for_amount_rebuild(
+            plan,
+            orders,
+            current_price=65_200.0,
+        )
+
+        self.assertEqual(result["execute_price"], 65_320.0)
+        self.assertNotIn("sticky_existing_price_for_rebuild", result)
 
 
 class LiquidityEntryGateTests(unittest.TestCase):

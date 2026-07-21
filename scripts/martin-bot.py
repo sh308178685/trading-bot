@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-BITGET 马丁策略机器人（最终版）
+多交易所马丁策略机器人
 --------------------------------
 策略逻辑：
 1. 趋势判断：
@@ -62,7 +62,11 @@ if str(ROOT) not in sys.path:
 DEPS_DIR = ROOT / '.deps-local'
 LEGACY_DEPS_DIR = ROOT / '.deps'
 USER_SITE = Path(site.getusersitepackages())
-for extra_path in (DEPS_DIR, LEGACY_DEPS_DIR, USER_SITE):
+# A virtual environment must remain isolated. Injecting the per-user site here
+# can shadow packages installed in `.venv` (for example websockets 13 over 16).
+IN_VIRTUALENV = sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+EXTRA_DEPENDENCY_PATHS = () if IN_VIRTUALENV else (DEPS_DIR, LEGACY_DEPS_DIR, USER_SITE)
+for extra_path in EXTRA_DEPENDENCY_PATHS:
     if extra_path.exists() and str(extra_path) not in sys.path:
         sys.path.insert(0, str(extra_path))
 
@@ -463,6 +467,28 @@ class MartinBot:
             'HIGH': max(self._safe_float(self.config.get('volatility_spacing_high_multiplier', 1.20), 1.20), 0.1),
             'EXTREME': max(self._safe_float(self.config.get('volatility_spacing_extreme_multiplier', 1.50), 1.50), 0.1),
         }
+        # Market-data circuit breakers. Invalid candles must fail closed before
+        # they can distort EMA/ATR and create live entry or add-layer orders.
+        self.market_data_max_candle_range_pct = min(
+            max(self._safe_float(self.config.get('market_data_max_candle_range_pct', 0.20), 0.20), 0.01),
+            1.0,
+        )
+        self.market_data_max_close_jump_pct = min(
+            max(self._safe_float(self.config.get('market_data_max_close_jump_pct', 0.20), 0.20), 0.01),
+            1.0,
+        )
+        self.market_data_max_atr_pct = min(
+            max(self._safe_float(self.config.get('market_data_max_atr_pct', 0.05), 0.05), 0.001),
+            1.0,
+        )
+        self.market_data_atr_spike_multiplier = max(
+            self._safe_float(self.config.get('market_data_atr_spike_multiplier', 8.0), 8.0),
+            2.0,
+        )
+        self.market_data_atr_spike_floor_pct = min(
+            max(self._safe_float(self.config.get('market_data_atr_spike_floor_pct', 0.02), 0.02), 0.001),
+            self.market_data_max_atr_pct,
+        )
         self.phase2_extra_layers = max(int(self.config.get('phase2_extra_layers', self.config.get('phase2_max_layers', 6))), 1)
         self.phase2_layer_multipliers = list(self.config.get('phase2_layer_multipliers', [1.7, 2.1, 2.6, 3.2, 3.9, 4.8]))
         self.phase2_layer_min_gap_pct = self._safe_float(self.config.get('phase2_layer_min_gap_pct', 0.010), 0.010)
@@ -571,6 +597,10 @@ class MartinBot:
         self.entry_amount_refresh_tolerance = max(
             self._safe_float(self.config.get('entry_amount_refresh_tolerance', 0.01), 0.01),
             0.0,
+        )
+        self.pending_entry_max_deviation_pct = min(
+            max(self._safe_float(self.config.get('pending_entry_max_deviation_pct', 0.10), 0.10), 0.01),
+            0.50,
         )
         self.entry_submission_confirm_timeout = max(
             self._safe_float(self.config.get('entry_submission_confirm_timeout', 3.0), 3.0),
@@ -697,6 +727,8 @@ class MartinBot:
         self._live_snapshot_cache: Dict[str, Any] = {}
         self._volatility_profile_cache: Dict[str, Any] = {}
         self._volatility_profile_at = 0.0
+        self._market_data_errors: Dict[str, str] = {}
+        self._market_data_error_log_at: Dict[str, float] = {}
         self._liquidity_snapshot_cache: Dict[str, Any] = {}
         self._liquidity_snapshot_at = 0.0
         self._last_liquidity_gate_reason = ""
@@ -720,6 +752,7 @@ class MartinBot:
 
         self.exchange = self._init_exchange()
         self.markets = None
+        self._account_position_mode = ""
 
         self.state = RuntimeState(symbol=self.symbol)
         self._load_runtime_state()
@@ -832,18 +865,97 @@ class MartinBot:
         if self.markets is None:
             self.markets = self.exchange.load_markets()
 
+    def _position_mode_is_supported(self, position_mode: str) -> bool:
+        mode = str(position_mode or '').lower()
+        if mode == 'one_way_mode':
+            return True
+        return bool(
+            mode == 'hedge_mode'
+            and getattr(self.exchange, 'supports_single_direction_hedge_mode', False)
+        )
+
+    def _hedge_mode_is_active(self) -> bool:
+        return bool(
+            str(getattr(self, '_account_position_mode', '') or '').lower() == 'hedge_mode'
+            and getattr(self.exchange, 'supports_single_direction_hedge_mode', False)
+        )
+
+    @staticmethod
+    def _entry_order_position_side(order: Dict[str, Any]) -> str:
+        if bool(order.get('reduceOnly', False)):
+            return ''
+        info = order.get('info') or {}
+        position_side = str(
+            order.get('positionSide')
+            or info.get('positionSide')
+            or info.get('holdSide')
+            or ''
+        ).lower()
+        if position_side in {'long', 'short'}:
+            return position_side
+        side = str(order.get('side') or info.get('side') or info.get('orderSide') or '').lower()
+        if side == 'buy':
+            return 'long'
+        if side == 'sell':
+            return 'short'
+        return ''
+
+    def _assert_single_direction_entry_orders(
+        self,
+        open_orders: List[Dict[str, Any]],
+        position: Optional[Dict[str, Any]] = None,
+    ) -> set[str]:
+        if not self._hedge_mode_is_active():
+            return set()
+        entry_sides = {
+            side
+            for order in open_orders
+            if (side := self._entry_order_position_side(order))
+        }
+        position_side = str((position or {}).get('side') or '').lower()
+        if len(entry_sides) > 1:
+            raise FatalTradingConfigurationError(
+                f"WEEX {self.symbol} 同时存在多、空两个方向的开仓/加仓挂单，"
+                "机器人拒绝选择其中一侧；请先人工核对并只保留一个方向。"
+            )
+        if position_side in {'long', 'short'} and entry_sides and entry_sides != {position_side}:
+            raise FatalTradingConfigurationError(
+                f"WEEX {self.symbol} 当前持仓为 {position_side}，但存在 {next(iter(entry_sides))} "
+                "方向的非减仓挂单；为防止形成双向仓位，机器人已停止。"
+            )
+        return entry_sides
+
+    def _validate_hedge_mode_safety(self) -> None:
+        if not self._hedge_mode_is_active():
+            return
+        ok, position = self._fetch_active_position(force_rest=True)
+        if not ok:
+            raise RuntimeError("无法权威确认 WEEX 持仓，暂不启动交易")
+        open_orders = self.fetch_open_orders(force_rest=True)
+        if open_orders is None:
+            raise RuntimeError("无法权威确认 WEEX 当前挂单，暂不启动交易")
+        self._assert_single_direction_entry_orders(open_orders, position)
+
     def _bootstrap_exchange(self):
         while True:
             try:
-                self.setup_account()
+                # Validate the configured market and API-trading eligibility
+                # before changing any account setting such as leverage.
                 self._ensure_markets()
                 position_mode = self.exchange.fetch_position_mode(self.symbol)
-                if position_mode != 'one_way_mode':
+                self._account_position_mode = str(position_mode or '').lower()
+                if not self._position_mode_is_supported(position_mode):
                     raise FatalTradingConfigurationError(
-                        f"当前 Bitget 持仓模式为 {position_mode!r}，本机器人只支持 one_way_mode。"
+                        f"当前 {getattr(self.exchange, 'name', '交易所')} 持仓模式为 {position_mode!r}，"
+                        "该适配器不支持在此持仓模式下安全交易。"
                         "请先在交易所核对并清空相关持仓/挂单，再手动切换；机器人不会自动改账户模式。"
                     )
-                print("✅ 持仓模式: one_way_mode")
+                self._validate_hedge_mode_safety()
+                self.setup_account()
+                if self._hedge_mode_is_active():
+                    print("✅ 持仓模式: hedge_mode（WEEX 单方向策略保护已启用）")
+                else:
+                    print("✅ 持仓模式: one_way_mode")
                 self.sync_state_with_exchange()
                 return
             except KeyboardInterrupt:
@@ -1866,6 +1978,40 @@ class MartinBot:
         current_pct, current_atr, current_price = ratios[-1]
         history = [value[0] for value in ratios[:-1]]
         sample_count = len(history)
+        max_atr_pct = max(
+            self._safe_float(getattr(self, 'market_data_max_atr_pct', 0.05), 0.05),
+            0.001,
+        )
+        if current_pct > max_atr_pct:
+            return self._empty_volatility_profile(
+                'invalid',
+                f'ATR/价格 {current_pct*100:.2f}% 超过安全上限 {max_atr_pct*100:.2f}%',
+            )
+        if history:
+            ordered_history = sorted(history)
+            middle = len(ordered_history) // 2
+            if len(ordered_history) % 2:
+                baseline_pct = ordered_history[middle]
+            else:
+                baseline_pct = (ordered_history[middle - 1] + ordered_history[middle]) / 2.0
+            spike_floor = max(
+                self._safe_float(getattr(self, 'market_data_atr_spike_floor_pct', 0.02), 0.02),
+                0.001,
+            )
+            spike_multiplier = max(
+                self._safe_float(getattr(self, 'market_data_atr_spike_multiplier', 8.0), 8.0),
+                2.0,
+            )
+            if (
+                current_pct >= spike_floor
+                and baseline_pct > 0
+                and current_pct > baseline_pct * spike_multiplier
+            ):
+                return self._empty_volatility_profile(
+                    'invalid',
+                    f'ATR/价格 {current_pct*100:.2f}% 是历史中位数的 '
+                    f'{current_pct/baseline_pct:.1f} 倍',
+                )
         minimum_samples = min(
             max(int(getattr(self, 'volatility_percentile_min_samples', 80)), 20),
             max(lookback - 1, 20),
@@ -1998,7 +2144,11 @@ class MartinBot:
             return "BEARISH_BUT_STRETCHED", "WAIT"
         return "NEUTRAL", "WAIT"
 
-    def _pending_entry_price_from_orders(self, orders: Optional[List[Dict[str, Any]]]) -> float:
+    def _pending_entry_price_from_orders(
+        self,
+        orders: Optional[List[Dict[str, Any]]],
+        reference_price: Optional[float] = None,
+    ) -> float:
         if not orders:
             return 0.0
         non_reduce_orders = [order for order in orders if not order.get('reduceOnly', False)]
@@ -2006,14 +2156,18 @@ class MartinBot:
             return 0.0
         order = non_reduce_orders[0]
         price = self._safe_float(order.get('price', 0))
-        return price if self._is_sane_pending_entry_price(price) else 0.0
+        return price if self._is_sane_pending_entry_price(price, reference_price=reference_price) else 0.0
 
-    def _is_sane_pending_entry_price(self, price: float) -> bool:
+    def _is_sane_pending_entry_price(
+        self,
+        price: float,
+        reference_price: Optional[float] = None,
+    ) -> bool:
         price = self._safe_float(price, 0.0)
         if price <= 0:
             return False
         references = [
-            self._safe_float(self.state.pending_entry_price, 0.0),
+            self._safe_float(reference_price, 0.0),
             self._safe_float(self.state.last_fill_price, 0.0),
             self._safe_float(self.state.entry_price, 0.0),
         ]
@@ -2024,7 +2178,14 @@ class MartinBot:
         if anchor <= 0:
             return True
         ratio = price / anchor
-        return 0.7 <= ratio <= 1.3
+        max_deviation = min(
+            max(
+                self._safe_float(getattr(self, 'pending_entry_max_deviation_pct', 0.10), 0.10),
+                0.01,
+            ),
+            0.50,
+        )
+        return (1.0 - max_deviation) <= ratio <= (1.0 + max_deviation)
 
     def _layer_anchor_price(
         self,
@@ -2168,6 +2329,16 @@ class MartinBot:
         avg_price = self._safe_float(position.get('entryPrice', current_price)) if position else current_price
         side = self.state.position_side
         volatility_profile = self._get_volatility_profile()
+        profile_status = str(volatility_profile.get('status') or '').lower()
+        if (
+            bool(getattr(self, 'volatility_percentile_enabled', True))
+            and profile_status in {'invalid', 'unavailable', 'stale'}
+        ):
+            print(
+                f"❌ 市场数据状态为 {profile_status}: "
+                f"{volatility_profile.get('reason') or '原因未知'}；跳过第{layer_num}层加仓"
+            )
+            return None
         volatility_multiplier = self._safe_float(
             volatility_profile.get('spacing_multiplier'),
             1.0,
@@ -2183,6 +2354,10 @@ class MartinBot:
             phase=phase,
             volatility_profile=volatility_profile,
         )
+        primary_data_error = (getattr(self, '_market_data_errors', {}) or {}).get(str(self.timeframe), '')
+        if primary_data_error:
+            print(f"❌ 主周期K线异常: {primary_data_error}；跳过第{layer_num}层加仓")
+            return None
         if structure_price is not None:
             entry_price = structure_price
             source = "STRUCTURE"
@@ -2220,6 +2395,28 @@ class MartinBot:
                 phase=phase,
             )
         entry_price = self._price_to_precision(entry_price)
+        price_anchor = (
+            max(current_price, avg_price)
+            if side == 'short'
+            else min(current_price, avg_price)
+        )
+        max_price_deviation = min(
+            max(
+                self._safe_float(getattr(self, 'pending_entry_max_deviation_pct', 0.10), 0.10),
+                0.01,
+            ),
+            0.50,
+        )
+        if (
+            price_anchor <= 0
+            or entry_price <= 0
+            or abs(entry_price / price_anchor - 1.0) > max_price_deviation
+        ):
+            print(
+                f"❌ 第{layer_num}层候选价 {entry_price:.2f} 偏离参考价 {price_anchor:.2f} "
+                f"超过 {max_price_deviation*100:.2f}%，拒绝挂单"
+            )
+            return None
 
         layer_multipliers = phase_cfg['layer_multipliers']
         phase_layer_index = self._resolve_phase_layer_index(phase_cfg, layer_num)
@@ -2949,6 +3146,13 @@ class MartinBot:
             return plan
         if not self._is_structure_price_valid_for_side(side, current_price, avg_price, existing_price):
             return plan
+        if self._is_materially_better_structure_price(
+            side,
+            current_price,
+            self._safe_float(plan.get('execute_price', 0.0), 0.0),
+            existing_price,
+        ):
+            return plan
 
         stabilized_plan = dict(plan)
         stabilized_plan['entry_price'] = existing_price
@@ -3038,7 +3242,10 @@ class MartinBot:
         position: Dict[str, Any],
         reason_prefix: str = "",
     ) -> bool:
-        anchor_pending_price = self._pending_entry_price_from_orders(add_orders)
+        anchor_pending_price = self._pending_entry_price_from_orders(
+            add_orders,
+            reference_price=current_price,
+        )
         plan = self._build_add_order_plan(
             next_layer,
             current_price,
@@ -3058,14 +3265,20 @@ class MartinBot:
             print(f"🧷 {reason_prefix}第{next_layer}层加仓重建沿用旧价: {plan['sticky_rebuild_reason']}")
 
         if self._entry_orders_match_plan(add_orders, plan):
-            pending_price = self._pending_entry_price_from_orders(add_orders)
+            pending_price = self._pending_entry_price_from_orders(
+                add_orders,
+                reference_price=current_price,
+            )
             if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
                 self._set_runtime_flag('pending_entry_price', pending_price)
             return True
 
         refresh_reason = self._entry_order_refresh_reason(add_orders, plan)
         if not refresh_reason:
-            pending_price = self._pending_entry_price_from_orders(add_orders)
+            pending_price = self._pending_entry_price_from_orders(
+                add_orders,
+                reference_price=current_price,
+            )
             if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
                 self._set_runtime_flag('pending_entry_price', pending_price)
             return True
@@ -3975,9 +4188,11 @@ class MartinBot:
 
     def _snapshot_strategy(self, stream: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = {
-            'name': 'Bitget 马丁策略机器人',
-            'exchange': getattr(self.exchange, 'name', 'Bitget'),
+            'name': f"{getattr(self.exchange, 'name', '交易所')} 马丁策略机器人",
+            'exchange': getattr(self.exchange, 'name', '交易所'),
             'mode': 'sandbox' if self.config.get('sandbox', True) else 'live',
+            'position_mode': str(getattr(self, '_account_position_mode', '') or 'unknown'),
+            'single_direction_guard': self._hedge_mode_is_active(),
             'symbol': self.symbol,
             'timeframe': self.timeframe,
             'sr_timeframe': self.sr_timeframe,
@@ -4418,6 +4633,7 @@ class MartinBot:
         except Exception as e:
             if "leverage not change" not in str(e).lower():
                 print(f"⚠️ 设置杠杆失败: {e}")
+                raise RuntimeError(f"无法确认交易所杠杆设置: {e}") from e
 
     def get_wallet_balance(self) -> Optional[float]:
         snapshot = self.get_balance_snapshot()
@@ -4608,10 +4824,20 @@ class MartinBot:
         open_orders = self.fetch_open_orders()
         if open_orders is None:
             return True
+        self._assert_single_direction_entry_orders(open_orders)
+        requested_position_side = 'long' if str(side).lower() == 'buy' else 'short'
         for order in open_orders:
             if order.get('reduceOnly', False):
                 continue
-            if str(order.get('side', '')).lower() == side.lower():
+            order_position_side = self._entry_order_position_side(order)
+            if self._hedge_mode_is_active() and order_position_side:
+                if order_position_side != requested_position_side:
+                    raise FatalTradingConfigurationError(
+                        f"WEEX {self.symbol} 已存在 {order_position_side} 方向开仓挂单，"
+                        f"拒绝再提交 {requested_position_side} 方向订单。"
+                    )
+                return True
+            if str(order.get('side', '')).lower() == str(side).lower():
                 return True
         return False
 
@@ -4624,11 +4850,30 @@ class MartinBot:
             params = {'_force_rest': True} if force_rest else None
             positions = self.exchange.fetch_positions([self.symbol], params)
             self._clear_state_sync_required()
-            for pos in positions:
-                contracts = self._safe_float(pos.get('contracts', 0))
-                if contracts > 0:
-                    return True, pos
+            active_positions = [
+                pos
+                for pos in positions
+                if self._safe_float(pos.get('contracts', 0)) > 0
+            ]
+            observed_modes = {
+                str(((pos.get('info') or {}).get('posMode') or '')).lower()
+                for pos in active_positions
+                if str(((pos.get('info') or {}).get('posMode') or '')).strip()
+            }
+            if len(observed_modes) == 1:
+                self._account_position_mode = next(iter(observed_modes))
+            if len(active_positions) > 1:
+                sides = sorted({str(pos.get('side') or 'unknown').lower() for pos in active_positions})
+                raise FatalTradingConfigurationError(
+                    f"{getattr(self.exchange, 'name', '交易所')} {self.symbol} 返回了 "
+                    f"{len(active_positions)} 个活动仓位（方向={sides}）。"
+                    "机器人只管理一个方向，已停止以避免遗漏或误平仓。"
+                )
+            if active_positions:
+                return True, active_positions[0]
             return True, None
+        except FatalTradingConfigurationError:
+            raise
         except Exception as e:
             self._mark_state_sync_required(f"持仓查询失败: {e}")
             if not suppress_error:
@@ -4669,7 +4914,13 @@ class MartinBot:
         return [
             order for order in rows
             if not order.get('reduceOnly', False)
-            and str(order.get('side', '')).lower() == wrong_side
+            and (
+                self._entry_order_position_side(order) == ('short' if side == 'long' else 'long')
+                or (
+                    not self._entry_order_position_side(order)
+                    and str(order.get('side', '')).lower() == wrong_side
+                )
+            )
         ]
 
     def _cancel_wrong_direction_entry_orders(
@@ -5207,11 +5458,17 @@ class MartinBot:
                 return self._PARTIAL_SKIPPED
 
             position_mode = str(((position.get('info') or {}).get('posMode') or '')).lower()
-            if position_mode and position_mode != 'one_way_mode':
+            if position_mode and not self._position_mode_is_supported(position_mode):
                 self._mark_state_sync_required(
-                    f"{reason}拒绝执行: 当前持仓模式 {position_mode!r}，只支持 one_way_mode"
+                    f"{reason}拒绝执行: 当前持仓模式 {position_mode!r} 不受该交易所适配器支持"
                 )
                 print(f"❌ {reason}: 当前持仓模式为 {position_mode!r}，禁止提交 reduce-only 部分止盈")
+                return self._PARTIAL_PENDING
+
+            raw_position_side = str(position.get('side') or '').lower()
+            if position_mode == 'hedge_mode' and raw_position_side not in {'long', 'short'}:
+                self._mark_state_sync_required(f"{reason}拒绝执行: WEEX hedge_mode 仓位缺少明确 LONG/SHORT 方向")
+                print(f"❌ {reason}: hedge_mode 仓位方向不明确，禁止提交部分止盈")
                 return self._PARTIAL_PENDING
 
             current_price = self._live_price_from_ws(position, allow_rest=True)
@@ -5434,6 +5691,86 @@ class MartinBot:
     # =========================================================
     # K线 / 指标
     # =========================================================
+    def _record_market_data_quality(self, timeframe: str, reason: str = '') -> None:
+        timeframe = str(timeframe or self.timeframe)
+        errors = getattr(self, '_market_data_errors', None)
+        if errors is None:
+            errors = {}
+            self._market_data_errors = errors
+        if not reason:
+            errors.pop(timeframe, None)
+            return
+
+        errors[timeframe] = reason
+        now = time.time()
+        logged_at = getattr(self, '_market_data_error_log_at', None)
+        if logged_at is None:
+            logged_at = {}
+            self._market_data_error_log_at = logged_at
+        last_at = self._safe_float(logged_at.get(timeframe, 0.0), 0.0)
+        if now - last_at >= 60.0:
+            print(f"❌ K线质量检查失败[{timeframe}]: {reason}；禁止据此开仓或加仓")
+            logged_at[timeframe] = now
+
+    def _validate_ohlcv_frame(self, df: pd.DataFrame, timeframe: str) -> Optional[pd.DataFrame]:
+        frame = df.copy()
+        numeric_columns = ('timestamp', 'open', 'high', 'low', 'close', 'volume')
+        for column in numeric_columns:
+            frame[column] = pd.to_numeric(frame[column], errors='coerce').astype('float64')
+
+        if any(not frame[column].map(math.isfinite).all() for column in numeric_columns):
+            self._record_market_data_quality(timeframe, '存在非数字或非有限值')
+            return None
+
+        price_columns = ['open', 'high', 'low', 'close']
+        positive_prices = frame[price_columns].gt(0).all(axis=1)
+        valid_timestamp = frame['timestamp'].gt(0)
+        valid_volume = frame['volume'].ge(0)
+        valid_high = frame['high'].ge(frame[['open', 'low', 'close']].max(axis=1))
+        valid_low = frame['low'].le(frame[['open', 'high', 'close']].min(axis=1))
+        valid_rows = positive_prices & valid_timestamp & valid_volume & valid_high & valid_low
+        if not valid_rows.all():
+            invalid_count = int((~valid_rows).sum())
+            self._record_market_data_quality(
+                timeframe,
+                f'{invalid_count} 根K线包含零价、负值或不一致的OHLC',
+            )
+            return None
+
+        if frame['timestamp'].duplicated().any():
+            self._record_market_data_quality(timeframe, '存在重复时间戳')
+            return None
+        frame = frame.sort_values('timestamp').reset_index(drop=True)
+
+        max_range_pct = max(
+            self._safe_float(getattr(self, 'market_data_max_candle_range_pct', 0.20), 0.20),
+            0.01,
+        )
+        candle_range_pct = (frame['high'] - frame['low']) / frame['close']
+        if candle_range_pct.gt(max_range_pct).any():
+            observed = self._safe_float(candle_range_pct.max(), 0.0)
+            self._record_market_data_quality(
+                timeframe,
+                f'单根K线振幅 {observed*100:.2f}% 超过上限 {max_range_pct*100:.2f}%',
+            )
+            return None
+
+        max_jump_pct = max(
+            self._safe_float(getattr(self, 'market_data_max_close_jump_pct', 0.20), 0.20),
+            0.01,
+        )
+        close_jump_pct = frame['close'].pct_change().abs().dropna()
+        if close_jump_pct.gt(max_jump_pct).any():
+            observed = self._safe_float(close_jump_pct.max(), 0.0)
+            self._record_market_data_quality(
+                timeframe,
+                f'相邻收盘价跳变 {observed*100:.2f}% 超过上限 {max_jump_pct*100:.2f}%',
+            )
+            return None
+
+        self._record_market_data_quality(timeframe)
+        return frame
+
     def fetch_ohlcv_df(self, timeframe=None, limit=100) -> Optional[pd.DataFrame]:
         timeframe = timeframe or self.timeframe
         try:
@@ -5444,13 +5781,21 @@ class MartinBot:
                 ohlcv,
                 columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
             )
-            return df
+            return self._validate_ohlcv_frame(df, str(timeframe))
         except Exception as e:
             print(f"❌ 获取K线失败: {e}")
+            self._record_market_data_quality(str(timeframe), f'获取或解析失败: {e}')
             return None
 
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
+
+        # Pandas 3 promotes a float Series to object when ``pd.NA`` is used as
+        # the zero-division sentinel. Rolling aggregations then fail with
+        # "No numeric types to aggregate". Normalize exchange payloads and
+        # keep every indicator input on the float/NaN path.
+        for column in ('open', 'high', 'low', 'close', 'volume'):
+            df[column] = pd.to_numeric(df[column], errors='coerce').astype('float64')
 
         # EMA
         df['ema_fast'] = df['close'].ewm(span=self.fast_ema_period, adjust=False).mean()
@@ -5462,7 +5807,7 @@ class MartinBot:
         loss = -delta.clip(upper=0)
         avg_gain = gain.rolling(self.rsi_period).mean()
         avg_loss = loss.rolling(self.rsi_period).mean()
-        rs = avg_gain / avg_loss.replace(0, pd.NA)
+        rs = avg_gain / avg_loss.where(avg_loss.ne(0))
         df['rsi'] = 100 - (100 / (1 + rs))
 
         # ATR
@@ -5483,11 +5828,12 @@ class MartinBot:
         plus_dm[(up_move > down_move) & (up_move > 0)] = up_move
         minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
 
-        atr = df['atr'].replace(0, pd.NA)
+        atr = df['atr'].where(df['atr'].ne(0))
         plus_di = 100 * (plus_dm.rolling(self.adx_period).mean() / atr)
         minus_di = 100 * (minus_dm.rolling(self.adx_period).mean() / atr)
 
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
+        di_sum = plus_di + minus_di
+        dx = 100 * (plus_di - minus_di).abs() / di_sum.where(di_sum.ne(0))
         df['adx'] = dx.rolling(self.adx_period).mean()
 
         return df
@@ -5651,12 +5997,17 @@ class MartinBot:
         去重 / 合并过近价位
         min_gap_ratio = 0.2%
         """
-        if not levels:
+        valid_levels = []
+        for level in levels or []:
+            value = self._safe_float(level, 0.0)
+            if value > 0 and math.isfinite(value):
+                valid_levels.append(value)
+        if not valid_levels:
             return []
 
-        levels = sorted(levels)
-        merged = [levels[0]]
-        for lv in levels[1:]:
+        valid_levels.sort()
+        merged = [valid_levels[0]]
+        for lv in valid_levels[1:]:
             if abs(lv - merged[-1]) / merged[-1] >= min_gap_ratio:
                 merged.append(lv)
         return merged
@@ -6572,6 +6923,8 @@ class MartinBot:
         if open_orders is None:
             open_orders = []
         non_reduce_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
+        if orders_available:
+            self._assert_single_direction_entry_orders(non_reduce_orders, position)
 
         if position:
             contracts = self._safe_float(position.get('contracts', 0))
@@ -6601,7 +6954,13 @@ class MartinBot:
                 non_reduce_orders = [
                     o for o in open_orders
                     if not o.get('reduceOnly', False)
-                    and str(o.get('side', '')).lower() == expected_order_side
+                    and (
+                        self._entry_order_position_side(o) == side
+                        or (
+                            not self._entry_order_position_side(o)
+                            and str(o.get('side', '')).lower() == expected_order_side
+                        )
+                    )
                 ]
 
             self.state.bot_state = "IN_STRATEGY"
@@ -6636,7 +6995,10 @@ class MartinBot:
                 self.state.pending_layer = (
                     min(self.max_layers, self.state.layer + 1)
                 )
-                self.state.pending_entry_price = self._pending_entry_price_from_orders(non_reduce_orders)
+                self.state.pending_entry_price = self._pending_entry_price_from_orders(
+                    non_reduce_orders,
+                    reference_price=price,
+                )
                 self.state.pending_entry_amount = self._normalize_amount(
                     self._safe_float(non_reduce_orders[0].get('amount', 0.0), 0.0)
                 )
@@ -6684,7 +7046,10 @@ class MartinBot:
             if open_orders:
                 first_order = open_orders[0]
                 self.state.bot_state = "IN_STRATEGY"
-                self.state.position_side = 'long' if first_order['side'] == 'buy' else 'short'
+                self.state.position_side = (
+                    self._entry_order_position_side(first_order)
+                    or ('long' if first_order['side'] == 'buy' else 'short')
+                )
                 if self.state.layer == 0:
                     self.state.layer = 1
                 self.state.pending_layer = max(self.state.pending_layer, self.state.layer)
@@ -6705,8 +7070,8 @@ class MartinBot:
     # =========================================================
     def run(self):
         print("\n" + "=" * 60)
-        print("🤖 BITGET 马丁策略机器人（最终版）")
-        print(f"  交易所: {getattr(self.exchange, 'name', 'Bitget')}")
+        print("🤖 多交易所马丁策略机器人")
+        print(f"  交易所: {getattr(self.exchange, 'name', '交易所')}")
         print(f"  交易对: {self.symbol}")
         print(f"  杠杆: {self.leverage}X")
         print(f"  Phase1 首仓: {self.phase1_first_order_ratio*100:.2f}%")
@@ -6914,7 +7279,10 @@ class MartinBot:
                                         add_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
                                     if phase_changed:
                                         self._set_runtime_flag('last_phase', current_phase)
-                                    pending_price = self._pending_entry_price_from_orders(add_orders)
+                                    pending_price = self._pending_entry_price_from_orders(
+                                        add_orders,
+                                        reference_price=reconcile_price,
+                                    )
                                     if pending_price > 0 and abs(pending_price - self.state.pending_entry_price) > 1e-9:
                                         self._set_runtime_flag('pending_entry_price', pending_price)
                                     if add_orders:
@@ -7038,6 +7406,8 @@ class MartinBot:
                 except KeyboardInterrupt:
                     print("\n用户中断，退出...")
                     break
+                except FatalTradingConfigurationError:
+                    raise
                 except Exception as e:
                     print(f"❌ 主循环错误: {e}")
                     traceback.print_exc()
@@ -7050,7 +7420,7 @@ class MartinBot:
     # CLI
     # =========================================================
     def main(self):
-        parser = argparse.ArgumentParser(description='BITGET 马丁策略机器人（最终版）')
+        parser = argparse.ArgumentParser(description='多交易所马丁策略机器人')
         parser.add_argument('--run', action='store_true', help='运行机器人')
         parser.add_argument('--balance', action='store_true', help='查询余额')
         parser.add_argument('--position', action='store_true', help='查询持仓')

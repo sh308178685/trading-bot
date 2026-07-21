@@ -1,14 +1,14 @@
 ---
 name: bitget-pro-trader
-description: Bitget martingale strategy only. Includes the running bot and a status checker.
-version: 1.1.0
+description: Bitget and WEEX martingale strategy. Includes the running bot and a status checker.
+version: 1.2.0
 author: Codex
-tags: [trading, crypto, bitget, martingale]
+tags: [trading, crypto, bitget, weex, martingale]
 ---
 
-# Bitget Martin Bot
+# Multi-exchange Martin Bot
 
-This project now keeps only the Bitget martingale strategy.
+This project supports the martingale strategy on Bitget and WEEX USDT futures.
 
 ## What remains
 
@@ -51,6 +51,22 @@ Get JSON output for dashboards or a future web UI:
 python scripts/check-martin-status.py --json
 ```
 
+To use WEEX, set `exchange` to `weex`, `sandbox` to `false`, and use a unified
+USDT futures symbol such as `BTC/USDT:USDT` in `config/config.json`. Keep the
+credentials out of that file when possible:
+
+```text
+set WEEX_API_KEY=your_key
+set WEEX_SECRET_KEY=your_secret
+set WEEX_PASSPHRASE=your_passphrase
+```
+
+WEEX uses the same `wsEnabled`, `wsPublicEnabled`, `wsPrivateEnabled`,
+`wsFreshSeconds`, and `wsReconnectDelay` switches as Bitget. Its V3 public
+WebSocket supplies ticker/depth/candles and the authenticated private socket
+supplies account/position/fill/order updates; REST remains the authoritative
+fallback when a cache is missing or stale.
+
 Run the web dashboard:
 
 ```bash
@@ -86,8 +102,10 @@ http://YOUR_PC_IP:8765
 
 ## Notes
 
-- `sandbox: true` means Bitget demo mode.
-- `sandbox: false` means live trading.
-- Start with demo mode before touching live capital.
-- Keep Bitget credentials in environment variables where possible; `config/config.json` is ignored and must never be committed.
+- Bitget supports `sandbox: true` demo mode and `sandbox: false` live mode.
+- WEEX currently supports only `sandbox: false`: WEEX's official V3 demo API does not expose the cancel-order, conditional-order, or TP/SL endpoints needed to manage this strategy safely, so the adapter fails closed in demo mode.
+- WEEX currently uses REST polling; the dashboard reports `rest` transport.
+- WEEX startup checks the official API-trading-symbol list and refuses to run when the configured contract is not API-enabled.
+- Start Bitget changes in demo mode. For WEEX, use a dedicated low-risk API key and manually verify the account and symbol before enabling the bot.
+- Keep exchange credentials in environment variables where possible; `config/config.json` is ignored and must never be committed. Bitget uses `BITGET_*`; WEEX uses `WEEX_API_KEY`, `WEEX_SECRET_KEY`, and `WEEX_PASSPHRASE` (or the documented `MARTIN_*` aliases).
 - The repository's pre-push hook rejects any ref whose history contains `config/config.json`. Rotate exposed keys and rewrite that local history before publishing it.

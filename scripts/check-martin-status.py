@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect the current Bitget martingale strategy status."""
+"""Inspect the current martingale strategy status."""
 
 import argparse
 import json
@@ -14,9 +14,9 @@ for dependency_dir in (ROOT / ".deps-local", ROOT / ".deps"):
     if dependency_dir.exists() and str(dependency_dir) not in sys.path:
         sys.path.insert(0, str(dependency_dir))
 
-import ccxt
 import pandas as pd
 
+from trading.exchanges import create_exchange_adapter
 from trading.runtime_config import load_runtime_config
 
 CONFIG_FILE = ROOT / "config" / "config.json"
@@ -77,18 +77,7 @@ class MartinStatusChecker:
         self.exchange = self._init_exchange()
 
     def _init_exchange(self):
-        exchange = ccxt.bitget(
-            {
-                "apiKey": self.config.get("apiKey", ""),
-                "secret": self.config.get("secretKey", ""),
-                "password": self.config.get("passphrase", ""),
-                "enableRateLimit": True,
-                "options": {"defaultType": "swap"},
-            }
-        )
-        if self.config.get("sandbox", True):
-            exchange.set_sandbox_mode(True)
-        return exchange
+        return create_exchange_adapter(self.config)
 
     def _fetch_balance(self):
         balance = self.exchange.fetch_balance({"type": "swap"})
@@ -143,6 +132,8 @@ class MartinStatusChecker:
             ohlcv,
             columns=["timestamp", "open", "high", "low", "close", "volume"],
         )
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
 
         # 检查K线数据是否有效（模拟盘可能返回全相同价格）
         price_range = frame["high"].max() - frame["low"].min()
@@ -160,7 +151,7 @@ class MartinStatusChecker:
         loss = -delta.clip(upper=0)
         avg_gain = gain.rolling(self.rsi_period).mean()
         avg_loss = loss.rolling(self.rsi_period).mean()
-        rs = avg_gain / avg_loss.replace(0, pd.NA)
+        rs = avg_gain / avg_loss.where(avg_loss.ne(0))
         frame["rsi"] = 100 - (100 / (1 + rs))
 
         prev_close = frame["close"].shift(1)
@@ -236,6 +227,7 @@ class MartinStatusChecker:
 
         return {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "exchange": getattr(self.exchange, "name", str(self.config.get("exchange", "bitget"))),
             "mode": "sandbox" if self.config.get("sandbox", True) else "live",
             "symbol": self.symbol,
             "timeframe": self.timeframe,
@@ -377,7 +369,7 @@ def format_text_report(status, events=None):
     mode_cn = "模拟盘" if status["mode"] == "sandbox" else "实盘"
 
     lines = [
-        "📊 Bitget 马丁策略状态",
+        f"📊 {status.get('exchange', '交易所')} 马丁策略状态",
         f"⏰ 时间: {status['timestamp']}",
         f"🎮 模式: {mode_cn}",
         f"📈 交易对: {status['symbol']} ({status['timeframe']})",
