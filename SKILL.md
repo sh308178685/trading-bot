@@ -1,21 +1,22 @@
 ---
 name: bitget-pro-trader
-description: Bitget martingale strategy only. Includes the running bot and a status checker.
+description: Bitget and Gate.io martingale strategy. Includes the running bot and a status checker.
 version: 1.1.0
 author: Codex
-tags: [trading, crypto, bitget, martingale]
+tags: [trading, crypto, bitget, gateio, martingale]
 ---
 
 # Bitget Martin Bot
 
-This project now keeps only the Bitget martingale strategy.
+This project supports Bitget and Gate.io USDT perpetual martingale strategies.
 
 ## What remains
 
 - `scripts/martin-bot.py`: main strategy runner
 - `scripts/check-martin-status.py`: current status inspector, supports `--json`
 - `config/config.json`: live config
-- `config/config.example.json`: martingale config template
+- `config/config.example.json`: Bitget martingale template
+- `config/config.gate.example.json`: Gate.io USDT perpetual template
 - `data/martin-runtime.json`: runtime snapshot
 - `data/martin-state.json`: last status snapshot for event detection
 
@@ -80,6 +81,7 @@ http://YOUR_PC_IP:8765
 
 ## Notes
 
-- `sandbox: true` means Bitget demo mode.
+- Set `exchange` to `bitget` or `gate`. Gate requires an API v4 key with futures permissions.
+- `sandbox: true` means the selected exchange's demo/testnet mode.
 - `sandbox: false` means live trading.
 - Start with demo mode before touching live capital.

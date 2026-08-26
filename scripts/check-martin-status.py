@@ -7,7 +7,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import ccxt
 import pandas as pd
 
 
@@ -16,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from trading.runtime_config import load_runtime_config
+from trading.exchanges import create_exchange_adapter
 
 CONFIG_FILE = ROOT / "config" / "config.json"
 RUNTIME_FILE = ROOT / "data" / "martin-runtime.json"
@@ -75,18 +75,7 @@ class MartinStatusChecker:
         self.exchange = self._init_exchange()
 
     def _init_exchange(self):
-        exchange = ccxt.bitget(
-            {
-                "apiKey": self.config.get("apiKey", ""),
-                "secret": self.config.get("secretKey", ""),
-                "password": self.config.get("passphrase", ""),
-                "enableRateLimit": True,
-                "options": {"defaultType": "swap"},
-            }
-        )
-        if self.config.get("sandbox", True):
-            exchange.set_sandbox_mode(True)
-        return exchange
+        return create_exchange_adapter(self.config)
 
     def _fetch_balance(self):
         balance = self.exchange.fetch_balance({"type": "swap"})

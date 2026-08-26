@@ -2331,6 +2331,7 @@ class MartinBot:
             print(f"✅ 杠杆: {self.leverage}X")
         except Exception as e:
             if "leverage not change" not in str(e).lower():
+                raise RuntimeError(f"Leverage setup failed; trading is blocked: {e}") from e
                 print(f"⚠️ 设置杠杆失败: {e}")
 
     def get_wallet_balance(self) -> Optional[float]:
