@@ -2,6 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
+REM ChatGPT GitHub write test: no functional effect.
+
 where py >nul 2>nul
 if %errorlevel%==0 (
     py -3 scripts\launch-martin.py %*
