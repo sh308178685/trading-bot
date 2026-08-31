@@ -40,5 +40,5 @@ ensure_running() {
 }
 
 # --- Start both ---
-ensure_running "$PIDFILE" "martin-bot" "python3 scripts/martin-bot.py --run"
+ensure_running "$PIDFILE" "martin-bot" "python3 scripts/martin-runner.py --run"
 ensure_running "$DASH_PIDFILE" "martin-dashboard" "python3 scripts/launch-dashboard.py --no-browser"

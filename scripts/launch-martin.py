@@ -21,7 +21,7 @@ LEGACY_DEPS_DIR = ROOT / ".deps"
 from trading.runtime_config import load_runtime_config
 
 CONFIG_FILE = ROOT / "config" / "config.json"
-BOT_SCRIPT = ROOT / "scripts" / "martin-bot.py"
+BOT_SCRIPT = ROOT / "scripts" / "martin-runner.py"
 LOG_DIR = ROOT / "data" / "logs"
 
 
