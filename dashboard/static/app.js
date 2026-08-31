@@ -241,12 +241,17 @@ function renderChart(targetId, series, options = {}) {
 
 function renderRuntimeFlags(snapshot) {
   const wrap = document.getElementById("runtime-flags");
+  const indicators = (snapshot.market && snapshot.market.indicators) || {};
+  const activeDrawdown = snapshot.runtime.active_trailing_drawdown_ratio || 0;
   const flags = [
     { label: "当前阶段", value: translatePhase(snapshot.runtime.phase) },
     { label: "最高浮盈", value: fmtPct(snapshot.runtime.best_profit_pct) },
-    { label: "分批止盈 1", value: snapshot.runtime.partial_tp_1_done ? "已完成" : "未完成" },
-    { label: "分批止盈 2", value: snapshot.runtime.partial_tp_2_done ? "已完成" : "未完成" },
     { label: "移动止盈", value: snapshot.runtime.activated ? "已激活" : "待激活" },
+    { label: "动态激活值", value: fmtPct(indicators.dynamic_tp_activate_pct) },
+    {
+      label: "实际允许回撤",
+      value: fmtPct(snapshot.runtime.activated && activeDrawdown > 0 ? activeDrawdown : indicators.dynamic_tp_trail_ratio),
+    },
   ];
 
   wrap.innerHTML = flags
@@ -381,10 +386,8 @@ function renderIndicators(snapshot) {
     ["RSI", fmtNumber(indicators.rsi)],
     ["ADX", fmtNumber(indicators.adx)],
     ["ATR", fmtMoney(indicators.atr)],
-    ["止盈激活值", fmtPct(indicators.dynamic_tp_activate_pct)],
-    ["回撤比例", fmtPct(indicators.dynamic_tp_trail_ratio)],
-    ["动态分批止盈 1", fmtPct(indicators.dynamic_partial_tp1_pct)],
-    ["动态分批止盈 2", fmtPct(indicators.dynamic_partial_tp2_pct)],
+    ["动态止盈激活值", fmtPct(indicators.dynamic_tp_activate_pct)],
+    ["动态回撤比例", fmtPct(indicators.dynamic_tp_trail_ratio)],
   ];
 
   target.innerHTML = rows
@@ -413,10 +416,8 @@ function renderPhaseOverview(snapshot) {
     ["Phase2 额外层数", `${snapshot.strategy.phase2_extra_layers || 0} 层`],
     ["Phase1 倍率", (snapshot.strategy.phase1_layer_multipliers || []).join(" / ") || "--"],
     ["Phase2 倍率", (snapshot.strategy.phase2_layer_multipliers || []).join(" / ") || "--"],
-    [
-      "动态分批止盈",
-      `${fmtPct(snapshot.market.indicators.dynamic_partial_tp1_pct)} / ${fmtPct(snapshot.market.indicators.dynamic_partial_tp2_pct)}`,
-    ],
+    ["本层移动止盈激活", fmtPct(snapshot.market.indicators.dynamic_tp_activate_pct)],
+    ["本层允许回撤", fmtPct(snapshot.market.indicators.dynamic_tp_trail_ratio)],
   ];
 
   target.innerHTML = rows

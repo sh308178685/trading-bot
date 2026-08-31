@@ -717,7 +717,16 @@ class BitgetExchangeAdapter(ExchangeAdapter):
                 return fn(*args, **kwargs)
             except Exception as exc:
                 last_error = exc
-                is_retryable = isinstance(exc, getattr(ccxt, "NetworkError", Exception)) or any(
+                ccxt_network_error = getattr(ccxt, "NetworkError", None)
+                retryable_types: tuple[type[BaseException], ...] = (
+                    TimeoutError,
+                    ConnectionError,
+                    requests.Timeout,
+                    requests.ConnectionError,
+                )
+                if isinstance(ccxt_network_error, type):
+                    retryable_types += (ccxt_network_error,)
+                is_retryable = isinstance(exc, retryable_types) or any(
                     token in str(exc).lower()
                     for token in ("timeout", "timed out", "connection", "reset", "temporarily", "aborted")
                 )
@@ -1061,7 +1070,12 @@ class BitgetExchangeAdapter(ExchangeAdapter):
         data = self._retry("下单", self._private_post, "/api/v2/mix/order/place-order", request) or {}
         return {
             "id": data.get("orderId"),
-            "clientOrderId": data.get("clientOid"),
+            # Bitget does not consistently echo clientOid in every successful
+            # response.  Keep the caller-supplied id so the strategy can still
+            # reconcile an order after an ambiguous network timeout.  `request`
+            # is built once above and passed unchanged to `_retry`, therefore
+            # every retry of this logical order uses the same idempotency key.
+            "clientOrderId": data.get("clientOid") or client_oid,
             "symbol": symbol,
             "type": order_type,
             "side": side,
@@ -1140,6 +1154,7 @@ class BitgetExchangeAdapter(ExchangeAdapter):
         normal_orders = [order for order in orders if order.get("type") != "trigger"]
         trigger_orders = [order for order in orders if order.get("type") == "trigger" or order.get("planType") == "normal_plan"]
         success_list: list[dict[str, Any]] = []
+        cancellation_failures: list[dict[str, Any]] = []
 
         if normal_orders:
             payload = {
@@ -1158,6 +1173,7 @@ class BitgetExchangeAdapter(ExchangeAdapter):
                     success_list.extend(data.get("successList", []))
                     failure_list = data.get("failureList", [])
                     if failure_list:
+                        cancellation_failures.extend(failure_list)
                         for failed in failure_list:
                             print(f"⚠️ 撤单失败: {failed.get('orderId') or failed.get('clientOid')} - {failed.get('errorMsg')}")
                 except Exception:
@@ -1191,9 +1207,16 @@ class BitgetExchangeAdapter(ExchangeAdapter):
                 success_list.extend(data.get("successList", []))
                 failure_list = data.get("failureList", [])
                 if failure_list:
+                    cancellation_failures.extend(failure_list)
                     for failed in failure_list:
                         print(f"⚠️ 取消触发单失败: {failed.get('orderId') or failed.get('clientOid')} - {failed.get('errorMsg')}")
 
+        if cancellation_failures:
+            failed_ids = [
+                str(item.get("orderId") or item.get("clientOid") or "unknown")
+                for item in cancellation_failures
+            ]
+            raise RuntimeError(f"Bitget failed to cancel orders: {', '.join(failed_ids)}")
         return success_list
 
     def create_trigger_order(
@@ -1372,7 +1395,22 @@ class BitgetExchangeAdapter(ExchangeAdapter):
                 "orderId": order_id or "",
                 "clientOid": client_oid or "",
             }]
-        return self._retry("取消仓位止损单", self._private_post, "/api/v2/mix/order/cancel-plan-order", payload) or {}
+        data = self._retry(
+            "取消仓位止损单",
+            self._private_post,
+            "/api/v2/mix/order/cancel-plan-order",
+            payload,
+        ) or {}
+        failure_list = data.get("failureList", []) if isinstance(data, dict) else []
+        if failure_list:
+            failed_ids = [
+                str(item.get("orderId") or item.get("clientOid") or "unknown")
+                for item in failure_list
+            ]
+            raise RuntimeError(
+                f"Bitget failed to cancel position stop loss: {', '.join(failed_ids)}"
+            )
+        return data
 
     def fetch_ticker(self, symbol: str, params: dict[str, Any] | None = None):
         ticker = self._wait_for_ws_ticker(timeout=3.0)
@@ -1520,7 +1558,32 @@ class BitgetExchangeAdapter(ExchangeAdapter):
             return float(value[:-1]) * 604800
         return 60.0
 
+    def fetch_my_trades_authoritative(
+        self,
+        symbol: str | None = None,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch fills only when the REST history endpoint is available.
+
+        Unlike :meth:`fetch_my_trades`, this method never treats the bounded
+        WebSocket cache as a complete history.  It is intended for decisions
+        that must fail closed, such as a cancel/replace fill barrier.
+        """
+        options = dict(params or {})
+        options["requireAuthoritative"] = True
+        return self.fetch_my_trades(symbol, since, limit, options)
+
     def fetch_my_trades(self, symbol: str | None = None, since: int | None = None, limit: int | None = None, params: dict[str, Any] | None = None):
+        options = dict(params or {})
+        # The WebSocket fill cache is useful for UI continuity, but it is not a
+        # complete history and therefore cannot prove that a canceled order had
+        # no boundary fill.  Safety-critical callers can require a successful
+        # REST response while existing callers retain the WS fallback.
+        require_authoritative = bool(
+            options.pop("requireAuthoritative", options.pop("require_authoritative", False))
+        )
         limit = limit or 60
         ws_rows = self._map_ws_fills(limit)
         try:
@@ -1569,7 +1632,12 @@ class BitgetExchangeAdapter(ExchangeAdapter):
                         },
                     }
                 )
-        except Exception:
+        except Exception as exc:
+            if require_authoritative:
+                raise RuntimeError(
+                    "Bitget authoritative trade history is unavailable; "
+                    "WebSocket fill cache may be incomplete"
+                ) from exc
             if ws_rows:
                 return ws_rows[-limit:]
             raise
@@ -1619,10 +1687,26 @@ class BitgetExchangeAdapter(ExchangeAdapter):
     def _merge_trades(self, rest_rows: list[dict[str, Any]], ws_rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {}
         for trade in rest_rows:
-            trade_id = str(trade.get("id") or trade.get("order") or trade.get("timestamp"))
+            trade_id = str(
+                trade.get("id")
+                or (
+                    trade.get("order"),
+                    trade.get("timestamp"),
+                    trade.get("price"),
+                    trade.get("amount"),
+                )
+            )
             merged[trade_id] = trade
         for trade in ws_rows:
-            trade_id = str(trade.get("id") or trade.get("order") or trade.get("timestamp"))
+            trade_id = str(
+                trade.get("id")
+                or (
+                    trade.get("order"),
+                    trade.get("timestamp"),
+                    trade.get("price"),
+                    trade.get("amount"),
+                )
+            )
             merged[trade_id] = trade
         rows = list(merged.values())
         rows.sort(key=lambda item: safe_float(item.get("timestamp", 0)))

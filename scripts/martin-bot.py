@@ -22,9 +22,9 @@ BITGET 马丁策略机器人（最终版）
    - 再不行，用固定百分比偏移兜底
 
 4. 止盈：
-   - 浮盈 >= 5%：平 30%
-   - 浮盈 >= 8%：再平 20%
-   - 剩余仓位使用 ATR trailing + 回撤保护
+   - 只使用移动止盈，不做 TP1 / TP2 分批减仓
+   - 当前仓位层数越深，移动止盈越早激活、允许回撤越小
+   - 激活后保持生效，直到整轮仓位确认退出
 
 5. 止损：
    - 收益率低于 -max_loss_pct 时全平
@@ -46,6 +46,7 @@ import threading
 import contextlib
 import io
 import site
+import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -150,18 +151,25 @@ class RuntimeState:
     phase2_start_layer: int = 0
     pending_entry_price: float = 0.0
     pending_entry_amount: float = 0.0
+    pending_entry_order_id: str = ""
+    pending_entry_client_oid: str = ""
     last_fill_price: float = 0.0
     last_fill_time: str = ""
+    last_fill_order_id: str = ""
+    last_fill_amount: float = 0.0
+    last_fill_price_source: str = ""
+    unresolved_fill_order_id: str = ""
+    unresolved_fill_accounted_amount: float = 0.0
+    zero_fill_canceled_entry_order_id: str = ""
     protective_stop_active: bool = False
     protective_stop_order_id: str = ""
     protective_stop_client_oid: str = ""
     protective_stop_price: float = 0.0
     best_profit_pct: float = 0.0
+    active_trailing_drawdown_ratio: float = 0.0
     position_side: Optional[str] = None     # long / short
     last_known_contracts: float = 0.0
     bot_state: str = "IDLE"                 # IDLE / IN_STRATEGY
-    partial_tp_1_done: bool = False
-    partial_tp_2_done: bool = False
     activated: bool = False
     entry_price: float = 0.0
     initial_balance: float = 0.0            # 首仓时的余额基准，加仓仓位基于此计算
@@ -278,6 +286,27 @@ class MartinBot:
         self.layer_multipliers = self.phase1_layer_multipliers + self.phase2_layer_multipliers
         self.first_order_ratio = self.phase1_first_order_ratio
 
+        # 保留原来的 ADX / ATR 波动率动态止盈，再用层数系数逐层收紧。
+        # 列表不足 max_layers 时沿用最后一项。
+        default_activation_layer_multipliers = [
+            1.00, 0.90, 0.80, 0.70, 0.60, 0.52, 0.44, 0.37, 0.30,
+        ]
+        default_drawdown_layer_multipliers = [
+            1.00, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44, 0.36,
+        ]
+        self.trailing_activation_layer_multipliers = self._normalize_layer_schedule(
+            self.config.get('trailing_activation_layer_multipliers'),
+            default_activation_layer_multipliers,
+            minimum=0.05,
+            maximum=1.0,
+        )
+        self.trailing_drawdown_layer_multipliers = self._normalize_layer_schedule(
+            self.config.get('trailing_drawdown_layer_multipliers'),
+            default_drawdown_layer_multipliers,
+            minimum=0.05,
+            maximum=1.0,
+        )
+
         self.level_offset_pct = self.config.get('level_offset_pct', 0.001)              # 结构位偏移 0.1%
         self.add_layer_base_offset_pct = self.config.get('add_layer_base_offset_pct', 0.005)  # 固定兜底偏移 0.5% * 层数
         self.structure_refresh_threshold = self.config.get('structure_refresh_threshold', 0.008)  # 结构变化阈值 0.8%
@@ -315,20 +344,31 @@ class MartinBot:
             0.0,
         )
         self.protective_stop_profit_lock_ratio = self._safe_float(
-            self.config.get('protective_stop_profit_lock_ratio', 0.25),
-            0.25,
+            self.config.get('protective_stop_profit_lock_ratio', 0.75),
+            0.75,
         )
         self.protective_stop_min_profit_pct = self._safe_float(
             self.config.get('protective_stop_min_profit_pct', default_protective_floor),
             default_protective_floor,
         )
         self.protective_stop_update_step_pct = self._safe_float(
-            self.config.get('protective_stop_update_step_pct', 0.003),
-            0.003,
+            self.config.get('protective_stop_update_step_pct', 0.001),
+            0.001,
         )
-        self.trailing_min_close_profit_pct = self._safe_float(
-            self.config.get('trailing_min_close_profit_pct', self.protective_stop_min_profit_pct),
-            self.protective_stop_min_profit_pct,
+        self.trailing_activation_min_pct = max(
+            self._safe_float(
+                self.config.get('trailing_activation_min_pct', self.protective_stop_min_profit_pct),
+                self.protective_stop_min_profit_pct,
+            ),
+            0.0001,
+        )
+        self.trailing_activation_max_pct = max(
+            self._safe_float(self.config.get('trailing_activation_max_pct', 0.01), 0.01),
+            self.trailing_activation_min_pct,
+        )
+        self.trailing_drawdown_min_ratio = min(
+            max(self._safe_float(self.config.get('trailing_drawdown_min_ratio', 0.10), 0.10), 0.01),
+            0.95,
         )
 
         self.loop_interval = self.config.get('loop_interval', 20)
@@ -357,6 +397,7 @@ class MartinBot:
 
         self.state_lock = threading.RLock()
         self.action_lock = threading.RLock()
+        self.runtime_save_lock = threading.Lock()
         self.snapshot_lock = threading.Lock()
         self._exit_in_progress = threading.Event()
         self._risk_stop_event = threading.Event()
@@ -394,10 +435,32 @@ class MartinBot:
     def _save_json(self, path, data):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + f'.{os.getpid()}.tmp')
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(temp_path, path)
+        temp_path = path.with_suffix(
+            path.suffix
+            + f'.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp'
+        )
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            # Windows readers (dashboard、Defender、索引器等) 可能会在极短时间内
+            # 以不共享删除的方式占用目标文件，使原子替换报 WinError 5/32/33。
+            # 始终重试同一个已完整写好的临时文件，既保留原子性，也不先删除旧状态。
+            replace_retry_delays = (0.02, 0.05, 0.10, 0.20, 0.40)
+            for attempt in range(len(replace_retry_delays) + 1):
+                try:
+                    os.replace(temp_path, path)
+                    break
+                except OSError as exc:
+                    if getattr(exc, 'winerror', None) not in {5, 32, 33}:
+                        raise
+                    if attempt >= len(replace_retry_delays):
+                        raise
+                    time.sleep(replace_retry_delays[attempt])
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _now_str(self):
         return time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -453,6 +516,63 @@ class MartinBot:
         except Exception:
             return default
 
+    def _normalize_layer_schedule(
+        self,
+        raw_values: Any,
+        defaults: List[float],
+        minimum: float,
+        maximum: float,
+    ) -> List[float]:
+        configured = list(raw_values) if isinstance(raw_values, (list, tuple)) else []
+        fallback_values = list(defaults) or [minimum]
+        normalized: List[float] = []
+        for index in range(max(int(self.max_layers), 1)):
+            fallback = fallback_values[min(index, len(fallback_values) - 1)]
+            raw_value = configured[index] if index < len(configured) else fallback
+            value = min(max(self._safe_float(raw_value, fallback), minimum), maximum)
+            if normalized:
+                # 配置写反时也不能让深层仓位比浅层更晚止盈。
+                value = min(value, normalized[-1])
+            normalized.append(value)
+        return normalized
+
+    @staticmethod
+    def _layer_schedule_value(values: List[float], layer: int, default: float) -> float:
+        if not values:
+            return default
+        index = min(max(int(layer or 1), 1), len(values)) - 1
+        return float(values[index])
+
+    def _fallback_trailing_values_for_layer(self, layer: Optional[int] = None) -> Tuple[float, float]:
+        effective_layer = max(int(layer if layer is not None else self.state.layer), 1)
+        activation_floor = max(
+            self._safe_float(getattr(self, 'trailing_activation_min_pct', 0.005), 0.005),
+            0.0001,
+        )
+        drawdown_multiplier = self._layer_schedule_value(
+            getattr(self, 'trailing_drawdown_layer_multipliers', [1.0]),
+            effective_layer,
+            1.0,
+        )
+        trail_ratio = max(
+            self._safe_float(getattr(self, 'trailing_drawdown_min_ratio', 0.10), 0.10),
+            0.25 * drawdown_multiplier,
+        )
+        return activation_floor, trail_ratio
+
+    def _tighten_active_trail_ratio(self, candidate: float) -> float:
+        normalized = min(max(self._safe_float(candidate, 0.0), 0.01), 0.95)
+        changed = False
+        with self.state_lock:
+            current = self._safe_float(self.state.active_trailing_drawdown_ratio, 0.0)
+            if current <= 0 or normalized < current - 1e-12:
+                self.state.active_trailing_drawdown_ratio = normalized
+                current = normalized
+                changed = True
+        if changed:
+            self._save_runtime_state()
+        return current
+
     def _mark_state_sync_required(self, reason: str) -> None:
         reason_text = str(reason or '').strip() or 'unknown'
         if not self._state_sync_required or reason_text != self._state_sync_reason:
@@ -475,6 +595,36 @@ class MartinBot:
             return float(self.exchange.price_to_precision(self.symbol, price))
         except Exception:
             return price
+
+    def _layer_price_to_safe_precision(
+        self,
+        price: float,
+        side: str,
+        anchor_price: float,
+        spacing_ratio: float,
+    ) -> float:
+        raw_price = self._safe_float(price, 0.0)
+        try:
+            step = self._safe_float((self._market().get('precision') or {}).get('price'), 0.0)
+        except Exception:
+            step = 0.0
+        if step > 0 and raw_price > 0:
+            units = raw_price / step
+            if side == 'short':
+                raw_price = math.ceil(units - 1e-12) * step
+            else:
+                raw_price = math.floor(units + 1e-12) * step
+        quantized = self._price_to_precision(raw_price)
+        required_price = anchor_price * (
+            1 + spacing_ratio if side == 'short' else 1 - spacing_ratio
+        )
+        tolerance = max(abs(anchor_price) * 1e-12, 1e-15)
+        if step > 0:
+            if side == 'short' and quantized + tolerance < required_price:
+                quantized = self._price_to_precision(quantized + step)
+            elif side != 'short' and quantized > required_price + tolerance:
+                quantized = self._price_to_precision(max(quantized - step, 0.0))
+        return quantized
 
     def _min_amount(self) -> float:
         market = self._market()
@@ -591,6 +741,7 @@ class MartinBot:
         position: Dict[str, Any],
         current_profit_pct: Optional[float] = None,
         best_profit_pct: Optional[float] = None,
+        trail_ratio: Optional[float] = None,
     ) -> Optional[Dict[str, float]]:
         entry_price = self._position_entry_price(position)
         if entry_price <= 0:
@@ -611,9 +762,23 @@ class MartinBot:
         if best_profit <= 0:
             return None
 
+        resolved_trail_ratio = self._safe_float(trail_ratio, 0.0)
+        if resolved_trail_ratio <= 0:
+            resolved_trail_ratio = self._safe_float(
+                self.state.active_trailing_drawdown_ratio,
+                0.0,
+            )
+        if resolved_trail_ratio <= 0:
+            _, resolved_trail_ratio = self._fallback_trailing_values_for_layer(self.state.layer)
+        # 软件回撤线与交易所服务端保护单必须使用同一套收紧逻辑。
+        # 例如允许回撤 25%，保护单至少锁住最高浮盈的 75%。
+        lock_ratio = min(
+            max(self.protective_stop_profit_lock_ratio, 1.0 - resolved_trail_ratio, 0.0),
+            1.0,
+        )
         locked_profit_pct = max(
             self.protective_stop_min_profit_pct,
-            best_profit * max(self.protective_stop_profit_lock_ratio, 0.0),
+            best_profit * max(lock_ratio, 0.0),
         )
         if current_profit_pct is not None:
             lockable_profit_pct = max(self._safe_float(current_profit_pct, 0.0) - 0.001, 0.0)
@@ -634,6 +799,8 @@ class MartinBot:
             'side': side,
             'hold_side': self._position_hold_side_for_plan(position),
             'leverage': leverage,
+            'trail_ratio': resolved_trail_ratio,
+            'lock_ratio': lock_ratio,
         }
 
     def _should_update_protective_stop(self, side: str, trigger_price: float) -> bool:
@@ -647,38 +814,49 @@ class MartinBot:
         return trigger_price >= current_price * (1 + min_step)
 
     def _clear_protective_stop(self, remote: bool = True, force_all: bool = False) -> bool:
-        remote_changed = False
-        order_id = self.state.protective_stop_order_id
-        client_oid = self.state.protective_stop_client_oid
+        with self.action_lock:
+            remote_changed = False
+            order_id = self.state.protective_stop_order_id
+            client_oid = self.state.protective_stop_client_oid
+            has_local_stop = bool(
+                order_id or client_oid or self.state.protective_stop_active
+            )
 
-        if remote and self.protective_stop_enabled and (force_all or order_id or client_oid or self.state.protective_stop_active):
-            try:
-                self.exchange.cancel_position_stop_loss(
-                    self.symbol,
-                    order_id=order_id or None,
-                    client_oid=client_oid or None,
-                )
-                remote_changed = True
-            except Exception as exc:
-                print(f"⚠️ 取消保护止损失败: {exc}")
+            if remote and (force_all or has_local_stop):
+                try:
+                    cancel_result = self.exchange.cancel_position_stop_loss(
+                        self.symbol,
+                        order_id=order_id or None,
+                        client_oid=client_oid or None,
+                    )
+                    if isinstance(cancel_result, dict) and cancel_result.get('alreadyAbsent'):
+                        print(
+                            f"ℹ️ 远端保护止损已不存在，同步清理本地身份: "
+                            f"orderId={order_id or '--'}"
+                        )
+                    remote_changed = True
+                except Exception as exc:
+                    # 远端取消没有得到成功确认时必须保留本地身份，供下一轮重试。
+                    print(f"⚠️ 取消保护止损失败，保留远端订单身份: {exc}")
+                    return False
 
-        changed = False
-        with self.state_lock:
-            if self.state.protective_stop_active:
-                self.state.protective_stop_active = False
-                changed = True
-            if self.state.protective_stop_order_id:
-                self.state.protective_stop_order_id = ""
-                changed = True
-            if self.state.protective_stop_client_oid:
-                self.state.protective_stop_client_oid = ""
-                changed = True
-            if abs(self.state.protective_stop_price) > 1e-9:
-                self.state.protective_stop_price = 0.0
-                changed = True
-        if changed:
-            self._save_runtime_state()
-        return changed or remote_changed
+            changed = False
+            with self.state_lock:
+                if self.state.protective_stop_active:
+                    self.state.protective_stop_active = False
+                    changed = True
+                if self.state.protective_stop_order_id:
+                    self.state.protective_stop_order_id = ""
+                    changed = True
+                if self.state.protective_stop_client_oid:
+                    self.state.protective_stop_client_oid = ""
+                    changed = True
+                if abs(self.state.protective_stop_price) > 1e-9:
+                    self.state.protective_stop_price = 0.0
+                    changed = True
+            if changed:
+                self._save_runtime_state()
+            return changed or remote_changed
 
     def _arm_protective_stop(
         self,
@@ -686,26 +864,50 @@ class MartinBot:
         current_profit_pct: Optional[float],
         reason: str,
         best_profit_pct: Optional[float] = None,
+        trail_ratio: Optional[float] = None,
         force: bool = False,
     ) -> bool:
         if not self.protective_stop_enabled or self._exit_in_progress.is_set():
             return False
 
-        target = self._protective_stop_target(position, current_profit_pct=current_profit_pct, best_profit_pct=best_profit_pct)
-        if not target:
-            return False
-        if not force and not self._should_update_protective_stop(str(target['side']), target['trigger_price']):
-            return False
-
-        client_oid = self.state.protective_stop_client_oid or f"martin-pos-loss-{int(time.time() * 1000)}"
-        order_id = self.state.protective_stop_order_id or None
-
         try:
             with self.action_lock:
-                if self._exit_in_progress.is_set():
+                if (
+                    self._exit_in_progress.is_set()
+                    or self.state.bot_state != 'IN_STRATEGY'
+                ):
+                    return False
+                live_position = self.get_active_position()
+                if live_position is self._POSITION_API_ERROR or not live_position:
+                    return False
+                live_contracts = self._safe_float(live_position.get('contracts', 0.0), 0.0)
+                live_side = str(live_position.get('side') or '').lower()
+                state_side = str(self.state.position_side or '').lower()
+                if (
+                    live_contracts <= 0
+                    or live_side not in {'long', 'short'}
+                    or (state_side in {'long', 'short'} and state_side != live_side)
+                ):
                     return False
 
-                if order_id or self.state.protective_stop_client_oid:
+                target = self._protective_stop_target(
+                    live_position,
+                    current_profit_pct=current_profit_pct,
+                    best_profit_pct=best_profit_pct,
+                    trail_ratio=trail_ratio,
+                )
+                if not target:
+                    return False
+                if not force and not self._should_update_protective_stop(
+                    str(target['side']),
+                    target['trigger_price'],
+                ):
+                    return False
+
+                order_id = self.state.protective_stop_order_id or None
+                current_client_oid = self.state.protective_stop_client_oid or None
+                response_client_oid = current_client_oid
+                if order_id or current_client_oid:
                     try:
                         response = self.exchange.modify_tpsl_order(
                             self.symbol,
@@ -713,76 +915,67 @@ class MartinBot:
                             trigger_type=self.protective_stop_trigger_type,
                             execute_price=self.protective_stop_execute_price,
                             order_id=order_id,
-                            client_oid=self.state.protective_stop_client_oid or None,
+                            client_oid=current_client_oid,
                             size="",
                         )
                     except Exception:
-                        self.exchange.cancel_position_stop_loss(
+                        # 取消必须先得到明确成功；失败会直接跳到外层并保留旧身份。
+                        cancel_result = self.exchange.cancel_position_stop_loss(
                             self.symbol,
                             order_id=order_id,
-                            client_oid=self.state.protective_stop_client_oid or None,
+                            client_oid=current_client_oid,
                         )
+                        if isinstance(cancel_result, dict) and cancel_result.get('alreadyAbsent'):
+                            print(
+                                f"ℹ️ 旧保护止损已不存在，继续部署替代保护单: "
+                                f"orderId={order_id or '--'}"
+                            )
+                        with self.state_lock:
+                            self.state.protective_stop_active = False
+                            self.state.protective_stop_order_id = ""
+                            self.state.protective_stop_client_oid = ""
+                            self.state.protective_stop_price = 0.0
+                        self._save_runtime_state()
+                        response_client_oid = self._new_client_order_id()
                         response = self.exchange.place_position_stop_loss(
                             self.symbol,
                             hold_side=str(target['hold_side']),
                             trigger_price=target['trigger_price'],
                             trigger_type=self.protective_stop_trigger_type,
                             execute_price=self.protective_stop_execute_price,
-                            client_oid=client_oid,
+                            client_oid=response_client_oid,
                         )
                 else:
+                    response_client_oid = self._new_client_order_id()
                     response = self.exchange.place_position_stop_loss(
                         self.symbol,
                         hold_side=str(target['hold_side']),
                         trigger_price=target['trigger_price'],
                         trigger_type=self.protective_stop_trigger_type,
                         execute_price=self.protective_stop_execute_price,
-                        client_oid=client_oid,
+                        client_oid=response_client_oid,
                     )
+
+                response = response or {}
+                new_order_id = str(response.get('id') or order_id or "")
+                new_client_oid = str(
+                    response.get('clientOrderId') or response_client_oid or ""
+                )
+                with self.state_lock:
+                    self.state.protective_stop_active = True
+                    self.state.protective_stop_order_id = new_order_id
+                    self.state.protective_stop_client_oid = new_client_oid
+                    self.state.protective_stop_price = self._safe_float(target['trigger_price'], 0.0)
+                self._save_runtime_state()
         except Exception as exc:
             print(f"⚠️ 挂保护止损失败: {exc}")
             return False
-
-        response = response or {}
-        new_order_id = str(response.get('id') or order_id or "")
-        new_client_oid = str(response.get('clientOrderId') or client_oid or "")
-
-        with self.state_lock:
-            self.state.protective_stop_active = True
-            self.state.protective_stop_order_id = new_order_id
-            self.state.protective_stop_client_oid = new_client_oid
-            self.state.protective_stop_price = self._safe_float(target['trigger_price'], 0.0)
-        self._save_runtime_state()
         self._write_live_snapshot(force=True, include_market=False)
         print(
             f"🛡️ {reason}: 已挂保护止损 {target['side']} "
             f"@ {target['trigger_price']:.2f}，锁定收益下限 {target['locked_profit_pct']*100:.2f}%"
         )
         return True
-
-    def _allow_trailing_close(
-        self,
-        position: Dict[str, Any],
-        current_profit_pct: float,
-        reason: str,
-        best_profit_pct: Optional[float] = None,
-    ) -> bool:
-        profit_floor = max(self.trailing_min_close_profit_pct, self.protective_stop_min_profit_pct)
-        if current_profit_pct >= profit_floor:
-            return True
-
-        self._arm_protective_stop(
-            position,
-            current_profit_pct=current_profit_pct,
-            best_profit_pct=best_profit_pct,
-            reason=f"{reason}，改挂保护止损",
-            force=False,
-        )
-        print(
-            f"🛡️ {reason}: 当前收益 {current_profit_pct*100:.2f}% "
-            f"低于保底平仓线 {profit_floor*100:.2f}%，跳过亏损/低利润追踪平仓"
-        )
-        return False
 
     def _phase_config(self, phase: Optional[str] = None) -> Dict[str, Any]:
         normalized = str(phase or self.state.phase or 'PHASE1').upper()
@@ -961,6 +1154,819 @@ class MartinBot:
         price = self._safe_float(order.get('price', 0))
         return price if self._is_sane_pending_entry_price(price) else 0.0
 
+    def _entry_order_identity(self, order: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+        row = order or {}
+        info = row.get('info') or {}
+        initial = info.get('initial') if isinstance(info.get('initial'), dict) else {}
+        order_id = str(row.get('id') or row.get('orderId') or info.get('orderId') or '').strip()
+        client_oid = str(
+            row.get('clientOrderId')
+            or row.get('clientOid')
+            or info.get('clientOid')
+            or info.get('clientOrderId')
+            or info.get('text')
+            or initial.get('text')
+            or ''
+        ).strip()
+        return order_id, client_oid
+
+    @staticmethod
+    def _is_bot_entry_client_oid(client_oid: Optional[str]) -> bool:
+        """Return whether a client identity belongs to this bot's entry flow."""
+        value = str(client_oid or '').strip().lower()
+        return bool(value) and value.startswith(('t-martin-', 'martin-'))
+
+    def _is_owned_entry_order(
+        self,
+        order: Optional[Dict[str, Any]],
+        *,
+        allow_tracked_identity: bool = True,
+    ) -> bool:
+        """Identify bot entry orders before any adoption, cancellation, or rebuild."""
+        order_id, client_oid = self._entry_order_identity(order)
+        if self._is_bot_entry_client_oid(client_oid):
+            return True
+        if client_oid:
+            # An explicit non-bot client identity is authoritative evidence of
+            # foreign ownership; a matching server order ID cannot override it.
+            return False
+
+        # A persisted identity is useful for an order whose exchange response
+        # omitted clientOrderId.  It is only a continuation of an already-owned
+        # order; a new unlabelled/manual order is never adopted by side alone.
+        if allow_tracked_identity and order_id:
+            tracked_ids = {
+                str(self.state.pending_entry_order_id or '').strip(),
+                str(self.state.unresolved_fill_order_id or '').strip(),
+                str(self.state.last_fill_order_id or '').strip(),
+            }
+            if order_id in tracked_ids - {''}:
+                return True
+        return False
+
+    def _split_owned_entry_orders(
+        self,
+        orders: Optional[List[Dict[str, Any]]],
+        position_side: Optional[str],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        side = str(position_side or '').lower()
+        expected_side = 'buy' if side == 'long' else 'sell' if side == 'short' else ''
+        relevant = [
+            order for order in (orders or [])
+            if not order.get('reduceOnly', False)
+        ]
+        owned = [
+            order for order in relevant
+            if self._is_owned_entry_order(order)
+            and (
+                not expected_side
+                or str(order.get('side', '')).lower() == expected_side
+            )
+        ]
+        # Return every foreign entry order, including the opposite side.  A
+        # no-position cleanup must never call cancel-all on an order we do not
+        # own merely because its side is unexpected.
+        foreign = [
+            order for order in relevant
+            if not self._is_owned_entry_order(order)
+        ]
+        return owned, foreign
+
+    def _position_open_timestamp_ms(
+        self,
+        position: Optional[Dict[str, Any]],
+    ) -> float:
+        """Extract the exchange position's opening timestamp when available."""
+        row = position or {}
+        info = row.get('info') or {}
+        raw = row.get('timestamp')
+        if self._safe_float(raw, 0.0) <= 0:
+            for key in (
+                'open_time', 'openTime', 'first_open_time', 'firstOpenTime',
+                'open_timestamp', 'openTimestamp', 'cTime', 'ctime',
+            ):
+                raw = info.get(key)
+                if raw not in (None, ''):
+                    break
+        timestamp_ms = self._safe_float(raw, 0.0)
+        if 0 < timestamp_ms < 1_000_000_000_000:
+            timestamp_ms *= 1000.0
+        return timestamp_ms
+
+    def _last_fill_timestamp_ms(self) -> float:
+        raw = str(self.state.last_fill_time or '').strip()
+        if not raw:
+            return 0.0
+        try:
+            return datetime.fromisoformat(raw).timestamp() * 1000.0
+        except (TypeError, ValueError, OSError, OverflowError):
+            return self._safe_float(raw, 0.0)
+
+    def _guard_verified_anchor_for_position(
+        self,
+        position: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Invalidate a verified anchor that predates the current position cycle."""
+        if not self._has_verified_last_fill_price():
+            return False
+        position_open_ms = self._position_open_timestamp_ms(position)
+        if position_open_ms <= 0:
+            # Exchanges without an opening timestamp retain the existing strict
+            # order identity and trade-history checks.
+            return True
+        anchor_timestamp_ms = self._last_fill_timestamp_ms()
+        if anchor_timestamp_ms > 0 and anchor_timestamp_ms + 5000.0 >= position_open_ms:
+            return True
+
+        anchor_order_id = str(self.state.last_fill_order_id or '').strip()
+        accounted_amount = self._safe_float(self.state.last_fill_amount, 0.0)
+        with self.state_lock:
+            self.state.last_fill_price = 0.0
+            self.state.last_fill_time = ''
+            self.state.last_fill_order_id = ''
+            self.state.last_fill_amount = 0.0
+            self.state.last_fill_price_source = ''
+            if anchor_order_id:
+                self.state.unresolved_fill_order_id = anchor_order_id
+                self.state.unresolved_fill_accounted_amount = max(accounted_amount, 0.0)
+        self._mark_state_sync_required("末次成交锚点早于当前持仓周期")
+        self._save_runtime_state()
+        print("🛑 已隔离早于当前持仓周期的末次成交锚点，禁止生成加仓计划")
+        return False
+
+    @staticmethod
+    def _entry_execution_order_id(order: Optional[Dict[str, Any]]) -> str:
+        """Return Gate's triggered child order ID, never its unrelated me_order_id."""
+        row = order or {}
+        info = row.get('info') or {}
+        execution_order_id = str(
+            row.get('triggerExecutionOrderId')
+            or row.get('executionOrderId')
+            or info.get('trade_id_string')
+            or info.get('trade_id')
+            or ''
+        ).strip()
+        return '' if execution_order_id in {'', '0'} else execution_order_id
+
+    def _promote_trigger_execution_order_id(
+        self,
+        trigger_order_id: str,
+        execution_order_id: str,
+    ) -> None:
+        parent_id = str(trigger_order_id or '').strip()
+        child_id = str(execution_order_id or '').strip()
+        if not parent_id or not child_id or parent_id == child_id:
+            return
+        changed = False
+        with self.state_lock:
+            if str(self.state.pending_entry_order_id or '').strip() == parent_id:
+                self.state.pending_entry_order_id = child_id
+                changed = True
+            if str(self.state.unresolved_fill_order_id or '').strip() == parent_id:
+                self.state.unresolved_fill_order_id = child_id
+                changed = True
+            if str(self.state.last_fill_order_id or '').strip() == parent_id:
+                self.state.last_fill_order_id = child_id
+                changed = True
+            if str(self.state.zero_fill_canceled_entry_order_id or '').strip() == parent_id:
+                # A trigger-created child proves the parent was not a zero-fill cancel.
+                self.state.zero_fill_canceled_entry_order_id = ''
+                changed = True
+        if changed:
+            self._save_runtime_state()
+            print(
+                f"🔗 Gate 条件单已触发，成交身份切换: {parent_id} -> {child_id}"
+            )
+
+    def _has_verified_last_fill_price(self) -> bool:
+        price = self._safe_float(self.state.last_fill_price, 0.0)
+        source = str(self.state.last_fill_price_source or '').strip().lower()
+        order_id = str(self.state.last_fill_order_id or '').strip()
+        unresolved_order_id = str(self.state.unresolved_fill_order_id or '').strip()
+        return (
+            price > 0
+            and source == 'trade_history'
+            and bool(order_id)
+            and not unresolved_order_id
+        )
+
+    def _fetch_authoritative_my_trades(self, limit: int) -> List[Dict[str, Any]]:
+        """Fetch a complete REST-backed fill window when the adapter supports it."""
+        authoritative_fetch = getattr(
+            self.exchange,
+            'fetch_my_trades_authoritative',
+            None,
+        )
+        if callable(authoritative_fetch):
+            return authoritative_fetch(self.symbol, limit=limit) or []
+        # Gate and ordinary CCXT adapters already use their REST trade history here.
+        return self.exchange.fetch_my_trades(self.symbol, limit=limit) or []
+
+    def _fetch_authoritative_order(self, order_id: str) -> Dict[str, Any]:
+        """Fetch an order including exchange-specific completed-order fallbacks."""
+        fetch_order = getattr(self.exchange, 'fetch_order_authoritative', None)
+        if not callable(fetch_order):
+            fetch_order = getattr(self.exchange, 'fetch_order', None)
+        if not callable(fetch_order):
+            raise RuntimeError("exchange does not support authoritative order lookup")
+        return fetch_order(order_id, self.symbol) or {}
+
+    def _resolve_order_id_from_client_oid(self, client_oid: str) -> Optional[str]:
+        resolver = getattr(
+            self.exchange,
+            'fetch_order_by_client_id_authoritative',
+            None,
+        )
+        if not callable(resolver):
+            return None
+        expected_client_oid = str(client_oid or '').strip()
+        if not expected_client_oid:
+            return None
+        order = resolver(expected_client_oid, self.symbol) or {}
+        order_id, recovered_client_oid = self._entry_order_identity(order)
+        execution_order_id = self._entry_execution_order_id(order)
+        if not order_id:
+            raise RuntimeError("client order lookup returned no server order id")
+        if recovered_client_oid and recovered_client_oid != expected_client_oid:
+            raise RuntimeError("client order lookup returned a different client id")
+        return execution_order_id or order_id
+
+    def _authoritative_entry_order_ownership(
+        self,
+        order: Optional[Dict[str, Any]],
+        expected_order_id: str,
+    ) -> Optional[bool]:
+        """Check ownership when an authoritative order view exposes identity.
+
+        ``None`` means the exchange omitted client identity; callers retain the
+        existing strict trade/position checks for that legacy response.  An
+        explicit foreign identity is never accepted.  Trigger children inherit
+        ownership only through the verified parent and its ``trade_id`` link.
+        """
+        fetched_order_id, client_oid = self._entry_order_identity(order)
+        if fetched_order_id and fetched_order_id != str(expected_order_id).strip():
+            return False
+        info = (order or {}).get('info') or {}
+        initial = info.get('initial') if isinstance(info.get('initial'), dict) else {}
+        explicit_client_oid = str(
+            client_oid
+            or initial.get('text')
+            or info.get('text')
+            or ''
+        ).strip()
+        if explicit_client_oid:
+            return self._is_bot_entry_client_oid(explicit_client_oid)
+        if str((order or {}).get('type') or '').strip().lower() == 'trigger':
+            # No parent identity means there is no safe way to attribute a
+            # trigger-created child, even if me_order_id is present.
+            return False
+        return None
+
+    def _query_latest_entry_fill(
+        self,
+        position: Optional[Dict[str, Any]],
+        preferred_order_id: Optional[str] = None,
+        preferred_client_oid: Optional[str] = None,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Return (query_is_complete, recovered_fill)."""
+        position_info = (position or {}).get('info') or {}
+        raw_position_side = str(
+            (position or {}).get('side') or position_info.get('holdSide') or ''
+        ).lower()
+        if raw_position_side not in {'long', 'short'}:
+            print("⚠️ 真实持仓方向不明确，无法从成交记录恢复末次加仓价")
+            return False, None
+        side = raw_position_side
+        expected_trade_side = 'sell' if side == 'short' else 'buy'
+        position_open_ms = self._position_open_timestamp_ms(position)
+        cycle_tolerance_ms = 5000.0
+        preferred_id = str(preferred_order_id or '').strip()
+        preferred_client_id = str(preferred_client_oid or '').strip()
+        trade_limit = 60
+        try:
+            raw_trades = self._fetch_authoritative_my_trades(trade_limit)
+        except Exception as exc:
+            print(f"⚠️ 获取最近成交记录失败，无法确认末次加仓价: {exc}")
+            return False, None
+        raw_trades = sorted(
+            raw_trades,
+            key=lambda trade: self._safe_float(
+                trade.get('timestamp', (trade.get('info') or {}).get('cTime', 0)),
+                0.0,
+            ),
+        )
+
+        candidates: List[Dict[str, Any]] = []
+        seen_trade_ids = set()
+        for sequence, trade in enumerate(raw_trades):
+            info = trade.get('info') or {}
+            trade_id = str(trade.get('id') or info.get('tradeId') or '').strip()
+            if trade_id and trade_id in seen_trade_ids:
+                continue
+            if trade_id:
+                seen_trade_ids.add(trade_id)
+            trade_side = str(trade.get('side') or info.get('side') or '').lower()
+            if trade_side != expected_trade_side:
+                continue
+
+            reduce_only_value = trade.get('reduceOnly', info.get('reduceOnly', False))
+            if reduce_only_value is True or str(reduce_only_value).strip().lower() in {'1', 'true', 'yes'}:
+                continue
+            trade_side_detail = str(info.get('tradeSide') or '').lower()
+            if any(token in trade_side_detail for token in ('close', 'reduce', 'burst', 'delivery', 'adl')):
+                continue
+            trade_position_side = str(
+                trade.get('positionSide')
+                or trade.get('holdSide')
+                or info.get('positionSide')
+                or info.get('holdSide')
+                or ''
+            ).lower()
+            if trade_position_side in {'long', 'short'} and trade_position_side != side:
+                continue
+
+            price = self._safe_float(trade.get('price', info.get('priceAvg', info.get('price', 0))), 0.0)
+            amount = self._safe_float(
+                trade.get('amount', info.get('size', info.get('baseVolume', 0))),
+                0.0,
+            )
+            if price <= 0 or amount <= 0:
+                continue
+
+            order_id = str(
+                trade.get('order')
+                or trade.get('orderId')
+                or info.get('orderId')
+                or ''
+            ).strip()
+            trade_client_oid = str(
+                trade.get('clientOrderId')
+                or trade.get('clientOid')
+                or info.get('clientOid')
+                or info.get('clientOrderId')
+                or info.get('text')
+                or ''
+            ).strip()
+            if (
+                not order_id
+                or (preferred_id and order_id != preferred_id)
+                or (preferred_client_id and trade_client_oid != preferred_client_id)
+            ):
+                continue
+
+            timestamp_ms = self._safe_float(
+                trade.get('timestamp', info.get('cTime', info.get('uTime', 0))),
+                0.0,
+            )
+            if timestamp_ms <= 0:
+                continue
+            if (
+                position_open_ms > 0
+                and timestamp_ms + cycle_tolerance_ms < position_open_ms
+            ):
+                continue
+            candidates.append(
+                {
+                    'price': price,
+                    'amount': max(amount, 0.0),
+                    'order_id': order_id,
+                    'timestamp_ms': timestamp_ms,
+                    'sequence': sequence,
+                }
+            )
+
+        if not candidates:
+            if len(raw_trades) >= trade_limit:
+                print("⚠️ 成交查询窗口已满，无法证明目标订单从未成交")
+                return False, None
+            return True, None
+
+        latest = max(candidates, key=lambda row: (row['timestamp_ms'], row['sequence']))
+        latest_timestamp = latest['timestamp_ms']
+        latest_order_ids = {
+            row['order_id'] for row in candidates if row['timestamp_ms'] == latest_timestamp
+        }
+        if not preferred_id and not preferred_client_id and len(latest_order_ids) > 1:
+            print("⚠️ 最近时刻存在多个同方向开仓订单，无法唯一确定末次加仓")
+            return False, None
+        latest_order_id = latest['order_id']
+        same_order = (
+            [row for row in candidates if row['order_id'] == latest_order_id]
+            if latest_order_id
+            else [latest]
+        )
+        if len(raw_trades) >= trade_limit and min(row['sequence'] for row in same_order) == 0:
+            print("⚠️ 末次成交订单超出成交查询窗口，无法完整聚合部分成交")
+            return False, None
+        total_amount = sum(row['amount'] for row in same_order)
+        fill_price = sum(row['price'] * row['amount'] for row in same_order) / total_amount
+        latest_timestamp_ms = max(row['timestamp_ms'] for row in same_order)
+        return True, {
+            'price': fill_price,
+            'amount': total_amount,
+            'order_id': latest_order_id,
+            'timestamp_ms': latest_timestamp_ms,
+        }
+
+    def _fetch_latest_entry_fill(
+        self,
+        position: Optional[Dict[str, Any]],
+        preferred_order_id: Optional[str] = None,
+        preferred_client_oid: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        _, recovered = self._query_latest_entry_fill(
+            position,
+            preferred_order_id=preferred_order_id,
+            preferred_client_oid=preferred_client_oid,
+        )
+        return recovered
+
+    def _entry_order_fill_barrier(self, order_ids: List[str]) -> Optional[str]:
+        """Return a filled order id, empty string for no fill, or None if unknown."""
+        expected_ids = {str(order_id).strip() for order_id in order_ids if str(order_id).strip()}
+        if not expected_ids:
+            return None
+        trade_limit = 60
+        try:
+            trades = self._fetch_authoritative_my_trades(trade_limit)
+        except Exception as exc:
+            print(f"⚠️ 撤单后无法核对成交记录，禁止立即重挂: {exc}")
+            return None
+        for trade in trades:
+            info = trade.get('info') or {}
+            order_id = str(
+                trade.get('order')
+                or trade.get('orderId')
+                or info.get('orderId')
+                or ''
+            ).strip()
+            if order_id in expected_ids and self._safe_float(
+                trade.get('amount', info.get('size', info.get('baseVolume', 0.0))),
+                0.0,
+            ) > 0:
+                return order_id
+        if len(trades) >= trade_limit:
+            print("⚠️ 成交查询窗口已满，无法证明被撤订单没有边界成交，禁止立即重挂")
+            return None
+
+        zero_fill_canceled_order_id = str(
+            self.state.zero_fill_canceled_entry_order_id or ''
+        ).strip()
+        order_ids_requiring_lookup = set(expected_ids)
+        if not callable(
+            getattr(self.exchange, 'fetch_order_authoritative', None)
+            or getattr(self.exchange, 'fetch_order', None)
+        ):
+            print("⚠️ 交易所不支持按订单核对撤单终态，禁止立即重挂")
+            return None
+        for order_id in sorted(order_ids_requiring_lookup):
+            try:
+                order = self._fetch_authoritative_order(order_id)
+            except Exception as exc:
+                if order_id == zero_fill_canceled_order_id:
+                    # The persisted proof includes an explicit zero-fill cancel
+                    # response, disappearance from open orders and a complete trade
+                    # window. Gate may remove that terminal order from both views.
+                    continue
+                print(f"⚠️ 无法确认被撤订单 {order_id} 的最终状态，禁止立即重挂: {exc}")
+                return None
+            execution_order_id = self._entry_execution_order_id(order)
+            if execution_order_id:
+                for trade in trades:
+                    trade_info = trade.get('info') or {}
+                    trade_order_id = str(
+                        trade.get('order')
+                        or trade.get('orderId')
+                        or trade_info.get('orderId')
+                        or ''
+                    ).strip()
+                    if trade_order_id == execution_order_id and self._safe_float(
+                        trade.get(
+                            'amount',
+                            trade_info.get('size', trade_info.get('baseVolume', 0.0)),
+                        ),
+                        0.0,
+                    ) > 0:
+                        return execution_order_id
+                try:
+                    execution_order = self._fetch_authoritative_order(
+                        execution_order_id
+                    )
+                except Exception as exc:
+                    print(
+                        f"⚠️ Gate 条件单 {order_id} 已生成子订单 "
+                        f"{execution_order_id}，但无法确认子订单终态: {exc}"
+                    )
+                    return None
+                execution_status = str(
+                    execution_order.get('status') or ''
+                ).strip().lower()
+                execution_filled = self._safe_float(
+                    execution_order.get('filled', 0.0),
+                    0.0,
+                )
+                if execution_filled > 0 or execution_status in {'closed', 'filled'}:
+                    return execution_order_id
+                if execution_status not in {
+                    'canceled', 'cancelled', 'expired', 'rejected'
+                }:
+                    return None
+                continue
+            status = str(order.get('status') or '').strip().lower()
+            filled = self._safe_float(order.get('filled', 0.0), 0.0)
+            if str(order.get('type') or '').strip().lower() == 'trigger':
+                info = order.get('info') or {}
+                raw_outcome = str(
+                    info.get('finish_as')
+                    or info.get('reason')
+                    or info.get('status')
+                    or ''
+                ).strip().lower()
+                if (
+                    status in {'canceled', 'cancelled', 'expired', 'rejected'}
+                    or raw_outcome in {
+                        'canceled', 'cancelled', 'expired', 'failed', 'rejected'
+                    }
+                ):
+                    continue
+                # A closed auto parent without trade_id only describes the trigger
+                # lifecycle; it does not prove either a fill or a zero-fill cancel.
+                print(
+                    f"⚠️ Gate 条件单 {order_id} 终态缺少子订单 ID，禁止立即重挂"
+                )
+                return None
+            if filled > 0 or status in {'closed', 'filled'}:
+                return order_id
+            if status not in {'canceled', 'cancelled', 'expired', 'rejected'}:
+                print(
+                    f"⚠️ 被撤订单 {order_id} 终态不明确(status={status or 'unknown'})，"
+                    "禁止立即重挂"
+                )
+                return None
+        return ''
+
+    def _ensure_verified_last_fill_price(
+        self,
+        position: Optional[Dict[str, Any]],
+        *,
+        force_refresh: bool = False,
+        preferred_order_id: Optional[str] = None,
+        preferred_client_oid: Optional[str] = None,
+        expected_contract_delta: Optional[float] = None,
+        previously_accounted_fill_amount: float = 0.0,
+    ) -> bool:
+        if not force_refresh and self._has_verified_last_fill_price():
+            return True
+
+        # 一旦掌握订单 ID，就只能接受该订单的成交。退回到“最近同方向成交”
+        # 会把手工交易或其他策略订单误认成上一层成交，重新引入过近加仓风险。
+        resolved_preferred_order_id = str(preferred_order_id or '').strip()
+        preferred_client_id = str(preferred_client_oid or '').strip()
+        if not resolved_preferred_order_id and preferred_client_id:
+            try:
+                resolved_preferred_order_id = (
+                    self._resolve_order_id_from_client_oid(preferred_client_id) or ''
+                )
+            except Exception as exc:
+                print(f"⚠️ 无法用 clientOid 反查成交订单 ID: {exc}")
+        recovered = self._fetch_latest_entry_fill(
+            position,
+            preferred_order_id=resolved_preferred_order_id or None,
+            preferred_client_oid=(
+                preferred_client_id if not resolved_preferred_order_id else None
+            ),
+        )
+        if recovered is None and resolved_preferred_order_id:
+            # Gate records a triggered auto order under a parent ID, while fills
+            # belong to the ordinary child order in info.trade_id. Resolve that
+            # exact link before declaring the fill missing.
+            try:
+                trigger_order = self._fetch_authoritative_order(
+                    resolved_preferred_order_id
+                )
+                ownership = self._authoritative_entry_order_ownership(
+                    trigger_order,
+                    resolved_preferred_order_id,
+                )
+                if ownership is False:
+                    print("⚠️ 权威订单身份不属于机器人，拒绝采用其成交锚点")
+                    trigger_order = None
+                execution_order_id = self._entry_execution_order_id(trigger_order)
+            except Exception:
+                execution_order_id = ''
+            if execution_order_id:
+                parent_order_id = resolved_preferred_order_id
+                self._promote_trigger_execution_order_id(
+                    parent_order_id,
+                    execution_order_id,
+                )
+                resolved_preferred_order_id = execution_order_id
+                recovered = self._fetch_latest_entry_fill(
+                    position,
+                    preferred_order_id=execution_order_id,
+                )
+        if recovered is not None and resolved_preferred_order_id:
+            try:
+                authoritative_order = self._fetch_authoritative_order(
+                    resolved_preferred_order_id
+                )
+            except Exception:
+                # Some legacy adapters cannot retrieve completed orders after
+                # the trade history has settled; retain the existing strict
+                # order-id/side/amount evidence in that case.
+                authoritative_order = None
+            if authoritative_order is not None:
+                ownership = self._authoritative_entry_order_ownership(
+                    authoritative_order,
+                    resolved_preferred_order_id,
+                )
+                if ownership is False:
+                    print("⚠️ 权威订单身份不属于机器人，拒绝采用其成交锚点")
+                    recovered = None
+        if recovered is not None and expected_contract_delta is not None:
+            expected_delta = self._safe_float(expected_contract_delta, 0.0)
+            recovered_total = self._safe_float(recovered.get('amount'), 0.0)
+            accounted_amount = max(
+                self._safe_float(previously_accounted_fill_amount, 0.0),
+                0.0,
+            )
+            recovered_delta = recovered_total - accounted_amount
+            delta_tolerance = max(
+                abs(expected_delta) * 1e-8,
+                abs(recovered_total) * 1e-8,
+                1e-9,
+            )
+            if (
+                expected_delta < -delta_tolerance
+                or recovered_delta < -delta_tolerance
+                or abs(recovered_delta - expected_delta) > delta_tolerance
+            ):
+                print(
+                    "⚠️ 仓位增量与目标订单真实成交量不一致，"
+                    f"expected={expected_delta:.8f}, fillDelta={recovered_delta:.8f}；"
+                    "拒绝晋层并等待人工/交易所状态核对"
+                )
+                recovered = None
+        if recovered is not None:
+            return self._store_verified_last_fill(recovered)
+
+        invalidation_accounted_amount = 0.0
+        if resolved_preferred_order_id:
+            if (
+                str(self.state.unresolved_fill_order_id or '').strip()
+                == resolved_preferred_order_id
+            ):
+                invalidation_accounted_amount = self._safe_float(
+                    self.state.unresolved_fill_accounted_amount,
+                    0.0,
+                )
+            elif (
+                str(self.state.last_fill_order_id or '').strip()
+                == resolved_preferred_order_id
+                and str(self.state.last_fill_price_source or '').strip().lower()
+                == 'trade_history'
+            ):
+                invalidation_accounted_amount = self._safe_float(
+                    self.state.last_fill_amount,
+                    0.0,
+                )
+        with self.state_lock:
+            self.state.last_fill_price = 0.0
+            self.state.last_fill_time = ''
+            self.state.last_fill_order_id = ''
+            self.state.last_fill_amount = 0.0
+            self.state.last_fill_price_source = ''
+            self.state.unresolved_fill_order_id = resolved_preferred_order_id
+            self.state.unresolved_fill_accounted_amount = max(
+                invalidation_accounted_amount,
+                0.0,
+            )
+        self._save_runtime_state()
+        return False
+
+    def _store_verified_last_fill(self, recovered: Dict[str, Any]) -> bool:
+        price = self._safe_float(recovered.get('price'), 0.0)
+        amount = self._safe_float(recovered.get('amount'), 0.0)
+        order_id = str(recovered.get('order_id') or '').strip()
+        if price <= 0 or amount <= 0 or not order_id:
+            return False
+        with self.state_lock:
+            self.state.last_fill_price = price
+            self.state.last_fill_time = (
+                self._format_timestamp_ms(recovered.get('timestamp_ms')) or self._now_str()
+            )
+            self.state.last_fill_order_id = order_id
+            self.state.last_fill_amount = amount
+            self.state.last_fill_price_source = 'trade_history'
+            self.state.unresolved_fill_order_id = ''
+            self.state.unresolved_fill_accounted_amount = 0.0
+            if self.state.zero_fill_canceled_entry_order_id == order_id:
+                self.state.zero_fill_canceled_entry_order_id = ''
+        self._save_runtime_state()
+        print(
+            f"✅ 已从成交记录确认末次加仓价: {price:.8f}"
+            f" (orderId={order_id})"
+        )
+        return True
+
+    def _recover_single_layer_position_fill(
+        self,
+        position: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Strictly recover a lost first-layer fill without using position cost as an anchor.
+
+        This path is intentionally limited to layer 1.  A deeper position contains
+        several fills, so matching only the aggregate position cannot prove which
+        order was the most recent layer.  The recovered price always comes from
+        authoritative trade history; position entryPrice is only a consistency check.
+        """
+        if int(self.state.layer or 0) != 1 or not position:
+            return False
+
+        query_complete, recovered = self._query_latest_entry_fill(position)
+        if not query_complete or recovered is None:
+            return False
+
+        position_info = position.get('info') or {}
+        contracts = self._safe_float(
+            position.get('contracts', position_info.get('contracts', position_info.get('size', 0.0))),
+            0.0,
+        )
+        entry_price = self._safe_float(
+            position.get('entryPrice', position_info.get('openPriceAvg', 0.0)),
+            0.0,
+        )
+        fill_amount = self._safe_float(recovered.get('amount'), 0.0)
+        fill_price = self._safe_float(recovered.get('price'), 0.0)
+        fill_timestamp_ms = self._safe_float(recovered.get('timestamp_ms'), 0.0)
+        order_id = str(recovered.get('order_id') or '').strip()
+        position_open_ms = self._position_open_timestamp_ms(position)
+        amount_tolerance = max(abs(contracts) * 1e-8, 1e-9)
+        if (
+            contracts <= 0
+            or entry_price <= 0
+            or fill_amount <= 0
+            or fill_price <= 0
+            or not order_id
+            or abs(fill_amount - contracts) > amount_tolerance
+        ):
+            print("⚠️ 最近成交量无法与当前第1层仓位一一对应，拒绝自动恢复加仓锚点")
+            return False
+        if position_open_ms > 0 and fill_timestamp_ms + 5000.0 < position_open_ms:
+            print("⚠️ 最近机器人成交早于当前仓位周期，拒绝把旧周期成交恢复为加仓锚点")
+            return False
+
+        try:
+            step = self._safe_float((self._market().get('precision') or {}).get('price'), 0.0)
+        except Exception:
+            step = 0.0
+        if step >= entry_price:
+            step = 0.0
+        price_tolerance = max(abs(entry_price) * 1e-7, step * 0.51, 1e-12)
+        if abs(fill_price - entry_price) > price_tolerance:
+            print("⚠️ 最近成交价与当前第1层仓位不一致，拒绝自动恢复加仓锚点")
+            return False
+
+        if not callable(
+            getattr(self.exchange, 'fetch_order_authoritative', None)
+            or getattr(self.exchange, 'fetch_order', None)
+        ):
+            print("⚠️ 交易所不支持按订单复核首仓来源，拒绝自动恢复加仓锚点")
+            return False
+        try:
+            order = self._fetch_authoritative_order(order_id)
+        except Exception as exc:
+            print(f"⚠️ 无法复核首仓订单 {order_id}，拒绝自动恢复加仓锚点: {exc}")
+            return False
+
+        fetched_order_id, client_oid = self._entry_order_identity(order)
+        order_info = order.get('info') or {}
+        status = str(order.get('status') or order_info.get('status') or '').strip().lower()
+        order_side = str(order.get('side') or order_info.get('side') or '').strip().lower()
+        expected_side = 'sell' if str(position.get('side') or '').lower() == 'short' else 'buy'
+        order_filled = self._safe_float(
+            order.get('filled', order_info.get('filled', order_info.get('size', 0.0))),
+            0.0,
+        )
+        reduce_only_value = order.get('reduceOnly', order_info.get('reduceOnly', False))
+        is_reduce_only = (
+            reduce_only_value is True
+            or str(reduce_only_value).strip().lower() in {'1', 'true', 'yes'}
+        )
+        if (
+            fetched_order_id != order_id
+            or status not in {'closed', 'filled'}
+            or order_side != expected_side
+            or is_reduce_only
+            or abs(order_filled - fill_amount) > amount_tolerance
+            or not self._is_bot_entry_client_oid(client_oid)
+        ):
+            print("⚠️ 最近成交未通过机器人首仓订单身份校验，拒绝自动恢复加仓锚点")
+            return False
+
+        print("🔎 已通过成交、订单身份及第1层仓位三重校验，恢复真实首仓锚点")
+        return self._store_verified_last_fill(recovered)
+
     def _is_sane_pending_entry_price(self, price: float) -> bool:
         price = self._safe_float(price, 0.0)
         if price <= 0:
@@ -986,18 +1992,11 @@ class MartinBot:
         avg_price: float,
         pending_entry_price: Optional[float] = None,
     ) -> float:
-        candidates = [
-            self._safe_float(pending_entry_price, 0.0),
-            self._safe_float(self.state.last_fill_price, 0.0),
-            self._safe_float(avg_price, 0.0),
-            self._safe_float(current_price, 0.0),
-        ]
-        candidates = [value for value in candidates if value > 0]
-        if not candidates:
+        # 层间距只能锚定到已确认的上一层实际成交价。持仓均价、现价和待成交价
+        # 都不具备这个语义，尤其在价格反弹时会允许下一层越过上一层成交价。
+        if not self._has_verified_last_fill_price():
             return 0.0
-        if side == 'long':
-            return min(candidates)
-        return max(candidates)
+        return self._safe_float(self.state.last_fill_price, 0.0)
 
     def _enforce_layer_spacing(
         self,
@@ -1025,11 +2024,24 @@ class MartinBot:
             pending_entry_price=pending_entry_price,
         )
         if anchor_price <= 0:
-            return proposed_price
+            return 0.0
 
         if side == 'long':
             return min(proposed_price, anchor_price * (1 - spacing_ratio))
         return max(proposed_price, anchor_price * (1 + spacing_ratio))
+
+    def _is_add_order_plan_spacing_valid(self, plan: Dict[str, Any]) -> bool:
+        if not self._has_verified_last_fill_price():
+            return False
+        anchor_price = self._safe_float(self.state.last_fill_price, 0.0)
+        entry_price = self._safe_float(plan.get('execute_price', plan.get('entry_price', 0.0)), 0.0)
+        spacing_ratio = max(self._safe_float(plan.get('spacing_ratio', 0.0), 0.0), 0.0)
+        if anchor_price <= 0 or entry_price <= 0:
+            return False
+        tolerance = max(abs(anchor_price) * 1e-12, 1e-15)
+        if str(plan.get('side') or self.state.position_side or '').lower() == 'short':
+            return entry_price + tolerance >= anchor_price * (1 + spacing_ratio)
+        return entry_price <= anchor_price * (1 - spacing_ratio) + tolerance
 
     def _next_layer_trigger_ready(
         self,
@@ -1083,6 +2095,48 @@ class MartinBot:
         anchor_pending_price: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         position = position or self.get_active_position()
+        if not position or position is self._POSITION_API_ERROR:
+            print(f"⚠️ 无法确认真实持仓，跳过第{layer_num}层加仓计划")
+            return None
+        if layer_num > 1 and self._has_verified_last_fill_price():
+            if not self._guard_verified_anchor_for_position(position):
+                print(
+                    f"🛑 第{max(layer_num - 1, 1)}层成交锚点不属于当前持仓周期，"
+                    f"禁止生成第{layer_num}层加仓计划"
+                )
+                return None
+        if layer_num > 1 and not self._has_verified_last_fill_price():
+            exact_anchor_order_id = str(
+                self.state.unresolved_fill_order_id
+                or self.state.last_fill_order_id
+                or ''
+            ).strip()
+            exact_anchor_client_oid = ''
+            if (
+                not exact_anchor_order_id
+                and self.state.pending_layer <= self.state.layer
+            ):
+                exact_anchor_client_oid = str(
+                    self.state.pending_entry_client_oid or ''
+                ).strip()
+            # 深层仓位无法从聚合持仓反推出“上一层”的唯一成交。没有精确订单
+            # 身份时必须失败关闭，不能退回最近同向成交（可能是手工/其他策略）。
+            if not exact_anchor_order_id and not exact_anchor_client_oid:
+                print(
+                    f"🛑 第{max(layer_num - 1, 1)}层缺少精确成交订单身份，"
+                    f"禁止生成第{layer_num}层加仓计划"
+                )
+                return None
+            if not self._ensure_verified_last_fill_price(
+                position,
+                preferred_order_id=exact_anchor_order_id or None,
+                preferred_client_oid=exact_anchor_client_oid or None,
+            ):
+                print(
+                    f"🛑 无法确认第{max(layer_num - 1, 1)}层的真实成交价，"
+                    f"禁止生成第{layer_num}层加仓计划"
+                )
+                return None
         phase = self._current_phase(position, current_price=current_price)
         phase_cfg = self._phase_config(phase)
         if layer_num > phase_cfg['max_layers']:
@@ -1135,18 +2189,34 @@ class MartinBot:
         atr_value = self._safe_float((sr or {}).get('atr', 0.0), 0.0)
         if atr_value <= 0:
             atr_value, _ = self._extract_latest_atr(limit=80)
-        if source != "STRUCTURE":
-            entry_price = self._enforce_layer_spacing(
-                proposed_price=entry_price,
-                side=side,
-                layer_num=layer_num,
-                current_price=current_price,
-                avg_price=avg_price,
-                atr_value=atr_value,
-                pending_entry_price=anchor_pending_price,
-                phase=phase,
-            )
-        entry_price = self._price_to_precision(entry_price)
+        spacing_ratio = self._gap_ratio(
+            current_price=current_price,
+            atr_value=atr_value,
+            depth_scale=0.25,
+            layer_num=layer_num,
+            phase=phase,
+            kind='spacing',
+        )
+        entry_price = self._enforce_layer_spacing(
+            proposed_price=entry_price,
+            side=side,
+            layer_num=layer_num,
+            current_price=current_price,
+            avg_price=avg_price,
+            atr_value=atr_value,
+            pending_entry_price=anchor_pending_price,
+            phase=phase,
+        )
+        if entry_price <= 0:
+            print(f"🛑 第{layer_num}层缺少可靠成交锚点，禁止下单")
+            return None
+        spacing_anchor_price = self._safe_float(self.state.last_fill_price, 0.0)
+        entry_price = self._layer_price_to_safe_precision(
+            entry_price,
+            side,
+            spacing_anchor_price,
+            spacing_ratio,
+        )
 
         layer_multipliers = phase_cfg['layer_multipliers']
         phase_layer_index = self._resolve_phase_layer_index(phase_cfg, layer_num)
@@ -1189,6 +2259,8 @@ class MartinBot:
             'position': position,
             'side': side,
             'phase_layer_index': phase_layer_index,
+            'spacing_ratio': spacing_ratio,
+            'spacing_anchor_price': spacing_anchor_price,
         }
 
     def _log_add_order_plan(self, plan: Dict[str, Any]) -> None:
@@ -1249,38 +2321,127 @@ class MartinBot:
     def _submit_add_order_plan(self, plan: Dict[str, Any]) -> bool:
         layer_num = int(plan['layer_num'])
         try:
-            if self._exit_in_progress.is_set():
-                print(f"⚠️ 第{layer_num}层加仓下单前检测到平仓流程进行中，跳过本次挂单")
-                return False
-            if self.state.bot_state != "IN_STRATEGY" or self.state.layer <= 0:
-                print(
-                    f"⚠️ 当前运行态不允许部署第{layer_num}层加仓单: "
-                    f"bot_state={self.state.bot_state}, layer={self.state.layer}"
-                )
-                return False
-            if not self.get_active_position():
-                print(f"⚠️ 当前无持仓，跳过部署第{layer_num}层加仓单")
-                return False
-            if plan['trigger_price'] <= 0:
-                if not self._submit_entry_order(plan['order_side'], plan['amount'], plan['execute_price'], f"第{layer_num}层"):
+            # 与平仓流程共用同一把锁，确保“最终复核 -> 下单 -> 状态落盘”不会被
+            # 全平流程穿插。action_lock 是 RLock，普通限价单可安全复入
+            # _submit_entry_order()。
+            with self.action_lock:
+                if self._exit_in_progress.is_set():
+                    print(f"⚠️ 第{layer_num}层加仓下单前检测到平仓流程进行中，跳过本次挂单")
                     return False
-                print(f"✅ 第{layer_num}层加仓单已直接挂出")
-            else:
-                self.exchange.create_trigger_order(
-                    self.symbol,
-                    plan['order_side'],
-                    plan['amount'],
-                    plan['trigger_price'],
-                    price=plan['execute_price'],
-                    trigger_type=self.layer_trigger_type,
-                    order_type='limit',
-                )
-                print(f"✅ 第{layer_num}层条件加仓单已挂出")
-            self.state.phase = plan['phase']
-            self.state.pending_layer = max(self.state.layer, min(layer_num, self.max_layers))
-            self.state.pending_entry_price = plan['execute_price']
-            self.state.pending_entry_amount = plan['amount']
-            self._save_runtime_state()
+                if self.state.bot_state != "IN_STRATEGY" or self.state.layer <= 0:
+                    print(
+                        f"⚠️ 当前运行态不允许部署第{layer_num}层加仓单: "
+                        f"bot_state={self.state.bot_state}, layer={self.state.layer}"
+                    )
+                    return False
+                replaced_order_ids = [
+                    str(order_id).strip()
+                    for order_id in plan.get('replaced_entry_order_ids', [])
+                    if str(order_id).strip()
+                ]
+                if replaced_order_ids:
+                    boundary_fill_order_id: Optional[str] = ''
+                    for attempt in range(3):
+                        boundary_fill_order_id = self._entry_order_fill_barrier(
+                            replaced_order_ids
+                        )
+                        if boundary_fill_order_id is None or boundary_fill_order_id:
+                            break
+                        if attempt < 2:
+                            time.sleep(0.15)
+                    if boundary_fill_order_id is None:
+                        print("🛑 无法排除旧加仓单在撤单边界成交，拒绝立即重挂")
+                        return False
+                    if boundary_fill_order_id:
+                        with self.state_lock:
+                            self.state.last_fill_price = 0.0
+                            self.state.last_fill_time = ''
+                            self.state.last_fill_order_id = ''
+                            self.state.last_fill_amount = 0.0
+                            self.state.last_fill_price_source = ''
+                            self.state.unresolved_fill_order_id = boundary_fill_order_id
+                            self.state.unresolved_fill_accounted_amount = 0.0
+                        self._save_runtime_state()
+                        print(
+                            f"🛑 旧加仓单 {boundary_fill_order_id} 在撤单边界已有成交，"
+                            "已阻断重挂并等待仓位同步"
+                        )
+                        return False
+                if not self._is_add_order_plan_spacing_valid(plan):
+                    print(
+                        f"🛑 第{layer_num}层最终委托价未满足相对真实末次成交价的层间距，拒绝下单"
+                    )
+                    return False
+                active_position = self.get_active_position()
+                if not active_position or active_position is self._POSITION_API_ERROR:
+                    print(f"⚠️ 无法确认当前持仓，跳过部署第{layer_num}层加仓单")
+                    return False
+                expected_position = plan.get('position') or {}
+                expected_contracts = self._safe_float(expected_position.get('contracts', 0.0), 0.0)
+                active_contracts = self._safe_float(active_position.get('contracts', 0.0), 0.0)
+                contract_tolerance = max(abs(expected_contracts) * 1e-8, 1e-9)
+                expected_side = str(plan.get('side') or expected_position.get('side') or '').lower()
+                active_side = str(active_position.get('side') or '').lower()
+                if (
+                    expected_contracts <= 0
+                    or abs(active_contracts - expected_contracts) > contract_tolerance
+                    or active_side != expected_side
+                ):
+                    print(
+                        f"🛑 第{layer_num}层下单前持仓已变化 "
+                        f"({expected_side} {expected_contracts} -> {active_side} {active_contracts})，"
+                        "中止下单并等待重新同步成交"
+                    )
+                    return False
+                latest_open_orders = self.fetch_open_orders()
+                if latest_open_orders is None:
+                    print(f"🛑 第{layer_num}层下单前无法复核挂单列表，拒绝下单")
+                    return False
+                active_entry_orders = [
+                    order
+                    for order in latest_open_orders
+                    if not order.get('reduceOnly', False)
+                ]
+                if active_entry_orders:
+                    print(
+                        f"🛑 第{layer_num}层下单前又检测到 {len(active_entry_orders)} 个开仓挂单，"
+                        "拒绝重复提交"
+                    )
+                    return False
+                if plan['trigger_price'] <= 0:
+                    order_response = self._submit_entry_order(
+                        plan['order_side'],
+                        plan['amount'],
+                        plan['execute_price'],
+                        f"第{layer_num}层",
+                    )
+                    if order_response is None:
+                        return False
+                    print(f"✅ 第{layer_num}层加仓单已直接挂出")
+                else:
+                    order_response = self._create_trigger_order_idempotent(
+                        plan['order_side'],
+                        plan['amount'],
+                        plan['trigger_price'],
+                        price=plan['execute_price'],
+                        trigger_type=self.layer_trigger_type,
+                        order_type='limit',
+                    )
+                    print(f"✅ 第{layer_num}层条件加仓单已挂出")
+                order_id, client_oid = self._entry_order_identity(order_response)
+                submitted_amount = self._safe_float(order_response.get('amount'), plan['amount'])
+                if submitted_amount <= 0:
+                    submitted_amount = plan['amount']
+                with self.state_lock:
+                    self.state.phase = plan['phase']
+                    self.state.pending_layer = max(self.state.layer, min(layer_num, self.max_layers))
+                    self.state.pending_entry_price = plan['execute_price']
+                    self.state.pending_entry_amount = submitted_amount
+                    self.state.pending_entry_order_id = order_id
+                    self.state.pending_entry_client_oid = client_oid
+                    self.state.zero_fill_canceled_entry_order_id = ''
+                self._save_runtime_state()
+            # 快照可能触发多次网络读取，不能占用交易锁阻塞紧急平仓。
             self._write_live_snapshot(force=True, include_market=True)
             return True
         except Exception as e:
@@ -1464,6 +2625,13 @@ class MartinBot:
             return f"数量不一致({existing_amount} -> {plan['amount']})"
 
         existing_price = self._price_to_precision(self._safe_float(order.get('price', 0.0), 0.0))
+        existing_plan = dict(plan)
+        existing_plan['entry_price'] = existing_price
+        existing_plan['execute_price'] = existing_price
+        if not self._is_add_order_plan_spacing_valid(existing_plan):
+            return (
+                f"现有委托价 {existing_price:.2f} 未满足相对真实末次成交价的最小层间距"
+            )
         execute_delta = self._relative_price_delta(existing_price, plan['execute_price'])
         refresh_threshold = max(self._safe_float(self.structure_refresh_threshold, 0.0), 0.0)
 
@@ -1494,22 +2662,236 @@ class MartinBot:
             )
         return ""
 
+    def _cancel_response_confirms_zero_fill(
+        self,
+        target: Dict[str, Any],
+        response: Dict[str, Any],
+    ) -> bool:
+        if not isinstance(response, dict):
+            return False
+        target_order_id, _ = self._entry_order_identity(target)
+        response_order_id, _ = self._entry_order_identity(response)
+        if not target_order_id or response_order_id != target_order_id:
+            return False
+
+        info = response.get('info') or {}
+        status = str(response.get('status') or info.get('status') or '').strip().lower()
+        finish_as = str(
+            info.get('finish_as') or info.get('finishAs') or ''
+        ).strip().lower()
+        if status not in {'canceled', 'cancelled'} and finish_as not in {
+            'canceled',
+            'cancelled',
+        }:
+            return False
+
+        if str(target.get('type') or '').strip().lower() == 'trigger':
+            # A Gate auto order can create an ordinary child at the cancellation
+            # boundary.  Only an explicit trade_id=0 response proves that no child
+            # exists; absence of the parsed field is not enough.
+            has_execution_field = (
+                'trade_id' in info or 'trade_id_string' in info
+            )
+            if (
+                not has_execution_field
+                or self._entry_execution_order_id(response)
+            ):
+                return False
+
+        target_amount = self._safe_float(target.get('amount', 0.0), 0.0)
+        target_filled = self._safe_float(target.get('filled', 0.0), 0.0)
+        tolerance = max(abs(target_amount) * 1e-8, 1e-9)
+        if target_filled > tolerance:
+            return False
+
+        filled_is_known = response.get('filled') is not None
+        response_filled = self._safe_float(response.get('filled'), 0.0)
+        if not filled_is_known and info.get('filled') is not None:
+            filled_is_known = True
+            response_filled = self._safe_float(info.get('filled'), 0.0)
+
+        raw_size = abs(self._safe_float(info.get('size'), 0.0))
+        raw_left = abs(self._safe_float(info.get('left'), 0.0))
+        if not filled_is_known and raw_size > 0 and info.get('left') is not None:
+            filled_is_known = True
+            response_filled = max(raw_size - raw_left, 0.0)
+        if not filled_is_known or response_filled > tolerance:
+            return False
+
+        if response.get('remaining') is not None and target_amount > 0:
+            response_remaining = self._safe_float(response.get('remaining'), 0.0)
+            if response_remaining + tolerance < target_amount:
+                return False
+        elif raw_size > 0 and raw_left + tolerance < raw_size:
+            return False
+        return True
+
     def _cancel_entry_orders(self, orders: List[Dict[str, Any]]) -> bool:
         targets = [order for order in orders if not order.get('reduceOnly', False)]
         if not targets:
             return True
+        target_order_ids = {
+            self._entry_order_identity(order)[0]
+            for order in targets
+            if self._entry_order_identity(order)[0]
+        }
+        if len(target_order_ids) != len(targets):
+            print("🛑 加仓挂单缺少唯一 orderId，无法安全确认定向撤单终态")
+            return False
         cancel_fn = getattr(self.exchange, 'cancel_orders', None)
         if not callable(cancel_fn):
             print("⚠️ 交易所适配器不支持定向撤单，跳过加仓单重建")
             return False
         with self.action_lock:
             try:
-                cancel_fn(targets, self.symbol)
-                print(f"✅ 已撤销 {len(targets)} 个旧加仓挂单")
-                return True
+                cancel_result = cancel_fn(targets, self.symbol)
             except Exception as e:
                 print(f"⚠️ 定向撤销加仓挂单失败: {e}")
                 return False
+            cancel_responses = (
+                list(cancel_result)
+                if isinstance(cancel_result, (list, tuple))
+                else [cancel_result]
+                if isinstance(cancel_result, dict)
+                else []
+            )
+            response_by_order_id = {
+                self._entry_order_identity(response)[0]: response
+                for response in cancel_responses
+                if isinstance(response, dict) and self._entry_order_identity(response)[0]
+            }
+            zero_fill_response_ids = {
+                order_id
+                for order_id, target in (
+                    (self._entry_order_identity(target)[0], target) for target in targets
+                )
+                if order_id
+                and order_id in response_by_order_id
+                and self._cancel_response_confirms_zero_fill(
+                    target,
+                    response_by_order_id[order_id],
+                )
+            }
+            for attempt in range(1, 5):
+                if attempt > 1:
+                    time.sleep(0.15)
+                open_orders = self.fetch_open_orders()
+                if open_orders is None:
+                    continue
+                remaining_ids = {
+                    self._entry_order_identity(order)[0]
+                    for order in open_orders
+                    if not order.get('reduceOnly', False)
+                    and self._entry_order_identity(order)[0] in target_order_ids
+                }
+                if not remaining_ids:
+                    verified_zero_fill_ids = set()
+                    for target in targets:
+                        order_id, _ = self._entry_order_identity(target)
+                        if order_id not in zero_fill_response_ids:
+                            continue
+                        target_side = str(target.get('side') or '').strip().lower()
+                        position_side = 'long' if target_side == 'buy' else 'short'
+                        query_complete, recovered = self._query_latest_entry_fill(
+                            {'side': position_side},
+                            preferred_order_id=order_id,
+                        )
+                        if query_complete and recovered is None:
+                            verified_zero_fill_ids.add(order_id)
+                    tracked_order_id = str(
+                        self.state.pending_entry_order_id
+                        or self.state.unresolved_fill_order_id
+                        or ''
+                    ).strip()
+                    proof_order_id = (
+                        tracked_order_id
+                        if tracked_order_id in verified_zero_fill_ids
+                        else next(iter(verified_zero_fill_ids))
+                        if len(verified_zero_fill_ids) == 1
+                        else ''
+                    )
+                    if proof_order_id:
+                        with self.state_lock:
+                            self.state.zero_fill_canceled_entry_order_id = proof_order_id
+                        self._save_runtime_state()
+                        print(
+                            f"🔒 已记录零成交撤单终态: orderId={proof_order_id}"
+                        )
+                    print(f"✅ 已确认撤销 {len(targets)} 个旧加仓挂单")
+                    return True
+            print(
+                "🛑 撤单接口已返回，但旧加仓单仍未确认消失，禁止提交替代订单: "
+                f"{sorted(target_order_ids)}"
+            )
+            return False
+
+    def _retain_residual_fill_order(
+        self,
+        add_orders: List[Dict[str, Any]],
+        current_phase: str,
+        position: Optional[Dict[str, Any]],
+    ) -> bool:
+        foreign_orders = [
+            order for order in add_orders
+            if not order.get('reduceOnly', False)
+            and not self._is_owned_entry_order(order)
+        ]
+        if foreign_orders:
+            print("🛑 残余成交校准发现外来开仓单，禁止采用、撤销或重建")
+            return False
+        if self._has_verified_last_fill_price() and not self._guard_verified_anchor_for_position(
+            position
+        ):
+            print("🛑 残余订单锚点早于当前持仓周期，执行自有订单定向撤销并隔离")
+            if not self._cancel_entry_orders(add_orders):
+                print("⚠️ 旧残余订单尚未确认撤销，保持隔离并禁止重建")
+            return False
+        if not self._has_verified_last_fill_price():
+            return False
+        last_fill_order_id = str(self.state.last_fill_order_id or '').strip()
+        if not last_fill_order_id:
+            return False
+        residual_fill_orders = [
+            order
+            for order in add_orders
+            if self._entry_order_identity(order)[0] == last_fill_order_id
+        ]
+        if not residual_fill_orders:
+            return False
+
+        extra_orders = [
+            order
+            for order in add_orders
+            if self._entry_order_identity(order)[0] != last_fill_order_id
+        ]
+        if extra_orders:
+            print(
+                f"🛑 检测到残余成交单之外的 {len(extra_orders)} 个额外加仓单，"
+                "立即定向撤销并暂停部署下一层"
+            )
+            if not self._cancel_entry_orders(extra_orders):
+                print("⚠️ 额外加仓单尚未确认撤销，将继续阻断新加仓")
+
+        residual_order = residual_fill_orders[0]
+        residual_order_id, residual_client_oid = self._entry_order_identity(residual_order)
+        residual_layer = max(self.state.layer, self.state.pending_layer)
+        residual_price = self._pending_entry_price_from_orders(residual_fill_orders)
+        residual_amount = self._normalize_amount(
+            self._safe_float(residual_order.get('amount', 0.0), 0.0)
+        )
+        with self.state_lock:
+            self.state.pending_layer = residual_layer
+            self.state.pending_entry_price = residual_price
+            self.state.pending_entry_amount = residual_amount
+            self.state.pending_entry_order_id = residual_order_id
+            self.state.pending_entry_client_oid = residual_client_oid
+            self.state.last_phase = current_phase
+        self._save_runtime_state()
+        print(
+            f"⏳ 第{residual_layer}层订单仍有未成交部分，"
+            "继续等待同一订单完成，不提前部署下一层"
+        )
+        return True
 
     def _reconcile_active_entry_orders(
         self,
@@ -1519,6 +2901,15 @@ class MartinBot:
         position: Dict[str, Any],
         reason_prefix: str = "",
     ) -> bool:
+        _, foreign_orders = self._split_owned_entry_orders(
+            add_orders,
+            position.get('side'),
+        )
+        if foreign_orders:
+            print(
+                f"🛑 {reason_prefix}检测到外来同向开仓单，禁止撤销或重建"
+            )
+            return False
         anchor_pending_price = self._pending_entry_price_from_orders(add_orders)
         plan = self._build_add_order_plan(
             next_layer,
@@ -1527,10 +2918,22 @@ class MartinBot:
             anchor_pending_price=anchor_pending_price,
         )
         if plan is None:
+            print(f"🛑 {reason_prefix}无法确认安全层间距，撤销现有加仓挂单")
+            self._cancel_entry_orders(add_orders)
             return False
+        safe_plan = dict(plan)
         plan = self._stabilize_plan_amount_with_existing_entry(plan, add_orders)
         plan = self._stabilize_plan_with_existing_entry(plan, add_orders, current_price)
         plan = self._preserve_existing_entry_price_for_amount_rebuild(plan, add_orders, current_price)
+        if not self._is_add_order_plan_spacing_valid(plan):
+            print(
+                f"⚠️ {reason_prefix}旧挂单价格不满足真实成交间距，忽略价格粘性并采用安全新价"
+            )
+            plan = safe_plan
+        if not self._is_add_order_plan_spacing_valid(plan):
+            print(f"🛑 {reason_prefix}第{next_layer}层计划未通过最终间距校验")
+            self._cancel_entry_orders(add_orders)
+            return False
         if plan.get('sticky_amount_reason'):
             print(f"🧷 {reason_prefix}第{next_layer}层加仓数量保持不动: {plan['sticky_amount_reason']}")
         if plan.get('sticky_existing_price'):
@@ -1552,9 +2955,16 @@ class MartinBot:
             return True
 
         print(f"♻️ {reason_prefix}第{next_layer}层加仓挂单需要重建: {refresh_reason}")
+        replaced_order_ids = [
+            self._entry_order_identity(order)[0]
+            for order in add_orders
+            if self._entry_order_identity(order)[0]
+        ]
         if not self._cancel_entry_orders(add_orders):
             return False
-        return self._submit_add_order_plan(plan)
+        replacement_plan = dict(plan)
+        replacement_plan['replaced_entry_order_ids'] = replaced_order_ids
+        return self._submit_add_order_plan(replacement_plan)
 
     def _reconcile_startup_entry_orders(self) -> None:
         ok, position = self.enforce_exchange_position_sync(reason="启动校准")
@@ -1567,13 +2977,31 @@ class MartinBot:
             return
 
         position_side = str(position.get('side', '')).lower()
-        expected_order_side = 'buy' if position_side == 'long' else 'sell'
-        add_orders = [
-            order for order in open_orders
-            if not order.get('reduceOnly', False)
-            and str(order.get('side', '')).lower() == expected_order_side
-        ]
+        add_orders, foreign_orders = self._split_owned_entry_orders(
+            open_orders,
+            position_side,
+        )
+        if foreign_orders:
+            self._mark_state_sync_required(
+                "启动校准检测到外来同向开仓单"
+            )
+            print(
+                "🛑 启动校准发现外来同向开仓单，保留其原状并暂停重建: "
+                f"{[self._entry_order_identity(order)[0] or self._entry_order_identity(order)[1] for order in foreign_orders]}"
+            )
+            return
         if not add_orders:
+            if self._has_verified_last_fill_price() and not self._guard_verified_anchor_for_position(
+                position
+            ):
+                print("🛑 启动校准拒绝沿用早于当前持仓周期的成交锚点")
+            return
+        if self._retain_residual_fill_order(
+            add_orders,
+            self._current_phase(position),
+            position,
+        ):
+            print("⏳ 启动检查: 最近成交订单仍有未成交部分，等待该层完成")
             return
 
         current_price = self._live_price_from_ws(position, allow_rest=True)
@@ -1607,111 +3035,74 @@ class MartinBot:
 
         self.sync_state_with_exchange()
 
-    def _dynamic_tp_values(self, adx: float, volatility_pct: float) -> Tuple[float, float]:
-        leverage = max(float(self.leverage), 1.0)
-        fee_floor = max(2 * self.fee_rate * leverage, 0.0)
-        profit_floor = max(
-            self.trailing_min_close_profit_pct,
-            self.protective_stop_min_profit_pct,
+    def _dynamic_tp_values(
+        self,
+        adx: float = 0.0,
+        volatility_pct: float = 0.0,
+        layer: Optional[int] = None,
+    ) -> Tuple[float, float]:
+        """Return market-dynamic trailing values, tightened by confirmed layer."""
+        effective_layer = max(int(layer if layer is not None else self.state.layer), 1)
+        leverage = max(self._safe_float(getattr(self, 'leverage', 1.0), 1.0), 1.0)
+        fee_rate = max(self._safe_float(getattr(self, 'fee_rate', 0.0005), 0.0005), 0.0)
+        fee_floor = 2.0 * fee_rate * leverage
+        activation_floor = max(
+            self._safe_float(getattr(self, 'trailing_activation_min_pct', 0.005), 0.005),
+            self._safe_float(getattr(self, 'protective_stop_min_profit_pct', 0.005), 0.005),
             fee_floor + 0.001,
         )
-        # Let the activation threshold follow current trading costs and protection settings
-        # instead of pinning it to a fixed 3% floor.
-        base_threshold = max(fee_floor * 3.0, profit_floor * 2.4)
+        activation_cap = max(
+            self._safe_float(getattr(self, 'trailing_activation_max_pct', 0.01), 0.01),
+            activation_floor,
+        )
+        base_threshold = max(fee_floor * 1.5, activation_floor)
 
         if adx > 30:
             adx_multiplier = 1.5
-            trail_ratio = 0.4
+            market_drawdown_ratio = 0.25
         elif adx > 25:
             adx_multiplier = 1.2
-            trail_ratio = 0.45
+            market_drawdown_ratio = 0.28
         elif adx > 20:
             adx_multiplier = 1.0
-            trail_ratio = 0.5
+            market_drawdown_ratio = 0.31
         else:
             adx_multiplier = 0.7
-            trail_ratio = 0.6
+            market_drawdown_ratio = 0.35
 
         if volatility_pct > 0.03:
-            vol_multiplier = 1.3
+            volatility_multiplier = 1.3
         elif volatility_pct > 0.02:
-            vol_multiplier = 1.1
+            volatility_multiplier = 1.1
         elif volatility_pct > 0.01:
-            vol_multiplier = 1.0
+            volatility_multiplier = 1.0
         else:
-            vol_multiplier = 0.8
+            volatility_multiplier = 0.8
 
-        activate_pct = base_threshold * adx_multiplier * vol_multiplier
-        activate_pct = max(activate_pct, max(profit_floor, fee_floor * 1.5))
-        activate_pct = min(activate_pct, 0.15)
-        return activate_pct, trail_ratio
-
-    def _dynamic_partial_tp_targets(
-        self,
-        position: Optional[Dict[str, Any]] = None,
-        context: Optional[Dict[str, float]] = None,
-        current_profit_pct: Optional[float] = None,
-        best_profit_pct: Optional[float] = None,
-    ) -> Dict[str, float]:
-        side = self._position_side(position)
-        layer = max(int(self.state.layer), 1)
-        phase = self._current_phase(position, current_profit_pct=current_profit_pct)
-        risk_context = context or self._build_risk_context(position_side=side, layer=layer) or {}
-
-        adx = self._safe_float(risk_context.get('adx', 20.0), 20.0)
-        volatility_pct = self._safe_float(risk_context.get('volatility_pct', 0.02), 0.02)
-
-        if adx >= 30:
-            trend_mult = 1.20
-        elif adx >= 20:
-            trend_mult = 1.00
-        else:
-            trend_mult = 0.85
-
-        if volatility_pct > 0.03:
-            vol_mult = 1.25
-        elif volatility_pct > 0.015:
-            vol_mult = 1.05
-        else:
-            vol_mult = 0.90
-
-        if layer >= 4:
-            layer_mult = 0.88
-        elif layer == 3:
-            layer_mult = 0.95
-        else:
-            layer_mult = 1.00
-
-        phase_mult = 0.92 if phase == 'PHASE2' else 1.00
-        total_mult = trend_mult * vol_mult * layer_mult * phase_mult
-
-        leverage = max(float(self.leverage), 1.0)
-        profit_floor = max(
-            self.trailing_min_close_profit_pct,
-            self.protective_stop_min_profit_pct,
-            2 * self.fee_rate * leverage + 0.001,
+        market_activation = min(
+            max(base_threshold * adx_multiplier * volatility_multiplier, activation_floor),
+            activation_cap,
+        )
+        activation_layer_multiplier = self._layer_schedule_value(
+            getattr(self, 'trailing_activation_layer_multipliers', [1.0]),
+            effective_layer,
+            1.0,
+        )
+        # 只压缩高于交易成本地板的动态部分，避免深层目标低到连成本都覆盖不了。
+        activate_pct = activation_floor + (
+            (market_activation - activation_floor) * activation_layer_multiplier
         )
 
-        tp1_threshold = max(profit_floor, 0.04 * total_mult)
-        tp1_threshold = min(max(tp1_threshold, 0.015), 0.08)
-
-        tp2_threshold = max(tp1_threshold + 0.015, 0.07 * total_mult)
-        tp2_threshold = min(tp2_threshold, 0.14)
-
-        return {
-            'tp1_threshold': tp1_threshold,
-            'tp2_threshold': tp2_threshold,
-            'tp1_ratio': 0.30,
-            'tp2_ratio': 0.20,
-            'trend_mult': trend_mult,
-            'vol_mult': vol_mult,
-            'layer_mult': layer_mult,
-            'phase_mult': phase_mult,
-            'phase': phase,
-            'adx': adx,
-            'volatility_pct': volatility_pct,
-            'best_profit_pct': self._safe_float(best_profit_pct, self.state.best_profit_pct),
-        }
+        drawdown_layer_multiplier = self._layer_schedule_value(
+            getattr(self, 'trailing_drawdown_layer_multipliers', [1.0]),
+            effective_layer,
+            1.0,
+        )
+        trail_ratio = max(
+            self._safe_float(getattr(self, 'trailing_drawdown_min_ratio', 0.10), 0.10),
+            market_drawdown_ratio * drawdown_layer_multiplier,
+        )
+        return activate_pct, trail_ratio
 
     def _build_risk_context(self, position_side: Optional[str] = None, layer: Optional[int] = None) -> Optional[Dict[str, float]]:
         df = self.fetch_ohlcv_df(limit=80)
@@ -1725,14 +3116,18 @@ class MartinBot:
         current_price = self._safe_float(row['close'], 1)
         atr = self._safe_float(row['atr'], current_price * 0.02)
         volatility_pct = atr / current_price if current_price > 0 else 0.02
-        activate_pct, trail_ratio = self._dynamic_tp_values(adx, volatility_pct)
+        effective_side = (position_side or self.state.position_side or '').lower()
+        effective_layer = max(int(layer if layer is not None else self.state.layer), 1)
+        activate_pct, trail_ratio = self._dynamic_tp_values(
+            adx,
+            volatility_pct,
+            layer=effective_layer,
+        )
 
         window = min(30, len(df))
         recent_high = self._safe_float(df['high'].tail(window).max(), current_price)
         recent_low = self._safe_float(df['low'].tail(window).min(), current_price)
 
-        effective_side = (position_side or self.state.position_side or '').lower()
-        effective_layer = int(layer if layer is not None else self.state.layer)
         atr_multiplier = 4.0 if effective_layer < 4 else 3.0
 
         if effective_side == 'short':
@@ -1747,6 +3142,7 @@ class MartinBot:
             'atr': atr,
             'current_price': current_price,
             'volatility_pct': volatility_pct,
+            'layer': effective_layer,
             'activate_pct': activate_pct,
             'trail_ratio': trail_ratio,
             'recent_high': recent_high,
@@ -1873,9 +3269,15 @@ class MartinBot:
         ):
             return self._risk_context
 
-        context = self._build_risk_context(position_side=side, layer=layer)
+        try:
+            context = self._build_risk_context(position_side=side, layer=layer)
+        except Exception as exc:
+            print(f"⚠️ 刷新移动止盈指标失败，继续使用分层回撤保护: {exc}")
+            context = None
         if context is None:
-            return self._risk_context
+            # 旧层级/旧方向的 ATR 线不能带到新仓位；调用方会用当前层级的
+            # 激活阈值和回撤比例继续保护，只暂时跳过 ATR 条件。
+            return self._risk_context if self._risk_context_key == key else None
 
         self._risk_context = context
         self._risk_context_key = key
@@ -1908,18 +3310,31 @@ class MartinBot:
                 phase2_start_layer=raw.get('phase2_start_layer', 0),
                 pending_entry_price=raw.get('pending_entry_price', 0.0),
                 pending_entry_amount=raw.get('pending_entry_amount', 0.0),
+                pending_entry_order_id=raw.get('pending_entry_order_id', ""),
+                pending_entry_client_oid=raw.get('pending_entry_client_oid', ""),
                 last_fill_price=raw.get('last_fill_price', 0.0),
                 last_fill_time=raw.get('last_fill_time', ""),
+                last_fill_order_id=raw.get('last_fill_order_id', ""),
+                last_fill_amount=raw.get('last_fill_amount', 0.0),
+                last_fill_price_source=raw.get('last_fill_price_source', ""),
+                unresolved_fill_order_id=raw.get('unresolved_fill_order_id', ""),
+                unresolved_fill_accounted_amount=raw.get(
+                    'unresolved_fill_accounted_amount',
+                    0.0,
+                ),
+                zero_fill_canceled_entry_order_id=raw.get(
+                    'zero_fill_canceled_entry_order_id',
+                    "",
+                ),
                 protective_stop_active=raw.get('protective_stop_active', False),
                 protective_stop_order_id=raw.get('protective_stop_order_id', ""),
                 protective_stop_client_oid=raw.get('protective_stop_client_oid', ""),
                 protective_stop_price=raw.get('protective_stop_price', 0.0),
                 best_profit_pct=raw.get('best_profit_pct', 0.0),
+                active_trailing_drawdown_ratio=raw.get('active_trailing_drawdown_ratio', 0.0),
                 position_side=raw.get('position_side'),
                 last_known_contracts=raw.get('last_known_contracts', 0.0),
                 bot_state=raw.get('bot_state', 'IDLE'),
-                partial_tp_1_done=raw.get('partial_tp_1_done', False),
-                partial_tp_2_done=raw.get('partial_tp_2_done', False),
                 activated=raw.get('activated', False),
                 entry_price=raw.get('entry_price', 0.0),
                 initial_balance=raw.get('initial_balance', 0.0),
@@ -1938,22 +3353,37 @@ class MartinBot:
             print(f"⚠️ 加载状态失败: {e}")
 
     def _save_runtime_state(self):
-        with self.state_lock:
-            self.state.last_update = self._now_str()
-            payload = asdict(self.state)
-            payload['symbol'] = self.symbol
-        self._save_json(self.runtime_file, payload)
+        save_lock = getattr(self, 'runtime_save_lock', None)
+        if save_lock is None:
+            # 兼容测试或旧式 __new__ 构造；正式实例会在 __init__ 中预先创建。
+            save_lock = threading.Lock()
+            self.runtime_save_lock = save_lock
+        with save_lock:
+            with self.state_lock:
+                self.state.last_update = self._now_str()
+                payload = asdict(self.state)
+                payload['symbol'] = self.symbol
+            self._save_json(self.runtime_file, payload)
 
     def _reset_state(self):
-        self._clear_protective_stop(remote=True, force_all=True)
-        with self.state_lock:
-            self.state = RuntimeState(symbol=self.symbol)
-            self._last_risk_log_profit_pct = 0.0
-            self._risk_context = None
-            self._risk_context_at = 0.0
-            self._risk_context_key = None
-            self._last_risk_rest_position_at = 0.0
-        self._save_runtime_state()
+        with self.action_lock:
+            if not self._clear_protective_stop(remote=True, force_all=True):
+                if (
+                    self.state.protective_stop_active
+                    or self.state.protective_stop_order_id
+                    or self.state.protective_stop_client_oid
+                ):
+                    print("🛑 保护止损尚未确认撤销，保留运行态并拒绝重置为 IDLE")
+                    return False
+            with self.state_lock:
+                self.state = RuntimeState(symbol=self.symbol)
+                self._last_risk_log_profit_pct = 0.0
+                self._risk_context = None
+                self._risk_context_at = 0.0
+                self._risk_context_key = None
+                self._last_risk_rest_position_at = 0.0
+            self._save_runtime_state()
+            return True
 
     def _has_orphan_entry_orders(self, open_orders: List[Dict[str, Any]]) -> bool:
         non_reduce_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
@@ -1965,25 +3395,125 @@ class MartinBot:
             or self.state.pending_layer > 1
         )
 
+    def _is_owned_exit_order(self, order: Optional[Dict[str, Any]]) -> bool:
+        """Return whether an open exit/entry order may be canceled by this bot."""
+        if self._is_owned_entry_order(order):
+            return True
+        order_id, client_oid = self._entry_order_identity(order)
+        if (
+            order_id
+            and order_id == str(self.state.protective_stop_order_id or '').strip()
+        ):
+            return True
+        if (
+            client_oid
+            and client_oid == str(self.state.protective_stop_client_oid or '').strip()
+        ):
+            return True
+        return False
+
+    def _cancel_owned_open_orders(
+        self,
+        orders: List[Dict[str, Any]],
+    ) -> bool:
+        """Cancel only explicitly owned orders and verify their disappearance."""
+        targets = [order for order in orders if self._is_owned_exit_order(order)]
+        if not targets:
+            return True
+        cancel_fn = getattr(self.exchange, 'cancel_orders', None)
+        if not callable(cancel_fn):
+            cancel_one = getattr(self.exchange, 'cancel_order', None)
+            if not callable(cancel_one):
+                return False
+            cancel_fn = lambda rows, symbol: [
+                cancel_one(
+                    self._entry_order_identity(row)[0],
+                    symbol,
+                    {'trigger': str(row.get('type') or '').lower() == 'trigger'},
+                )
+                for row in rows
+            ]
+        try:
+            cancel_fn(targets, self.symbol)
+        except Exception as exc:
+            print(f"⚠️ 取消机器人自有挂单失败，进入隔离: {exc}")
+            return False
+        target_ids = {
+            self._entry_order_identity(order)[0]
+            for order in targets
+            if self._entry_order_identity(order)[0]
+        }
+        target_clients = {
+            self._entry_order_identity(order)[1]
+            for order in targets
+            if self._entry_order_identity(order)[1]
+        }
+        if not target_ids and not target_clients:
+            return False
+        for _ in range(4):
+            latest = self.fetch_open_orders()
+            if latest is None:
+                return False
+            remaining = [
+                order for order in latest
+                if (
+                    self._entry_order_identity(order)[0] in target_ids
+                    or self._entry_order_identity(order)[1] in target_clients
+                )
+            ]
+            if not remaining:
+                return True
+            time.sleep(0.15)
+        return False
+
     def _finalize_full_exit(self, reason: str = "") -> bool:
         prefix = f"{reason} " if reason else ""
-        cleared = False
+        orders_cleared = False
         for attempt in range(1, 4):
-            self.cancel_all_orders()
-            time.sleep(0.2)
             open_orders = self.fetch_open_orders()
             if open_orders is None:
                 print(f"⚠️ {prefix}全平后无法确认挂单状态，第 {attempt} 次清理未完成")
                 continue
             if not open_orders:
-                cleared = True
+                orders_cleared = True
                 break
+            foreign_orders = [
+                order for order in open_orders
+                if not self._is_owned_exit_order(order)
+            ]
+            owned_orders = [
+                order for order in open_orders
+                if self._is_owned_exit_order(order)
+            ]
+            if owned_orders and not self._cancel_owned_open_orders(owned_orders):
+                print(f"🛑 {prefix}机器人自有挂单未确认撤销，保留运行态")
+                self._write_live_snapshot(force=True, include_market=True)
+                return False
+            if foreign_orders:
+                print(
+                    f"🛑 {prefix}发现 {len(foreign_orders)} 个外来挂单，"
+                    "不执行全撤并保留运行态"
+                )
+                self._write_live_snapshot(force=True, include_market=True)
+                return False
+            time.sleep(0.2)
             print(f"⚠️ {prefix}全平后仍有 {len(open_orders)} 个挂单残留，第 {attempt} 次重试撤单")
-        self._reset_state()
+
+        if not orders_cleared:
+            print(f"🛑 {prefix}挂单未确认清空，保留运行态与订单身份，禁止重置为 IDLE")
+            self._write_live_snapshot(force=True, include_market=True)
+            return False
+
+        if not self._wait_for_position_close(0.0, timeout_sec=1.0):
+            print(f"🛑 {prefix}未连续确认仓位为零，保留运行态等待重试")
+            self._write_live_snapshot(force=True, include_market=True)
+            return False
+
+        if self._reset_state() is False:
+            self._write_live_snapshot(force=True, include_market=True)
+            return False
         self._write_live_snapshot(force=True, include_market=True)
-        if not cleared:
-            print(f"⚠️ {prefix}全平后挂单清理未完全确认，运行态已重置为 IDLE")
-        return cleared
+        return True
 
     def _snapshot_strategy(self, stream: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = {
@@ -2020,7 +3550,11 @@ class MartinBot:
             'protective_stop_trigger_type': self.protective_stop_trigger_type,
             'protective_stop_profit_lock_ratio': self.protective_stop_profit_lock_ratio,
             'protective_stop_min_profit_pct': self.protective_stop_min_profit_pct,
-            'trailing_min_close_profit_pct': self.trailing_min_close_profit_pct,
+            'trailing_activation_min_pct': self.trailing_activation_min_pct,
+            'trailing_activation_max_pct': self.trailing_activation_max_pct,
+            'trailing_drawdown_min_ratio': self.trailing_drawdown_min_ratio,
+            'trailing_activation_layer_multipliers': self.trailing_activation_layer_multipliers,
+            'trailing_drawdown_layer_multipliers': self.trailing_drawdown_layer_multipliers,
             'transport': (stream or {}).get('transport', 'rest'),
         }
         try:
@@ -2172,13 +3706,12 @@ class MartinBot:
         trend, signal = self._infer_signal(latest)
         support_resistance = self._quiet_call(self.find_support_resistance)
         context = self._build_risk_context(position_side=self.state.position_side, layer=self.state.layer)
-        activate_pct = context['activate_pct'] if context else 0.0
-        trail_ratio = context['trail_ratio'] if context else 0.5
-        live_position = self.get_active_position()
-        if live_position is self._POSITION_API_ERROR:
-            live_position = None
-        partial_targets = self._dynamic_partial_tp_targets(position=live_position, context=context)
-
+        fallback_activate_pct, fallback_trail_ratio = self._fallback_trailing_values_for_layer(self.state.layer)
+        activate_pct = context['activate_pct'] if context else fallback_activate_pct
+        trail_ratio = context['trail_ratio'] if context else fallback_trail_ratio
+        active_trail_ratio = self._safe_float(self.state.active_trailing_drawdown_ratio, 0.0)
+        if self.state.activated and active_trail_ratio > 0:
+            trail_ratio = min(trail_ratio, active_trail_ratio)
         return {
             'ticker': {
                 'last': self._safe_float(ticker.get('last', 0)),
@@ -2201,11 +3734,7 @@ class MartinBot:
                 'signal': signal,
                 'dynamic_tp_activate_pct': activate_pct * 100,
                 'dynamic_tp_trail_ratio': trail_ratio * 100,
-                'dynamic_partial_tp1_pct': partial_targets['tp1_threshold'] * 100,
-                'dynamic_partial_tp2_pct': partial_targets['tp2_threshold'] * 100,
-                'dynamic_partial_tp1_ratio': partial_targets['tp1_ratio'] * 100,
-                'dynamic_partial_tp2_ratio': partial_targets['tp2_ratio'] * 100,
-                'dynamic_partial_tp_phase': partial_targets['phase'],
+                'dynamic_tp_layer': max(int(self.state.layer), 1),
             },
             'support_resistance': support_resistance
             or {'current_price': self._safe_float(latest['close']), 'support': [], 'resistance': []},
@@ -2419,6 +3948,74 @@ class MartinBot:
             retry_amount = self._normalize_amount(current_amount * self.insufficient_balance_shrink_ratio)
         return retry_amount
 
+    def _new_client_order_id(self) -> str:
+        # Gate clientOrderId/text 最多 28 个字符；t- 前缀同时符合 Gate 的自定义
+        # text 约定。总长度 27，Bitget clientOid 也可直接接受。
+        return f"t-martin-{uuid.uuid4().hex[:18]}"
+
+    def _create_order_idempotent(
+        self,
+        order_type: str,
+        side: str,
+        amount: float,
+        price: Optional[float] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        order_params = dict(params or {})
+        client_oid = str(
+            order_params.get('clientOrderId')
+            or order_params.get('clientOid')
+            or self._new_client_order_id()
+        )
+        if not order_params.get('clientOrderId') and not order_params.get('clientOid'):
+            order_params['clientOrderId'] = client_oid
+        response = self.exchange.create_order(
+            self.symbol,
+            order_type,
+            side,
+            amount,
+            price,
+            order_params,
+        )
+        normalized = dict(response) if isinstance(response, dict) else {'raw': response}
+        normalized.setdefault('clientOrderId', client_oid)
+        normalized.setdefault('amount', amount)
+        return normalized
+
+    def _create_trigger_order_idempotent(
+        self,
+        side: str,
+        amount: float,
+        trigger_price: float,
+        *,
+        price: Optional[float],
+        trigger_type: str,
+        order_type: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        order_params = dict(params or {})
+        client_oid = str(
+            order_params.get('clientOrderId')
+            or order_params.get('clientOid')
+            or self._new_client_order_id()
+        )
+        if not order_params.get('clientOrderId') and not order_params.get('clientOid'):
+            order_params['clientOrderId'] = client_oid
+        response = self.exchange.create_trigger_order(
+            self.symbol,
+            side,
+            amount,
+            trigger_price,
+            price=price,
+            trigger_type=trigger_type,
+            order_type=order_type,
+            params=order_params,
+        )
+        normalized = dict(response) if isinstance(response, dict) else {'raw': response}
+        normalized.setdefault('clientOrderId', client_oid)
+        normalized.setdefault('amount', amount)
+        return normalized
+
     def _submit_entry_order(
         self,
         order_side: str,
@@ -2426,15 +4023,19 @@ class MartinBot:
         entry_price: float,
         label: str,
         order_type: str = 'limit',
-    ) -> bool:
+    ) -> Optional[Dict[str, Any]]:
         with self.action_lock:
             if self._exit_in_progress.is_set():
                 print(f"⚠️ {label} 下单前检测到平仓流程进行中，跳过本次挂单")
-                return False
+                return None
             try:
                 create_price = entry_price if order_type == 'limit' else None
-                self.exchange.create_order(self.symbol, order_type, order_side, amount, create_price)
-                return True
+                return self._create_order_idempotent(
+                    order_type,
+                    order_side,
+                    amount,
+                    create_price,
+                )
             except Exception as e:
                 if order_type == 'limit' and self._is_insufficient_balance_error(e):
                     retry_amount = self._calculate_retry_amount(amount, entry_price)
@@ -2443,8 +4044,12 @@ class MartinBot:
                             f"⚠️ {label} 下单时可用保证金不足，自动缩量重试: "
                             f"{amount:.6f} -> {retry_amount:.6f}"
                         )
-                        self.exchange.create_order(self.symbol, 'limit', order_side, retry_amount, entry_price)
-                        return True
+                        return self._create_order_idempotent(
+                            'limit',
+                            order_side,
+                            retry_amount,
+                            entry_price,
+                        )
                 raise
 
     def _has_pending_entry_order(self, side: str) -> bool:
@@ -2507,6 +4112,7 @@ class MartinBot:
             order for order in rows
             if not order.get('reduceOnly', False)
             and str(order.get('side', '')).lower() == wrong_side
+            and self._is_owned_entry_order(order)
         ]
 
     def _cancel_wrong_direction_entry_orders(
@@ -2527,6 +4133,61 @@ class MartinBot:
             return False
         print(f"✅ {reason_prefix}已撤销错误方向挂单")
         return True
+
+    def _prepare_position_side_change(
+        self,
+        previous_side: str,
+        exchange_side: str,
+        open_orders: List[Dict[str, Any]],
+        reason: str = "",
+    ) -> bool:
+        """Quarantine a direction change until every old entry order is terminal.
+
+        The old runtime identity must remain intact while cancellation is uncertain.
+        Otherwise a still-live long add order can later reduce or reverse a newly
+        observed short position (and vice versa) without the bot being able to track it.
+        """
+        reason_prefix = f"{reason}: " if reason else ""
+        if not self._cancel_wrong_direction_entry_orders(
+            exchange_side,
+            open_orders=open_orders,
+            reason=reason or "方向切换",
+        ):
+            self._mark_state_sync_required("方向切换时旧加仓挂单未确认撤销")
+            print(
+                f"🛑 {reason_prefix}旧方向加仓挂单尚未确认撤销，"
+                "保留原订单身份并暂停策略同步"
+            )
+            return False
+
+        tracked_order_id = str(
+            self.state.pending_entry_order_id
+            or self.state.unresolved_fill_order_id
+            or ''
+        ).strip()
+        tracked_client_oid = str(self.state.pending_entry_client_oid or '').strip()
+        if not tracked_order_id and not tracked_client_oid:
+            return True
+
+        resolution = self._resolve_missing_pending_entry_order(
+            {'side': previous_side}
+        )
+        if resolution in {'canceled_zero_fill', 'known_terminal'}:
+            self._clear_pending_entry_tracking(
+                reset_pending_layer=False,
+                clear_unresolved_order_id=tracked_order_id,
+            )
+            return True
+
+        self._mark_state_sync_required(
+            f"方向切换时旧订单终态不明确: {resolution}"
+        )
+        print(
+            f"🛑 {reason_prefix}检测到持仓方向 {previous_side} -> {exchange_side}，"
+            f"但旧订单 {tracked_order_id or tracked_client_oid} 的终态为 "
+            f"{resolution}；保留身份并暂停，禁止丢单后继续加仓"
+        )
+        return False
 
     def _force_sync_position_side(
         self,
@@ -2549,6 +4210,30 @@ class MartinBot:
                     f"exchange.position_side={exchange_side}，已以交易所为准修正"
                 )
                 self.state.position_side = exchange_side
+                # 方向变化代表旧策略周期身份已失效。旧 layer/pending_layer 绝不能
+                # 带入新方向，否则会用旧方向的待成交层级错误晋层。
+                self.state.layer = 0
+                self.state.pending_layer = 0
+                self.state.phase = 'PHASE1'
+                self.state.last_phase = 'PHASE1'
+                self.state.phase2_start_layer = 0
+                self.state.initial_balance = 0.0
+                self.state.best_profit_pct = 0.0
+                self.state.active_trailing_drawdown_ratio = 0.0
+                self.state.activated = False
+                self.state.last_known_contracts = 0.0
+                self.state.last_fill_price = 0.0
+                self.state.last_fill_time = ''
+                self.state.last_fill_order_id = ''
+                self.state.last_fill_amount = 0.0
+                self.state.last_fill_price_source = ''
+                self.state.unresolved_fill_order_id = ''
+                self.state.unresolved_fill_accounted_amount = 0.0
+                self.state.pending_entry_price = 0.0
+                self.state.pending_entry_amount = 0.0
+                self.state.pending_entry_order_id = ''
+                self.state.pending_entry_client_oid = ''
+                self.state.zero_fill_canceled_entry_order_id = ''
                 changed = True
             contracts = self._safe_float(position.get('contracts', 0))
             entry_price = self._safe_float(position.get('entryPrice', 0))
@@ -2577,19 +4262,45 @@ class MartinBot:
             self._write_live_snapshot(force=True, include_market=False)
             return False, None
 
+        if position:
+            exchange_side = str(position.get('side', '')).lower()
+            previous_side = str(self.state.position_side or '').lower()
+            side_changed = (
+                previous_side in {'long', 'short'}
+                and exchange_side in {'long', 'short'}
+                and previous_side != exchange_side
+            )
+            open_orders = self.fetch_open_orders()
+            if open_orders is None:
+                if side_changed:
+                    self._mark_state_sync_required(
+                        "方向切换时无法确认旧加仓挂单列表"
+                    )
+                    print(
+                        "🛑 检测到持仓方向变化，但挂单查询失败；"
+                        "保留旧订单身份并暂停本轮"
+                    )
+                    return False, position
+            elif side_changed:
+                if not self._prepare_position_side_change(
+                    previous_side,
+                    exchange_side,
+                    open_orders=open_orders,
+                    reason=reason or "方向校准",
+                ):
+                    return False, position
+            elif not self._cancel_wrong_direction_entry_orders(
+                exchange_side,
+                open_orders=open_orders,
+                reason=reason or "方向校准",
+            ):
+                self._mark_state_sync_required("错误方向挂单未确认撤销")
+                return False, position
         self._force_sync_position_side(
             position,
             reason=reason or "主循环校准",
             sync_contracts=sync_contracts,
         )
-        if position:
-            open_orders = self.fetch_open_orders()
-            if open_orders is not None:
-                self._cancel_wrong_direction_entry_orders(
-                    str(position.get('side', '')).lower(),
-                    open_orders=open_orders,
-                    reason=reason or "方向校准",
-                )
         return True, position
 
     def cancel_all_orders(self):
@@ -2623,8 +4334,8 @@ class MartinBot:
                 current_price = self._live_price_from_ws(position, allow_rest=True)
                 if current_price <= 0:
                     print("⚠️ 无法获取当前价格，回退到市价平仓")
-                    response = self.exchange.create_order(
-                        self.symbol, 'market', close_side, contracts, None,
+                    response = self._create_order_idempotent(
+                        'market', close_side, contracts, None,
                         {'reduceOnly': True}
                     )
                     print("✅ 市价平仓完成（回退）")
@@ -2645,8 +4356,7 @@ class MartinBot:
                     limit_price = base_price * (1 - slippage_pct)
 
                 print(f"\n--- 限价平仓 {contracts} | 当前价={current_price:.2f} | 限价={limit_price:.2f} | 滑点={slippage_pct*100:.2f}% ---")
-                response = self.exchange.create_order(
-                    self.symbol,
+                response = self._create_order_idempotent(
                     'limit',
                     close_side,
                     contracts,
@@ -2656,146 +4366,127 @@ class MartinBot:
                 order_id = response.get('id') if response else None
                 print(f"✅ 限价平仓单已挂出 (orderId={order_id})")
 
-                # 等待成交，最多等5秒
-                filled = self._wait_for_order_fill(order_id, timeout_sec=5.0)
-                if filled:
-                    print("✅ 限价平仓成交")
-                else:
-                    print("⚠️ 限价平仓未成交，尝试市价补单")
-                    # 撤掉未成交的限价单
-                    if order_id:
-                        try:
-                            self.exchange.cancel_order(order_id, self.symbol)
-                        except Exception:
-                            pass
-                    # 回退市价
-                    response = self.exchange.create_order(
-                        self.symbol, 'market', close_side, contracts, None,
-                        {'reduceOnly': True}
+                safe_to_supplement, remaining = self._resolve_limit_close_remainder(
+                    order_id,
+                    contracts,
+                    timeout_sec=5.0,
+                )
+                if not safe_to_supplement:
+                    print("🛑 限价平仓终态不明确，不盲目追加市价单")
+                    return response
+                if remaining > 0:
+                    latest_position = self.get_active_position()
+                    if latest_position is self._POSITION_API_ERROR:
+                        print("🛑 无法复核市价补单前仓位，不盲目追加")
+                        return response
+                    live_remaining = self._safe_float(
+                        (latest_position or {}).get('contracts', 0.0),
+                        0.0,
                     )
-                    print("✅ 市价补单完成")
+                    supplement = self._normalize_amount(min(remaining, live_remaining))
+                    if supplement > 0:
+                        response = self._create_order_idempotent(
+                            'market', close_side, supplement, None,
+                            {'reduceOnly': True}
+                        )
+                        print(f"✅ 市价补单完成: {supplement}")
+                else:
+                    print("✅ 限价平仓已完成，无需市价补单")
                 return response
             except Exception as e:
                 print(f"❌ 平仓失败: {e}")
                 return None
 
-    def _wait_for_order_fill(self, order_id: str, timeout_sec: float = 5.0) -> bool:
-        """等待限价单成交"""
+    def _wait_for_order_terminal(
+        self,
+        order_id: str,
+        timeout_sec: float = 5.0,
+    ) -> Optional[Dict[str, Any]]:
         if not order_id:
-            return False
+            return None
         deadline = time.time() + timeout_sec
+        latest: Optional[Dict[str, Any]] = None
         while time.time() < deadline:
             try:
-                order = self.exchange.fetch_order(order_id, self.symbol)
-                status = str(order.get('status', '')).lower()
-                if status in ('closed', 'filled'):
-                    return True
-                if status in ('canceled', 'cancelled', 'expired'):
-                    return False
+                latest = self.exchange.fetch_order(order_id, self.symbol) or {}
+                status = str(latest.get('status', '')).lower()
+                if status in {
+                    'closed', 'filled', 'canceled', 'cancelled', 'expired', 'rejected'
+                }:
+                    return latest
             except Exception:
                 pass
             time.sleep(0.3)
-        return False
+        return latest
 
-    def _wait_for_position_close(self, expected_contracts: float, timeout_sec: float = 3.0) -> bool:
+    def _wait_for_order_fill(self, order_id: str, timeout_sec: float = 5.0) -> bool:
+        """Backward-compatible full-fill check."""
+        order = self._wait_for_order_terminal(order_id, timeout_sec=timeout_sec)
+        return str((order or {}).get('status') or '').lower() in {'closed', 'filled'}
+
+    def _resolve_limit_close_remainder(
+        self,
+        order_id: str,
+        requested_amount: float,
+        timeout_sec: float = 5.0,
+    ) -> Tuple[bool, float]:
+        """Confirm a limit close terminal state and return its safe market remainder."""
+        if not order_id:
+            return False, 0.0
+        requested = max(self._safe_float(requested_amount, 0.0), 0.0)
+        snapshot = self._wait_for_order_terminal(order_id, timeout_sec=timeout_sec)
+        observed_filled = self._safe_float((snapshot or {}).get('filled', 0.0), 0.0)
+        status = str((snapshot or {}).get('status') or '').lower()
+        if status in {'closed', 'filled'}:
+            return True, 0.0
+
+        if status not in {'canceled', 'cancelled', 'expired', 'rejected'}:
+            try:
+                self.exchange.cancel_order(order_id, self.symbol)
+            except Exception as exc:
+                print(f"⚠️ 限价减仓单 {order_id} 撤单响应不确定，继续查询终态: {exc}")
+            final_snapshot = self._wait_for_order_terminal(order_id, timeout_sec=2.0)
+            if final_snapshot:
+                observed_filled = max(
+                    observed_filled,
+                    self._safe_float(final_snapshot.get('filled', 0.0), 0.0),
+                )
+                snapshot = final_snapshot
+                status = str(final_snapshot.get('status') or '').lower()
+
+        if status in {'closed', 'filled'}:
+            return True, 0.0
+        if status not in {'canceled', 'cancelled', 'expired', 'rejected'}:
+            return False, 0.0
+
+        observed_filled = min(max(observed_filled, 0.0), requested)
+        remaining = self._normalize_amount(max(requested - observed_filled, 0.0))
+        return True, remaining
+
+    def _wait_for_position_close(self, _expected_contracts: float, timeout_sec: float = 3.0) -> bool:
         deadline = time.time() + max(timeout_sec, 0.5)
-        target = self._safe_float(expected_contracts, 0.0)
+        empty_confirmations = 0
         while time.time() < deadline:
             latest = self.get_active_position()
+            if latest is self._POSITION_API_ERROR:
+                empty_confirmations = 0
+                time.sleep(0.2)
+                continue
             if not latest:
-                return True
+                empty_confirmations += 1
+                if empty_confirmations >= 2:
+                    return True
+                time.sleep(0.2)
+                continue
             remaining = self._safe_float(latest.get('contracts', 0.0), 0.0)
             if remaining <= 0:
-                return True
-            if target > 0 and remaining < max(target * 0.05, 0.01):
-                return True
+                empty_confirmations += 1
+                if empty_confirmations >= 2:
+                    return True
+            else:
+                empty_confirmations = 0
             time.sleep(0.2)
         return False
-
-    def _partial_close(self, position, ratio, reason):
-        with self.action_lock:
-            try:
-                contracts = self._safe_float(position.get('contracts', 0))
-                if contracts <= 0:
-                    return False
-
-                requested_amount = contracts * ratio
-                close_amount = self._normalize_amount(requested_amount)
-                if close_amount <= 0:
-                    market = self._market() or {}
-                    precision = market.get('precision') or {}
-                    limits = market.get('limits') or {}
-                    min_amount = self._safe_float((limits.get('amount') or {}).get('min'), 0.0)
-                    amount_step = self._safe_float(precision.get('amount'), 0.0)
-                    print(
-                        f"⚠️ {reason}: 平仓量过小，跳过 "
-                        f"(symbol={self.symbol}, contracts={contracts:.8f}, ratio={ratio:.4f}, "
-                        f"requested={requested_amount:.8f}, normalized={close_amount:.8f}, "
-                        f"min_amount={min_amount:.8f}, amount_step={amount_step:.8f})"
-                    )
-                    return False
-
-                side = 'buy' if str(position.get('side')).lower() == 'short' else 'sell'
-
-                # 限价分批平仓，防止滑点
-                current_price = self._live_price_from_ws(position, allow_rest=True)
-                if current_price > 0:
-                    slippage_pct = self._safe_float(
-                        self.config.get('close_slippage_pct', 0.001), 0.001
-                    )
-                    ticker = self.exchange.fetch_ticker(self.symbol)
-                    if side == 'buy':
-                        base_price = self._safe_float(ticker.get('ask', current_price), current_price)
-                        limit_price = base_price * (1 + slippage_pct)
-                    else:
-                        base_price = self._safe_float(ticker.get('bid', current_price), current_price)
-                        limit_price = base_price * (1 - slippage_pct)
-
-                    order_resp = self.exchange.create_order(
-                        self.symbol, 'limit', side, close_amount, limit_price,
-                        {'reduceOnly': True}
-                    )
-                    oid = order_resp.get('id') if order_resp else None
-                    print(f"📋 {reason}: 限价平仓 {close_amount} ({ratio*100:.0f}%) @ {limit_price:.2f}")
-                    # 等待成交
-                    filled = self._wait_for_order_fill(oid, timeout_sec=5.0)
-                    if not filled and oid:
-                        try:
-                            self.exchange.cancel_order(oid, self.symbol)
-                        except Exception:
-                            pass
-                        self.exchange.create_order(
-                            self.symbol, 'market', side, close_amount, None,
-                            {'reduceOnly': True}
-                        )
-                        print(f"⚠️ {reason}: 限价未成交，已市价补单")
-                    return True
-                else:
-                    self.exchange.create_order(
-                        self.symbol, 'market', side, close_amount, None,
-                        {'reduceOnly': True}
-                    )
-                    print(f"✅ {reason}: 市价平仓 {close_amount} ({ratio*100:.0f}%)（回退）")
-                    return True
-            except Exception as e:
-                print(f"❌ {reason} 失败: {e}")
-                return False
-
-    def _execute_partial_take_profit(self, position: Dict[str, Any], ratio: float, reason: str, state_flag: str) -> bool:
-        if self._exit_in_progress.is_set():
-            return False
-        live_position = self.get_active_position()
-        if live_position is self._POSITION_API_ERROR:
-            live_position = position  # fall back to passed-in position
-        else:
-            live_position = live_position or position
-        if not live_position:
-            return False
-        success = self._partial_close(live_position, ratio, reason)
-        if success:
-            self._set_runtime_flag(state_flag, True)
-            self._write_live_snapshot(force=True, include_market=False)
-        return success
 
     def _execute_exit_pipeline(self, reason: str, position: Optional[Dict[str, Any]] = None) -> bool:
         if self._exit_in_progress.is_set():
@@ -2807,21 +4498,57 @@ class MartinBot:
 
             self._exit_in_progress.set()
             try:
-                live_position = position or self.get_active_position()
-                if not live_position:
-                    self._finalize_full_exit(reason="未检测到持仓")
-                    return False
-
                 print(f"🎯 {reason}")
                 self._clear_protective_stop(remote=True, force_all=True)
-                open_orders = self.fetch_open_orders() or []
-                entry_orders = [order for order in open_orders if not order.get('reduceOnly', False)]
-                if entry_orders:
-                    self._cancel_entry_orders(entry_orders)
+                open_orders = self.fetch_open_orders()
+                if open_orders is None:
+                    print("🛑 平仓前无法读取挂单，拒绝全撤并进入隔离")
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return False
+                owned_orders = [
+                    order for order in open_orders
+                    if self._is_owned_exit_order(order)
+                ]
+                foreign_orders = [
+                    order for order in open_orders
+                    if not self._is_owned_exit_order(order)
+                ]
+                if owned_orders and not self._cancel_owned_open_orders(owned_orders):
+                    print("🛑 机器人自有挂单未确认撤销，拒绝继续平仓并进入隔离")
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return False
+                if foreign_orders:
+                    print(
+                        "🛑 平仓前发现外来挂单，保留其原状并进入隔离，"
+                        "不执行全撤回退"
+                    )
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return False
+
+                # 必须在拿到 action_lock 且完成撤单后重取仓位。调用方传入的快照
+                # 可能在等待锁期间因加仓成交而过期。
+                latest_position = self.get_active_position()
+                if latest_position is self._POSITION_API_ERROR:
+                    live_position = (
+                        position
+                        if position and position is not self._POSITION_API_ERROR
+                        else None
+                    )
+                    if live_position:
+                        print("⚠️ 平仓前实时仓位查询失败，暂按调用方快照下单；不会据此确认全平")
+                    else:
+                        print("🛑 平仓前无法获取任何可信仓位快照，本次不清除运行态")
+                        return False
+                else:
+                    live_position = latest_position
+
+                if not live_position:
+                    return self._finalize_full_exit(reason="未检测到持仓")
+
                 close_response = self.close_position(live_position)
                 closed = self._wait_for_position_close(self._safe_float(live_position.get('contracts', 0.0), 0.0))
                 if closed:
-                    self._finalize_full_exit(reason="平仓完成后")
+                    closed = self._finalize_full_exit(reason="平仓完成后")
                 elif close_response:
                     print("⚠️ 平仓单已提交，但短时间内未确认平仓，跳过全撤单以免撤掉减仓单")
                     self.sync_state_with_exchange()
@@ -3256,7 +4983,11 @@ class MartinBot:
         - 若已有实际成交价，仅检查候选结构位与 last_fill_price 的最小间距
         """
         last_sr = None
-        last_fill_price = self._safe_float(self.state.last_fill_price, 0.0)
+        last_fill_price = (
+            self._safe_float(self.state.last_fill_price, 0.0)
+            if self._has_verified_last_fill_price()
+            else 0.0
+        )
         pending_anchor_price = self._safe_float(pending_entry_price, 0.0)
         min_gap_ratio = max(self._phase_config(phase).get('layer_min_gap_pct', 0.0), 0.0)
 
@@ -3362,9 +5093,10 @@ class MartinBot:
     def calculate_dynamic_tp(self) -> Tuple[float, float]:
         context = self._build_risk_context()
         if context is None:
-            return 0.05, 0.5
+            return self._fallback_trailing_values_for_layer(self.state.layer)
         print(
-            f"📊 动态止盈: ADX={context['adx']:.1f} 波动率={context['volatility_pct']*100:.2f}% "
+            f"📊 动态移动止盈: 第{context['layer']}层 ADX={context['adx']:.1f} "
+            f"波动率={context['volatility_pct']*100:.2f}% "
             f"| 激活阈值={context['activate_pct']*100:.2f}% 回撤比例={context['trail_ratio']*100:.0f}%"
         )
         return context['activate_pct'], context['trail_ratio']
@@ -3432,71 +5164,53 @@ class MartinBot:
             return
 
         context = self._refresh_realtime_risk_context(position)
-        if context is None:
-            return
-
+        fallback_activate_pct, fallback_trail_ratio = self._fallback_trailing_values_for_layer(self.state.layer)
+        activate_pct = context['activate_pct'] if context else fallback_activate_pct
+        trail_ratio = context['trail_ratio'] if context else fallback_trail_ratio
         best_profit_pct = self.state.best_profit_pct
-        partial_targets = self._dynamic_partial_tp_targets(
-            position=position,
-            context=context,
-            current_profit_pct=current_profit_pct,
-            best_profit_pct=best_profit_pct,
-        )
-        if best_profit_pct < context['activate_pct']:
-            return
+        if not self.state.activated:
+            if best_profit_pct < activate_pct:
+                return
+            if self._set_runtime_flag('activated', True):
+                print(
+                    f"⚡ WS移动止盈已激活: 第{max(self.state.layer, 1)}层 "
+                    f"{best_profit_pct*100:.2f}% >= {activate_pct*100:.2f}%"
+                )
 
-        if not self.state.activated and self._set_runtime_flag('activated', True):
-            print(
-                f"⚡ WS移动止盈已激活: "
-                f"{best_profit_pct*100:.2f}% >= {context['activate_pct']*100:.2f}%"
-            )
+        # activated 是当前持仓周期内的粘性状态。即使后续指标上下文缺失、
+        # 配置阈值变化或利润回落，也必须继续执行回撤保护。
+        trail_ratio = self._tighten_active_trail_ratio(trail_ratio)
         self._arm_protective_stop(
             position,
             current_profit_pct=current_profit_pct,
             best_profit_pct=best_profit_pct,
+            trail_ratio=trail_ratio,
             reason="WS移动止盈激活",
         )
 
-        if best_profit_pct >= partial_targets['tp2_threshold'] and not self.state.partial_tp_2_done:
-            print(
-                f"🎯 WS分批止盈2: 浮盈 {best_profit_pct*100:.2f}% "
-                f">= 动态阈值 {partial_targets['tp2_threshold']*100:.2f}%，平仓20%"
-            )
-            if self._execute_partial_take_profit(position, partial_targets['tp2_ratio'], "分批止盈2", "partial_tp_2_done"):
-                return
-
-        if best_profit_pct >= partial_targets['tp1_threshold'] and not self.state.partial_tp_1_done:
-            print(
-                f"🎯 WS分批止盈1: 浮盈 {best_profit_pct*100:.2f}% "
-                f">= 动态阈值 {partial_targets['tp1_threshold']*100:.2f}%，平仓30%"
-            )
-            if self._execute_partial_take_profit(position, partial_targets['tp1_ratio'], "分批止盈1", "partial_tp_1_done"):
-                return
-
-        current_price = live_price or self._safe_float(position.get('markPrice', 0), context['current_price'])
+        current_price = live_price or self._safe_float(
+            position.get('markPrice', 0),
+            self._safe_float((context or {}).get('current_price', 0), 0.0),
+        )
         drawdown = best_profit_pct - current_profit_pct
-        max_drawdown = context['trail_ratio'] * best_profit_pct
-        if self.state.layer >= 4:
-            max_drawdown = min(max_drawdown, 0.035 if best_profit_pct > 0.10 else 0.05)
+        max_drawdown = trail_ratio * best_profit_pct
 
         if best_profit_pct > 0 and drawdown >= max_drawdown:
-            if not self._allow_trailing_close(position, current_profit_pct, "WS回撤保护", best_profit_pct):
-                return
             print(
                 f"🔴 WS回撤保护触发: 回撤 {drawdown*100:.2f}% "
-                f">= {max_drawdown*100:.2f}%"
+                f">= {max_drawdown*100:.2f}%（当前收益 {current_profit_pct*100:.2f}%）"
             )
             self._execute_exit_pipeline("WS 回撤保护触发，执行总平仓", position)
             return
 
+        if context is None:
+            return
         if self.state.position_side == 'short':
             should_close = current_price > context['trail_price']
         else:
             should_close = current_price < context['trail_price']
 
         if should_close:
-            if not self._allow_trailing_close(position, current_profit_pct, "WS ATR止盈", best_profit_pct):
-                return
             print(f"🎯 WS ATR止盈触发: {context['trail_desc']}, 当前价={current_price:.2f}")
             self._execute_exit_pipeline("WS ATR止盈触发，执行总平仓", position)
 
@@ -3524,55 +5238,55 @@ class MartinBot:
             self._update_best_profit(current_profit_pct, source="轮询")
 
             context = self._refresh_realtime_risk_context(position, force=True)
-            if context is None:
-                return False
-
-            activate_pct = context['activate_pct']
-            trail_ratio = context['trail_ratio']
-            print(
-                f"📊 动态止盈: ADX={context['adx']:.1f} 波动率={context['volatility_pct']*100:.2f}% "
-                f"| 激活阈值={activate_pct*100:.2f}% 回撤比例={trail_ratio*100:.0f}%"
-            )
-            partial_targets = self._dynamic_partial_tp_targets(
-                position=position,
-                context=context,
-                current_profit_pct=current_profit_pct,
-                best_profit_pct=self.state.best_profit_pct,
+            fallback_activate_pct, fallback_trail_ratio = self._fallback_trailing_values_for_layer(self.state.layer)
+            activate_pct = context['activate_pct'] if context else fallback_activate_pct
+            trail_ratio = context['trail_ratio'] if context else fallback_trail_ratio
+            if self.state.activated:
+                trail_ratio = self._tighten_active_trail_ratio(trail_ratio)
+            context_text = (
+                f"ADX={context['adx']:.1f} 波动率={context['volatility_pct']*100:.2f}%"
+                if context
+                else "K线指标暂不可用"
             )
             print(
-                f"📌 动态分批止盈: TP1>={partial_targets['tp1_threshold']*100:.2f}% 平30% "
-                f"| TP2>={partial_targets['tp2_threshold']*100:.2f}% 平20% "
-                f"| 阶段={partial_targets['phase']}"
+                f"📊 移动止盈: 第{max(self.state.layer, 1)}层 {context_text} "
+                f"| 激活阈值={activate_pct*100:.2f}% 允许回撤={trail_ratio*100:.0f}%"
             )
 
-            if self.state.best_profit_pct < activate_pct:
-                print(f"⏳ 等待激活: {self.state.best_profit_pct*100:.2f}% < {activate_pct*100:.2f}%")
-                return False
+            if not self.state.activated:
+                if self.state.best_profit_pct < activate_pct:
+                    print(
+                        f"⏳ 等待激活: {self.state.best_profit_pct*100:.2f}% "
+                        f"< {activate_pct*100:.2f}%"
+                    )
+                    return False
+                if self._set_runtime_flag('activated', True):
+                    print(
+                        f"⚡ 移动止盈已永久激活（本持仓周期）: "
+                        f"{self.state.best_profit_pct*100:.2f}% >= {activate_pct*100:.2f}%"
+                    )
+                trail_ratio = self._tighten_active_trail_ratio(trail_ratio)
 
-            self._set_runtime_flag('activated', True)
             self._arm_protective_stop(
                 position,
                 current_profit_pct=current_profit_pct,
                 best_profit_pct=self.state.best_profit_pct,
+                trail_ratio=trail_ratio,
                 reason="轮询移动止盈激活",
             )
 
-            # 分批止盈2
-            if self.state.best_profit_pct >= partial_targets['tp2_threshold'] and not self.state.partial_tp_2_done:
-                print(
-                    f"🎯 分批止盈2: 浮盈 {self.state.best_profit_pct*100:.2f}% "
-                    f">= 动态阈值 {partial_targets['tp2_threshold']*100:.2f}%，平仓20%"
-                )
-                self._execute_partial_take_profit(position, partial_targets['tp2_ratio'], "分批止盈2", "partial_tp_2_done")
-                return False
+            # 回撤保护
+            if self.state.best_profit_pct > 0:
+                drawdown = self.state.best_profit_pct - current_profit_pct
+                max_drawdown = trail_ratio * self.state.best_profit_pct
+                if drawdown >= max_drawdown:
+                    print(
+                        f"🔴 回撤保护触发: 回撤 {drawdown*100:.2f}% "
+                        f">= {max_drawdown*100:.2f}%（当前收益 {current_profit_pct*100:.2f}%）"
+                    )
+                    return True
 
-            # 分批止盈1
-            if self.state.best_profit_pct >= partial_targets['tp1_threshold'] and not self.state.partial_tp_1_done:
-                print(
-                    f"🎯 分批止盈1: 浮盈 {self.state.best_profit_pct*100:.2f}% "
-                    f">= 动态阈值 {partial_targets['tp1_threshold']*100:.2f}%，平仓30%"
-                )
-                self._execute_partial_take_profit(position, partial_targets['tp1_ratio'], "分批止盈1", "partial_tp_1_done")
+            if context is None:
                 return False
 
             should_close = (
@@ -3580,29 +5294,8 @@ class MartinBot:
                 if self.state.position_side == 'short'
                 else current_price < context['trail_price']
             )
-
             print(f"📊 {context['trail_desc']}, 当前价={current_price:.2f}")
-
-            # 回撤保护
-            if self.state.best_profit_pct > 0:
-                drawdown = self.state.best_profit_pct - current_profit_pct
-                max_drawdown = trail_ratio * self.state.best_profit_pct
-
-                if self.state.layer >= 4:
-                    max_drawdown = min(max_drawdown, 0.035 if self.state.best_profit_pct > 0.10 else 0.05)
-
-                if drawdown >= max_drawdown:
-                    if not self._allow_trailing_close(position, current_profit_pct, "回撤保护", self.state.best_profit_pct):
-                        return False
-                    print(
-                        f"🔴 回撤保护触发: 回撤 {drawdown*100:.2f}% "
-                        f">= {max_drawdown*100:.2f}%"
-                    )
-                    return True
-
             if should_close:
-                if not self._allow_trailing_close(position, current_profit_pct, "ATR止盈", self.state.best_profit_pct):
-                    return False
                 print(f"🎯 ATR止盈触发: {context['trail_desc']}")
                 return True
 
@@ -3635,9 +5328,6 @@ class MartinBot:
         if equity < self.min_balance:
             print("❌ 余额不足")
             return False
-
-        # 记住首仓时的余额作为基准，后续加仓基于此计算
-        self.state.initial_balance = equity
 
         order_side = 'sell' if trade_side.lower() == 'short' else 'buy'
 
@@ -3692,29 +5382,65 @@ class MartinBot:
             )
 
         try:
-            if not self._submit_entry_order(order_side, amount, entry_price, "首仓", order_type=entry_type):
-                return False
-            print("✅ 首仓挂单已挂出")
+            with self.action_lock:
+                if self._exit_in_progress.is_set():
+                    print("⚠️ 首仓最终提交前检测到平仓流程，跳过下单")
+                    return False
+                active_position = self.get_active_position()
+                if active_position is self._POSITION_API_ERROR:
+                    print("⚠️ 首仓最终提交前无法确认仓位，跳过下单")
+                    return False
+                if active_position:
+                    print("⚠️ 首仓最终提交前已检测到持仓，拒绝重复开仓")
+                    return False
+                latest_open_orders = self.fetch_open_orders()
+                if latest_open_orders is None or latest_open_orders:
+                    print("⚠️ 首仓最终提交前无法确认空挂单状态，拒绝重复开仓")
+                    return False
 
-            self.state.bot_state = "IN_STRATEGY"
-            self.state.position_side = trade_side.lower()
-            self.state.layer = 1
-            self.state.pending_layer = 1
-            self.state.best_profit_pct = 0.0
-            self.state.partial_tp_1_done = False
-            self.state.partial_tp_2_done = False
-            self.state.activated = False
-            self.state.entry_price = entry_price
-            self.state.pending_entry_price = 0.0 if entry_type == 'market' else entry_price
-            self.state.pending_entry_amount = amount
-            self.state.last_fill_price = 0.0
-            self.state.last_fill_time = ""
-            self.state.protective_stop_active = False
-            self.state.protective_stop_order_id = ""
-            self.state.protective_stop_client_oid = ""
-            self.state.protective_stop_price = 0.0
-            self.state.last_known_contracts = 0.0
-            self._save_runtime_state()
+                order_response = self._submit_entry_order(
+                    order_side,
+                    amount,
+                    entry_price,
+                    "首仓",
+                    order_type=entry_type,
+                )
+                if order_response is None:
+                    return False
+                print("✅ 首仓挂单已挂出")
+                order_id, client_oid = self._entry_order_identity(order_response)
+                submitted_amount = self._safe_float(order_response.get('amount'), amount)
+                if submitted_amount <= 0:
+                    submitted_amount = amount
+
+                with self.state_lock:
+                    self.state.bot_state = "IN_STRATEGY"
+                    self.state.position_side = trade_side.lower()
+                    self.state.layer = 1
+                    self.state.pending_layer = 1
+                    self.state.initial_balance = equity
+                    self.state.best_profit_pct = 0.0
+                    self.state.active_trailing_drawdown_ratio = 0.0
+                    self.state.activated = False
+                    self.state.entry_price = entry_price
+                    self.state.pending_entry_price = 0.0 if entry_type == 'market' else entry_price
+                    self.state.pending_entry_amount = submitted_amount
+                    self.state.pending_entry_order_id = order_id
+                    self.state.pending_entry_client_oid = client_oid
+                    self.state.last_fill_price = 0.0
+                    self.state.last_fill_time = ""
+                    self.state.last_fill_order_id = ""
+                    self.state.last_fill_amount = 0.0
+                    self.state.last_fill_price_source = ""
+                    self.state.unresolved_fill_order_id = ""
+                    self.state.unresolved_fill_accounted_amount = 0.0
+                    self.state.zero_fill_canceled_entry_order_id = ""
+                    self.state.protective_stop_active = False
+                    self.state.protective_stop_order_id = ""
+                    self.state.protective_stop_client_oid = ""
+                    self.state.protective_stop_price = 0.0
+                    self.state.last_known_contracts = 0.0
+                self._save_runtime_state()
             self._write_live_snapshot(force=True, include_market=True)
             return True
         except Exception as e:
@@ -3782,6 +5508,330 @@ class MartinBot:
 
         return self.max_layers
 
+    def _clear_pending_entry_tracking(
+        self,
+        reset_pending_layer: bool = True,
+        clear_unresolved_order_id: Optional[str] = None,
+    ) -> None:
+        changed = False
+        resolved_order_id = str(clear_unresolved_order_id or '').strip()
+        with self.state_lock:
+            if reset_pending_layer and self.state.pending_layer != self.state.layer:
+                self.state.pending_layer = self.state.layer
+                changed = True
+            for field_name, empty_value in (
+                ('pending_entry_price', 0.0),
+                ('pending_entry_amount', 0.0),
+                ('pending_entry_order_id', ''),
+                ('pending_entry_client_oid', ''),
+            ):
+                if getattr(self.state, field_name) != empty_value:
+                    setattr(self.state, field_name, empty_value)
+                    changed = True
+            if (
+                resolved_order_id
+                and str(self.state.unresolved_fill_order_id or '').strip() == resolved_order_id
+            ):
+                self.state.unresolved_fill_order_id = ''
+                self.state.unresolved_fill_accounted_amount = 0.0
+                changed = True
+            if (
+                resolved_order_id
+                and str(self.state.zero_fill_canceled_entry_order_id or '').strip()
+                == resolved_order_id
+            ):
+                self.state.zero_fill_canceled_entry_order_id = ''
+                changed = True
+        if changed:
+            self._save_runtime_state()
+
+    def _record_unresolved_entry_fill(
+        self,
+        order_id: str,
+        recovered: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        resolved_order_id = str(
+            (recovered or {}).get('order_id') or order_id or ''
+        ).strip()
+        with self.state_lock:
+            if (
+                resolved_order_id
+                and str(self.state.unresolved_fill_order_id or '').strip()
+                == resolved_order_id
+            ):
+                accounted_amount = self._safe_float(
+                    self.state.unresolved_fill_accounted_amount,
+                    0.0,
+                )
+            elif (
+                str(self.state.last_fill_order_id or '').strip() == resolved_order_id
+                and str(self.state.last_fill_price_source or '').strip().lower()
+                == 'trade_history'
+            ):
+                accounted_amount = self._safe_float(
+                    self.state.last_fill_amount,
+                    0.0,
+                )
+            else:
+                accounted_amount = 0.0
+            if recovered is not None:
+                self.state.last_fill_price = self._safe_float(recovered.get('price'), 0.0)
+                self.state.last_fill_time = (
+                    self._format_timestamp_ms(recovered.get('timestamp_ms')) or self._now_str()
+                )
+                self.state.last_fill_order_id = resolved_order_id
+                self.state.last_fill_amount = self._safe_float(recovered.get('amount'), 0.0)
+                self.state.last_fill_price_source = 'trade_history'
+            else:
+                self.state.last_fill_price = 0.0
+                self.state.last_fill_time = ''
+                self.state.last_fill_order_id = ''
+                self.state.last_fill_amount = 0.0
+                self.state.last_fill_price_source = ''
+            if resolved_order_id and not self.state.pending_entry_order_id:
+                self.state.pending_entry_order_id = resolved_order_id
+            self.state.unresolved_fill_order_id = resolved_order_id
+            self.state.unresolved_fill_accounted_amount = max(accounted_amount, 0.0)
+            if self.state.zero_fill_canceled_entry_order_id == resolved_order_id:
+                self.state.zero_fill_canceled_entry_order_id = ''
+        self._save_runtime_state()
+
+    def _resolve_missing_pending_entry_order(
+        self,
+        position: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Classify a pending entry that vanished from the open-order view.
+
+        Only a terminal cancellation plus an authoritative zero-fill query may release
+        the identity for replacement. Every uncertain or newly filled state is sticky.
+        """
+        pending_order_id = str(self.state.pending_entry_order_id or '').strip()
+        unresolved_order_id = str(self.state.unresolved_fill_order_id or '').strip()
+        # pending 是“下一层订单”，unresolved 是“可能已成交但尚未完成同步的订单”。
+        # 正常情况下二者相同；损坏 runtime 可能只剩 unresolved，因此也必须能
+        # 对它完成零成交终态核对，避免永久阻断。
+        order_id = pending_order_id or unresolved_order_id
+        pending_client_oid = str(self.state.pending_entry_client_oid or '').strip()
+        client_oid = (
+            pending_client_oid
+            if pending_order_id or not unresolved_order_id
+            else ''
+        )
+        if not order_id and not client_oid:
+            return 'none'
+        if not order_id and client_oid:
+            try:
+                resolved_order_id = self._resolve_order_id_from_client_oid(client_oid)
+            except Exception as exc:
+                print(f"⚠️ 无法用 clientOid 反查待成交订单 ID: {exc}")
+                resolved_order_id = None
+            if resolved_order_id:
+                order_id = resolved_order_id
+                pending_order_id = resolved_order_id
+                with self.state_lock:
+                    self.state.pending_entry_order_id = resolved_order_id
+                self._save_runtime_state()
+
+        position_info = (position or {}).get('info') or {}
+        side = str(
+            (position or {}).get('side')
+            or position_info.get('holdSide')
+            or self.state.position_side
+            or ''
+        ).lower()
+        query_complete = False
+        recovered: Optional[Dict[str, Any]] = None
+        if side in {'long', 'short'}:
+            query_complete, recovered = self._query_latest_entry_fill(
+                {'side': side},
+                preferred_order_id=order_id or None,
+                preferred_client_oid=client_oid if not order_id else None,
+            )
+        if not order_id and recovered is not None:
+            order_id = str(recovered.get('order_id') or '').strip()
+
+        if not order_id:
+            print("⚠️ 待成交订单只有 clientOid，无法证明其已零成交取消，保留身份等待同步")
+            return 'unknown'
+
+        previous_verified_amount = (
+            self._safe_float(self.state.last_fill_amount, 0.0)
+            if str(self.state.last_fill_order_id or '') == order_id
+            else 0.0
+        )
+        previous_accounted_amount = (
+            self._safe_float(self.state.unresolved_fill_accounted_amount, 0.0)
+            if str(self.state.unresolved_fill_order_id or '') == order_id
+            else 0.0
+        )
+        previous_known_amount = max(
+            previous_verified_amount,
+            previous_accounted_amount,
+            0.0,
+        )
+        recovered_amount = self._safe_float((recovered or {}).get('amount'), 0.0)
+        amount_tolerance = max(abs(previous_known_amount) * 1e-8, 1e-12)
+        pending_layer_unconfirmed = bool(
+            pending_order_id
+            and order_id == pending_order_id
+            and self.state.pending_layer > self.state.layer
+        )
+        has_new_trade_fill = bool(
+            recovered is not None
+            and recovered_amount > previous_known_amount + amount_tolerance
+        )
+        if has_new_trade_fill:
+            self._record_unresolved_entry_fill(order_id, recovered)
+            return 'filled_wait_position'
+
+        if not callable(
+            getattr(self.exchange, 'fetch_order_authoritative', None)
+            or getattr(self.exchange, 'fetch_order', None)
+        ):
+            print("⚠️ 交易所不支持按订单查询终态，保留待成交订单身份等待同步")
+            return 'unknown'
+        try:
+            order = self._fetch_authoritative_order(order_id)
+        except Exception as exc:
+            if (
+                query_complete
+                and recovered is None
+                and str(self.state.zero_fill_canceled_entry_order_id or '').strip()
+                == order_id
+            ):
+                return 'canceled_zero_fill'
+            print(f"⚠️ 无法确认待成交订单 {order_id} 的终态: {exc}")
+            return 'unknown'
+
+        if str(order.get('type') or '').strip().lower() == 'trigger':
+            execution_order_id = self._entry_execution_order_id(order)
+            if not execution_order_id:
+                info = order.get('info') or {}
+                raw_outcome = str(
+                    info.get('finish_as')
+                    or info.get('reason')
+                    or info.get('status')
+                    or ''
+                ).strip().lower()
+                status = str(order.get('status') or '').strip().lower()
+                if status in {'open', 'new', 'live', 'partially_filled'}:
+                    return 'open'
+                canceled_outcomes = {
+                    'canceled', 'cancelled', 'expired', 'failed', 'rejected'
+                }
+                if (
+                    query_complete
+                    and recovered is None
+                    and raw_outcome in canceled_outcomes
+                ):
+                    return 'canceled_zero_fill'
+                print(
+                    f"⚠️ Gate 条件单 {order_id} 已结束但缺少触发子订单 ID，"
+                    "无法判定为成交或零成交取消"
+                )
+                return 'unknown'
+
+            parent_order_id = order_id
+            self._promote_trigger_execution_order_id(
+                parent_order_id,
+                execution_order_id,
+            )
+            order_id = execution_order_id
+            if pending_order_id == parent_order_id:
+                pending_order_id = execution_order_id
+            if side in {'long', 'short'}:
+                query_complete, recovered = self._query_latest_entry_fill(
+                    {'side': side},
+                    preferred_order_id=execution_order_id,
+                )
+            previous_verified_amount = (
+                self._safe_float(self.state.last_fill_amount, 0.0)
+                if str(self.state.last_fill_order_id or '') == order_id
+                else 0.0
+            )
+            previous_accounted_amount = (
+                self._safe_float(
+                    self.state.unresolved_fill_accounted_amount,
+                    0.0,
+                )
+                if str(self.state.unresolved_fill_order_id or '') == order_id
+                else 0.0
+            )
+            previous_known_amount = max(
+                previous_verified_amount,
+                previous_accounted_amount,
+                0.0,
+            )
+            recovered_amount = self._safe_float(
+                (recovered or {}).get('amount'),
+                0.0,
+            )
+            amount_tolerance = max(
+                abs(previous_known_amount) * 1e-8,
+                1e-12,
+            )
+            pending_layer_unconfirmed = bool(
+                pending_order_id
+                and order_id == pending_order_id
+                and self.state.pending_layer > self.state.layer
+            )
+            if (
+                recovered is not None
+                and recovered_amount > previous_known_amount + amount_tolerance
+            ):
+                self._record_unresolved_entry_fill(order_id, recovered)
+                return 'filled_wait_position'
+            try:
+                order = self._fetch_authoritative_order(execution_order_id)
+            except Exception as exc:
+                print(
+                    f"⚠️ Gate 条件单 {parent_order_id} 已生成子订单 "
+                    f"{execution_order_id}，但无法确认子订单终态: {exc}"
+                )
+                return 'unknown'
+
+        status = str(order.get('status') or '').lower()
+        filled = self._safe_float(order.get('filled', 0.0), 0.0)
+        if filled > previous_known_amount + amount_tolerance:
+            self._record_unresolved_entry_fill(order_id, recovered)
+            return 'filled_wait_position'
+        if status in {'closed', 'filled'}:
+            if (
+                not pending_layer_unconfirmed
+                and previous_known_amount > 0
+                and (
+                    str(self.state.last_fill_order_id or '') == order_id
+                    or str(self.state.unresolved_fill_order_id or '') == order_id
+                )
+            ):
+                return 'known_terminal'
+            self._record_unresolved_entry_fill(order_id, recovered)
+            return 'filled_wait_position'
+        if status in {'canceled', 'cancelled', 'expired', 'rejected'}:
+            if not query_complete:
+                print(
+                    f"⚠️ 订单 {order_id} 虽显示 {status}，但成交历史不完整，"
+                    "禁止按零成交重挂"
+                )
+                return 'unknown'
+            if previous_known_amount > 0:
+                if (
+                    not pending_layer_unconfirmed
+                    and (
+                        str(self.state.last_fill_order_id or '') == order_id
+                        or str(self.state.unresolved_fill_order_id or '') == order_id
+                    )
+                ):
+                    return 'known_terminal'
+                self._record_unresolved_entry_fill(order_id, recovered)
+                return 'filled_wait_position'
+            return 'canceled_zero_fill'
+        return 'open' if status in {'open', 'new', 'live', 'partially_filled'} else 'unknown'
+
+    def _resolve_pending_entry_without_position(self) -> str:
+        """Backward-compatible wrapper for first-entry eventual consistency."""
+        return self._resolve_missing_pending_entry_order(position=None)
+
     def sync_state_with_exchange(self):
         position_ok, position = self._fetch_active_position()
         if not position_ok:
@@ -3799,9 +5849,76 @@ class MartinBot:
             contracts = self._safe_float(position.get('contracts', 0))
             side = str(position.get('side', '')).lower()
             entry_price = self._safe_float(position.get('entryPrice', 0))
-            self._force_sync_position_side(position, reason="sync_state_with_exchange")
+            previous_side = str(self.state.position_side or '').lower()
+            side_changed = previous_side in {'long', 'short'} and previous_side != side
+            previous_contracts = self._safe_float(self.state.last_known_contracts, 0.0)
+            contracts_increased = side_changed or contracts > previous_contracts + 1e-9
+            unresolved_fill_order_id = str(self.state.unresolved_fill_order_id or '').strip()
+            pending_order_id = str(self.state.pending_entry_order_id or '').strip()
+            recovery_order_id = str(
+                # 仓位增加时，下一层 pending 身份比旧锚点的 unresolved 身份更具体。
+                pending_order_id or unresolved_fill_order_id
+            )
+            recovery_client_oid = str(self.state.pending_entry_client_oid or '').strip()
+            has_recovery_identity = bool(recovery_order_id or recovery_client_oid)
+            recovery_pending_layer = int(self.state.pending_layer or 0)
             if orders_available:
-                self._cancel_wrong_direction_entry_orders(side, open_orders=open_orders, reason="状态同步")
+                owned_entry_orders, foreign_entry_orders = self._split_owned_entry_orders(
+                    open_orders,
+                    side,
+                )
+                if foreign_entry_orders:
+                    self._mark_state_sync_required(
+                        "状态同步检测到外来同向开仓单"
+                    )
+                    print(
+                        "🛑 检测到外来同向开仓单，保留其原状并暂停策略部署: "
+                        f"{[self._entry_order_identity(order)[0] or self._entry_order_identity(order)[1] for order in foreign_entry_orders]}"
+                    )
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return
+                non_reduce_orders = owned_entry_orders
+            if side_changed:
+                if not orders_available:
+                    self._mark_state_sync_required(
+                        "状态同步检测到方向变化，但无法确认旧加仓挂单"
+                    )
+                    print(
+                        "🛑 持仓方向已变化，但挂单查询失败；"
+                        "保留旧订单身份并暂停状态同步"
+                    )
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return
+                if not self._prepare_position_side_change(
+                    previous_side,
+                    side,
+                    open_orders,
+                    reason="状态同步",
+                ):
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return
+            elif orders_available and not self._cancel_wrong_direction_entry_orders(
+                side,
+                open_orders=open_orders,
+                reason="状态同步",
+            ):
+                self._mark_state_sync_required("状态同步时错误方向挂单未确认撤销")
+                self._write_live_snapshot(force=True, include_market=True)
+                return
+            # 成交价恢复成功前不能提前吞掉 contracts 增量，否则下一轮无法再推进 pending_layer。
+            self._force_sync_position_side(
+                position,
+                reason="sync_state_with_exchange",
+                sync_contracts=False,
+            )
+            if side_changed:
+                unresolved_fill_order_id = ''
+                pending_order_id = ''
+                recovery_order_id = ''
+                recovery_client_oid = ''
+                has_recovery_identity = False
+                recovery_pending_layer = 0
+            if orders_available:
                 expected_order_side = 'buy' if side == 'long' else 'sell'
                 non_reduce_orders = [
                     o for o in open_orders
@@ -3809,9 +5926,54 @@ class MartinBot:
                     and str(o.get('side', '')).lower() == expected_order_side
                 ]
 
+            # 兼容旧版 BUG 已造成的损坏态：只剩一个零成交下一层的 unresolved ID，
+            # 而正确的第1层锚点已被清空。Gate 对已取消普通单可能直接返回
+            # ORDER_NOT_FOUND，因此不能单靠 fetch_order 证明取消；这里要求完整成交
+            # 窗口中最新机器人首仓的成交量、方向、价格和当前第1层仓位全部吻合。
+            # 若 unresolved 订单有任何成交，它会成为最新同向成交并无法通过该校验。
+            if (
+                orders_available
+                and not non_reduce_orders
+                and unresolved_fill_order_id
+                and not pending_order_id
+                and not contracts_increased
+                and int(self.state.layer or 0) == 1
+            ):
+                if self._recover_single_layer_position_fill(position):
+                    unresolved_fill_order_id = ''
+                    recovery_order_id = ''
+                    has_recovery_identity = False
+
+            if (
+                orders_available
+                and not non_reduce_orders
+                and has_recovery_identity
+                and not contracts_increased
+            ):
+                resolving_order_id = pending_order_id or unresolved_fill_order_id
+                pending_resolution = self._resolve_missing_pending_entry_order(position)
+                if pending_resolution not in {'canceled_zero_fill', 'known_terminal'}:
+                    print(
+                        f"⏳ 待成交订单 {recovery_order_id or recovery_client_oid} 已从挂单列表消失，"
+                        "但尚未确认零成交取消或仓位同步；保留层级和订单身份"
+                    )
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return
+                self._clear_pending_entry_tracking(
+                    reset_pending_layer=True,
+                    clear_unresolved_order_id=resolving_order_id,
+                )
+                unresolved_fill_order_id = str(
+                    self.state.unresolved_fill_order_id or ''
+                ).strip()
+                pending_order_id = str(self.state.pending_entry_order_id or '').strip()
+                recovery_order_id = pending_order_id or unresolved_fill_order_id
+                recovery_client_oid = ''
+                has_recovery_identity = bool(recovery_order_id)
+                recovery_pending_layer = self.state.layer
+
             self.state.bot_state = "IN_STRATEGY"
             self.state.position_side = side
-            self.state.last_known_contracts = contracts
             self.state.entry_price = entry_price
 
             price = entry_price or self._safe_float(position.get('markPrice', 0))
@@ -3825,7 +5987,14 @@ class MartinBot:
                 print(f"📌 使用 runtime 中的 layer={self.state.layer}")
                 reference_balance = self._safe_float(self.state.initial_balance, 0.0) or balance
                 estimated = self.estimate_current_layer(contracts, price, reference_balance)
-                if estimated > self.state.layer:
+                if (
+                    estimated > self.state.layer
+                    and not (
+                        contracts_increased
+                        and recovery_order_id
+                        and recovery_pending_layer > self.state.layer
+                    )
+                ):
                     print(
                         f"⚠️ 检测到 runtime.layer={self.state.layer} 低于仓位规模估算层级 {estimated}，"
                         "已按只增不减原则修正"
@@ -3837,20 +6006,151 @@ class MartinBot:
                 self.state.layer = estimated
             self.state.phase = self._current_phase(position, current_price=price)
             self._repair_phase2_start_layer()
-            if orders_available:
-                self.state.pending_layer = (
-                    min(self.max_layers, self.state.layer + 1)
-                    if non_reduce_orders else self.state.layer
-                )
+            if orders_available and non_reduce_orders:
+                order_id, client_oid = self._entry_order_identity(non_reduce_orders[0])
+                verified_anchor_order_id = str(
+                    self.state.last_fill_order_id or ''
+                ).strip()
+                unresolved_order_id = str(
+                    self.state.unresolved_fill_order_id or ''
+                ).strip()
+                if order_id and order_id == unresolved_order_id:
+                    # The fill is known but its position delta is not fully visible
+                    # yet. Preserve the original target layer instead of inventing
+                    # another next layer from the still-open residual order.
+                    self.state.pending_layer = max(
+                        self.state.layer,
+                        recovery_pending_layer,
+                        self.state.pending_layer,
+                    )
+                elif (
+                    order_id
+                    and order_id == verified_anchor_order_id
+                    and self._has_verified_last_fill_price()
+                ):
+                    # Same order still has a residual after a partial fill. It belongs
+                    # to the current layer, not layer + 1.
+                    self.state.pending_layer = self.state.layer
+                else:
+                    self.state.pending_layer = min(
+                        self.max_layers,
+                        self.state.layer + 1,
+                    )
                 self.state.pending_entry_price = self._pending_entry_price_from_orders(non_reduce_orders)
-                self.state.pending_entry_amount = (
-                    self._normalize_amount(self._safe_float(non_reduce_orders[0].get('amount', 0.0), 0.0))
-                    if non_reduce_orders else 0.0
+                self.state.pending_entry_amount = self._normalize_amount(
+                    self._safe_float(non_reduce_orders[0].get('amount', 0.0), 0.0)
                 )
-            else:
+                self.state.pending_entry_order_id = order_id
+                self.state.pending_entry_client_oid = client_oid
+                self.state.zero_fill_canceled_entry_order_id = ''
+            elif orders_available and not has_recovery_identity:
+                self.state.pending_layer = self.state.layer
+                self.state.pending_entry_price = 0.0
+                self.state.pending_entry_amount = 0.0
+                self.state.pending_entry_order_id = ''
+                self.state.pending_entry_client_oid = ''
+                self.state.zero_fill_canceled_entry_order_id = ''
+            elif not orders_available:
                 print("⚠️ 挂单状态获取失败，本次仅同步持仓，不覆盖 pending 挂单状态")
-            if self.state.last_fill_price <= 0:
-                self.state.last_fill_price = entry_price
+            else:
+                print("⏳ 挂单已消失但待成交身份仍在，本次不覆盖 pending 状态")
+
+            # “上一层真实成交”和“下一层待成交订单”是两个独立身份：
+            # - 仓位未增加时，只能复核 last_fill_order_id；绝不能用 pending ID
+            #   查询上一层，否则零成交的下一层会清空正确锚点。
+            # - 仓位确认增加后，才使用 pending/unresolved ID 晋升新的成交锚点。
+            current_pending_order_id = str(self.state.pending_entry_order_id or '').strip()
+            current_unresolved_order_id = str(
+                self.state.unresolved_fill_order_id or ''
+            ).strip()
+            current_pending_client_oid = str(
+                self.state.pending_entry_client_oid or ''
+            ).strip()
+            confirmed_anchor_order_id = str(self.state.last_fill_order_id or '').strip()
+            preferred_fill_order_id = ''
+            preferred_fill_client_oid = ''
+            if contracts_increased and not side_changed:
+                preferred_fill_order_id = current_pending_order_id or current_unresolved_order_id
+                if not preferred_fill_order_id:
+                    preferred_fill_client_oid = current_pending_client_oid
+            elif not side_changed:
+                preferred_fill_order_id = confirmed_anchor_order_id or current_unresolved_order_id
+
+            if preferred_fill_order_id or preferred_fill_client_oid:
+                previously_accounted_fill_amount = 0.0
+                if (
+                    preferred_fill_order_id
+                    and current_unresolved_order_id == preferred_fill_order_id
+                ):
+                    previously_accounted_fill_amount = self._safe_float(
+                        self.state.unresolved_fill_accounted_amount,
+                        0.0,
+                    )
+                elif (
+                    preferred_fill_order_id
+                    and str(self.state.last_fill_order_id or '').strip()
+                    == preferred_fill_order_id
+                ):
+                    previously_accounted_fill_amount = self._safe_float(
+                        self.state.last_fill_amount,
+                        0.0,
+                    )
+                fill_ready = self._ensure_verified_last_fill_price(
+                    position,
+                    force_refresh=True,
+                    preferred_order_id=preferred_fill_order_id or None,
+                    preferred_client_oid=preferred_fill_client_oid or None,
+                    expected_contract_delta=(
+                        contracts - previous_contracts
+                        if contracts_increased and not side_changed
+                        else 0.0
+                        if (
+                            preferred_fill_order_id
+                            and (
+                                preferred_fill_order_id == current_unresolved_order_id
+                                or previously_accounted_fill_amount > 0
+                            )
+                        )
+                        else None
+                    ),
+                    previously_accounted_fill_amount=previously_accounted_fill_amount,
+                )
+            elif int(self.state.layer or 0) == 1:
+                # 仅用于修复已因旧版启动 BUG 丢失锚点的第1层状态。成交记录是
+                # 价格来源；仓位均价只做一致性核验，绝不作为加仓价格兜底。
+                fill_ready = self._recover_single_layer_position_fill(position)
+            else:
+                # 深层仓位没有精确订单身份时，最近同向成交可能来自手工交易或
+                # 其他策略，不能自动成为末层锚点。
+                with self.state_lock:
+                    self.state.last_fill_price = 0.0
+                    self.state.last_fill_time = ''
+                    self.state.last_fill_order_id = ''
+                    self.state.last_fill_amount = 0.0
+                    self.state.last_fill_price_source = ''
+                    self.state.unresolved_fill_accounted_amount = 0.0
+                fill_ready = False
+            if contracts_increased and fill_ready and recovery_pending_layer > self.state.layer:
+                self.state.layer = recovery_pending_layer
+                self.state.pending_layer = max(self.state.pending_layer, self.state.layer)
+            if not contracts_increased or fill_ready:
+                self.state.last_known_contracts = contracts
+            if fill_ready and non_reduce_orders and self.state.last_fill_order_id:
+                residual_order_ids = {
+                    self._entry_order_identity(order)[0] for order in non_reduce_orders
+                }
+                if self.state.last_fill_order_id in residual_order_ids:
+                    self.state.pending_layer = max(self.state.layer, recovery_pending_layer)
+            if not fill_ready:
+                print("🛑 无法从成交记录确认末次加仓价，暂停后续加仓")
+                if orders_available and non_reduce_orders:
+                    if self._cancel_entry_orders(non_reduce_orders):
+                        print(
+                            "✅ 已请求撤销缺少可靠间距锚点的加仓挂单；"
+                            "保留订单身份，待确认零成交终态后再允许重建"
+                        )
+                    else:
+                        print("⚠️ 无法撤销缺少可靠间距锚点的加仓挂单，请人工检查")
             self._save_runtime_state()
             self._write_live_snapshot(force=True, include_market=True)
 
@@ -3860,28 +6160,99 @@ class MartinBot:
                 print("⚠️ 挂单状态获取失败，保持当前状态，稍后重试")
                 self._write_live_snapshot(force=True, include_market=False)
                 return
+            owned_entry_orders, foreign_entry_orders = self._split_owned_entry_orders(
+                open_orders,
+                self.state.position_side,
+            )
+            if foreign_entry_orders:
+                self._mark_state_sync_required(
+                    "无仓状态检测到外来同向开仓单"
+                )
+                print(
+                    "🛑 无仓状态检测到外来开仓单，保留其原状并暂停首仓部署: "
+                    f"{[self._entry_order_identity(order)[0] or self._entry_order_identity(order)[1] for order in foreign_entry_orders]}"
+                )
+                self._write_live_snapshot(force=True, include_market=True)
+                return
+            non_reduce_orders = owned_entry_orders
+            if not open_orders and (
+                self.state.pending_entry_order_id or self.state.pending_entry_client_oid
+            ):
+                resolving_order_id = str(
+                    self.state.pending_entry_order_id
+                    or self.state.unresolved_fill_order_id
+                    or ''
+                ).strip()
+                pending_resolution = self._resolve_pending_entry_without_position()
+                if pending_resolution not in {'canceled_zero_fill', 'known_terminal'}:
+                    print(
+                        "⏳ 首仓挂单已从挂单列表消失，但尚未同时确认订单取消与空仓；"
+                        "保留订单身份等待交易所最终一致"
+                    )
+                    self._write_live_snapshot(force=True, include_market=True)
+                    return
+                self._clear_pending_entry_tracking(
+                    reset_pending_layer=True,
+                    clear_unresolved_order_id=resolving_order_id,
+                )
             if self._has_orphan_entry_orders(open_orders):
                 print("⚠️ 检测到无持仓孤儿挂单，执行撤单并重置运行态")
                 self._finalize_full_exit(reason="孤儿挂单清理")
                 return
-            if open_orders:
-                first_order = open_orders[0]
+            if non_reduce_orders:
+                entry_sides = [str(order.get('side') or '').lower() for order in non_reduce_orders]
+                if (
+                    len(non_reduce_orders) != 1
+                    or any(side not in {'buy', 'sell'} for side in entry_sides)
+                    or len(set(entry_sides)) != 1
+                ):
+                    print("🛑 无持仓时检测到多个或方向异常的开仓挂单，执行全撤并拒绝任选其一")
+                    self._finalize_full_exit(reason="无仓异常开仓单清理")
+                    return
+                first_order = non_reduce_orders[0]
                 self.state.bot_state = "IN_STRATEGY"
                 self.state.position_side = 'long' if first_order['side'] == 'buy' else 'short'
                 if self.state.layer == 0:
                     self.state.layer = 1
                 self.state.pending_layer = max(self.state.pending_layer, self.state.layer)
-                self.state.pending_entry_price = self._pending_entry_price_from_orders(open_orders)
+                self.state.pending_entry_price = self._pending_entry_price_from_orders(non_reduce_orders)
                 self.state.pending_entry_amount = self._normalize_amount(
-                    self._safe_float(open_orders[0].get('amount', 0.0), 0.0)
+                    self._safe_float(first_order.get('amount', 0.0), 0.0)
                 )
+                order_id, client_oid = self._entry_order_identity(first_order)
+                self.state.pending_entry_order_id = order_id
+                self.state.pending_entry_client_oid = client_oid
+                self.state.zero_fill_canceled_entry_order_id = ''
+                # 无持仓时这只能是新首仓周期；不得让旧周期的成交来源或 unresolved ID
+                # 覆盖当前首仓订单身份。
+                self.state.last_fill_price = 0.0
+                self.state.last_fill_time = ''
+                self.state.last_fill_order_id = ''
+                self.state.last_fill_amount = 0.0
+                self.state.last_fill_price_source = ''
+                self.state.unresolved_fill_order_id = ''
+                self.state.unresolved_fill_accounted_amount = 0.0
                 self._save_runtime_state()
                 self._write_live_snapshot(force=True, include_market=True)
-                print(f"✅ 同步挂单状态: {len(open_orders)} 个挂单, side={self.state.position_side}")
+                print(
+                    f"✅ 同步挂单状态: {len(non_reduce_orders)} 个开仓挂单, "
+                    f"side={self.state.position_side}"
+                )
             else:
-                self._reset_state()
-                self._write_live_snapshot(force=True, include_market=True)
-                print("✅ 同步为空仓空单状态")
+                has_strategy_cycle = bool(
+                    self.state.bot_state == 'IN_STRATEGY'
+                    or self.state.last_known_contracts > 0
+                    or self.state.layer > 0
+                    or self.state.initial_balance > 0
+                    or self.state.last_fill_order_id
+                )
+                if has_strategy_cycle:
+                    print("⏳ 检测到策略周期的一次空仓空单快照，连续复核后再重置")
+                    self._finalize_full_exit(reason="状态同步确认周期结束")
+                else:
+                    self._reset_state()
+                    self._write_live_snapshot(force=True, include_market=True)
+                    print("✅ 同步为空仓空单状态")
 
     # =========================================================
     # 主循环
@@ -3896,6 +6267,18 @@ class MartinBot:
         print(f"  Phase1 层数/倍率: {self.phase1_max_layers} / {self.phase1_layer_multipliers}")
         print(f"  Phase2 额外层数/倍率: {self.phase2_extra_layers} / {self.phase2_layer_multipliers}")
         print(f"  总最大层数: {self.max_layers}")
+        print(
+            f"  动态移动止盈范围: {self.trailing_activation_min_pct*100:.2f}%"
+            f" ~ {self.trailing_activation_max_pct*100:.2f}%"
+        )
+        print(
+            "  激活层数系数: "
+            + " / ".join(f"{value:.2f}" for value in self.trailing_activation_layer_multipliers)
+        )
+        print(
+            "  回撤层数系数: "
+            + " / ".join(f"{value:.2f}" for value in self.trailing_drawdown_layer_multipliers)
+        )
         print(
             f"  阶段切换: 亏损达到 {self.phase_switch_loss_pct*100:.2f}% "
             f"或层数达到 {self.phase_switch_layer}"
@@ -3986,26 +6369,75 @@ class MartinBot:
                                     reduced = previous_contracts - current_contracts
                                     print(f"🎉 检测到减仓成交: -{reduced:.6f}")
 
+                                fill_ready = True
+                                if current_contracts > previous_contracts:
+                                    fill_order_id = str(
+                                        self.state.pending_entry_order_id
+                                        or self.state.unresolved_fill_order_id
+                                        or ''
+                                    ).strip()
+                                    fill_client_oid = (
+                                        str(self.state.pending_entry_client_oid or '').strip()
+                                        if not fill_order_id
+                                        else ''
+                                    )
+                                    accounted_fill_amount = 0.0
+                                    if (
+                                        fill_order_id
+                                        and str(self.state.unresolved_fill_order_id or '').strip()
+                                        == fill_order_id
+                                    ):
+                                        accounted_fill_amount = self._safe_float(
+                                            self.state.unresolved_fill_accounted_amount,
+                                            0.0,
+                                        )
+                                    elif (
+                                        fill_order_id
+                                        and str(self.state.last_fill_order_id or '').strip()
+                                        == fill_order_id
+                                    ):
+                                        accounted_fill_amount = self._safe_float(
+                                            self.state.last_fill_amount,
+                                            0.0,
+                                        )
+                                    if fill_order_id or fill_client_oid:
+                                        fill_ready = self._ensure_verified_last_fill_price(
+                                            position,
+                                            force_refresh=True,
+                                            preferred_order_id=fill_order_id or None,
+                                            preferred_client_oid=fill_client_oid or None,
+                                            expected_contract_delta=(
+                                                current_contracts - previous_contracts
+                                            ),
+                                            previously_accounted_fill_amount=(
+                                                accounted_fill_amount
+                                            ),
+                                        )
+                                    elif previous_contracts <= 0 and self.state.layer == 1:
+                                        fill_ready = self._recover_single_layer_position_fill(position)
+                                    else:
+                                        fill_ready = False
+                                    if not fill_ready:
+                                        print(
+                                            "🛑 仓位已增加，但无法确认对应的真实成交价；"
+                                            "已失效旧锚点并暂停后续加仓"
+                                        )
+
                                 with self.state_lock:
-                                    self.state.last_known_contracts = current_contracts
-                                    if current_contracts > previous_contracts and previous_contracts <= 0 and self.state.last_fill_price <= 0:
-                                        filled_price = self._safe_float(self.state.pending_entry_price, 0.0)
-                                        if filled_price <= 0:
-                                            filled_price = reference_price
-                                        self.state.last_fill_price = filled_price
-                                        self.state.last_fill_time = self._now_str()
-                                        self.state.pending_entry_price = 0.0
-                                        self.state.pending_entry_amount = 0.0
-                                    if current_contracts > previous_contracts and self.state.pending_layer > self.state.layer:
+                                    if current_contracts <= previous_contracts or fill_ready:
+                                        self.state.last_known_contracts = current_contracts
+                                    if (
+                                        current_contracts > previous_contracts
+                                        and fill_ready
+                                        and self.state.pending_layer > self.state.layer
+                                    ):
                                         self.state.layer = self.state.pending_layer
-                                        filled_price = self._safe_float(self.state.pending_entry_price, 0.0)
-                                        if filled_price <= 0:
-                                            filled_price = reference_price
-                                        self.state.last_fill_price = filled_price
-                                        self.state.last_fill_time = self._now_str()
-                                        self.state.pending_entry_price = 0.0
-                                        self.state.pending_entry_amount = 0.0
-                                    elif current_contracts > previous_contracts and reference_price > 0 and reference_balance > 0:
+                                    elif (
+                                        current_contracts > previous_contracts
+                                        and fill_ready
+                                        and reference_price > 0
+                                        and reference_balance > 0
+                                    ):
                                         estimated_layer = self.estimate_current_layer(
                                             current_contracts,
                                             reference_price,
@@ -4018,13 +6450,13 @@ class MartinBot:
                                             )
                                             self.state.layer = estimated_layer
                                             self.state.pending_layer = max(self.state.pending_layer, estimated_layer)
-                                            self.state.last_fill_price = reference_price
-                                            self.state.last_fill_time = self._now_str()
-                                            self.state.pending_entry_price = 0.0
-                                            self.state.pending_entry_amount = 0.0
                                     if self.state.pending_layer < self.state.layer:
                                         self.state.pending_layer = self.state.layer
                                 self._save_runtime_state()
+                                if current_contracts > previous_contracts and not fill_ready:
+                                    self._write_live_snapshot(force=True, include_market=True)
+                                    time.sleep(self.loop_interval)
+                                    continue
 
                             if self._exit_in_progress.is_set():
                                 time.sleep(min(self.loop_interval, 2))
@@ -4039,12 +6471,61 @@ class MartinBot:
                                     print("⚠️ 当前无法确认挂单状态，先不补挂，下一轮再试")
                                     time.sleep(self.loop_interval)
                                     continue
+                                foreign_orders = [
+                                    order for order in open_orders
+                                    if not order.get('reduceOnly', False)
+                                    and not self._is_owned_entry_order(order)
+                                ]
+                                if foreign_orders:
+                                    self._mark_state_sync_required(
+                                        "主循环检测到外来开仓单"
+                                    )
+                                    print(
+                                        "🛑 主循环检测到外来开仓单，保留其原状并暂停部署: "
+                                        f"{[self._entry_order_identity(order)[0] or self._entry_order_identity(order)[1] for order in foreign_orders]}"
+                                    )
+                                    self._write_live_snapshot(force=True, include_market=True)
+                                    time.sleep(self.loop_interval)
+                                    continue
                                 add_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
                                 phase_changed = current_phase != str(self.state.last_phase or current_phase).upper()
                                 if phase_changed:
                                     print(
                                         f"🧭 运行中阶段切换: {self.state.last_phase or 'UNKNOWN'} -> {current_phase}，"
                                         "检查并按新阶段参数重建加仓挂单"
+                                    )
+                                if self._retain_residual_fill_order(
+                                    add_orders,
+                                    current_phase,
+                                    position,
+                                ):
+                                    self._write_live_snapshot(force=False, include_market=True)
+                                    time.sleep(self.loop_interval)
+                                    continue
+                                if not add_orders and (
+                                    self.state.pending_entry_order_id
+                                    or self.state.pending_entry_client_oid
+                                ):
+                                    resolving_order_id = str(
+                                        self.state.pending_entry_order_id
+                                        or self.state.unresolved_fill_order_id
+                                        or ''
+                                    ).strip()
+                                    pending_resolution = self._resolve_missing_pending_entry_order(position)
+                                    if pending_resolution not in {
+                                        'canceled_zero_fill',
+                                        'known_terminal',
+                                    }:
+                                        print(
+                                            "⏳ 待成交加仓单已从挂单列表消失，"
+                                            "保留订单身份并等待成交/仓位最终一致"
+                                        )
+                                        self._write_live_snapshot(force=True, include_market=True)
+                                        time.sleep(self.loop_interval)
+                                        continue
+                                    self._clear_pending_entry_tracking(
+                                        reset_pending_layer=True,
+                                        clear_unresolved_order_id=resolving_order_id,
                                     )
                                 target_pending_layer = (
                                     min(self.max_layers, self.state.layer + 1)
@@ -4078,7 +6559,11 @@ class MartinBot:
                                             reason_prefix=reason_prefix,
                                         )
                                         open_orders = self.fetch_open_orders() or []
-                                        add_orders = [o for o in open_orders if not o.get('reduceOnly', False)]
+                                        add_orders = [
+                                            o for o in open_orders
+                                            if not o.get('reduceOnly', False)
+                                            and self._is_owned_entry_order(o)
+                                        ]
                                     if phase_changed:
                                         self._set_runtime_flag('last_phase', current_phase)
                                     pending_price = self._pending_entry_price_from_orders(add_orders)
@@ -4088,6 +6573,11 @@ class MartinBot:
                                         pending_amount = self._normalize_amount(self._safe_float(add_orders[0].get('amount', 0.0), 0.0))
                                         if abs(pending_amount - self.state.pending_entry_amount) > 1e-9:
                                             self._set_runtime_flag('pending_entry_amount', pending_amount)
+                                        pending_order_id, pending_client_oid = self._entry_order_identity(add_orders[0])
+                                        if pending_order_id != self.state.pending_entry_order_id:
+                                            self._set_runtime_flag('pending_entry_order_id', pending_order_id)
+                                        if pending_client_oid != self.state.pending_entry_client_oid:
+                                            self._set_runtime_flag('pending_entry_client_oid', pending_client_oid)
                                     trigger_orders = [o for o in add_orders if o.get('type') == 'trigger']
                                     if trigger_orders:
                                         print(
@@ -4100,12 +6590,63 @@ class MartinBot:
                                             f"委托价 {pending_price:.2f}"
                                         )
                             else:
-                                if self.state.pending_layer != self.state.layer:
-                                    self._set_runtime_flag('pending_layer', self.state.layer)
-                                if self.state.pending_entry_price != 0.0:
-                                    self._set_runtime_flag('pending_entry_price', 0.0)
-                                if self.state.pending_entry_amount != 0.0:
-                                    self._set_runtime_flag('pending_entry_amount', 0.0)
+                                open_orders = self.fetch_open_orders()
+                                if open_orders is None:
+                                    print("⚠️ 已达阶段上限，但无法确认残余挂单状态，保持订单身份等待重试")
+                                    time.sleep(self.loop_interval)
+                                    continue
+                                foreign_orders = [
+                                    order for order in open_orders
+                                    if not order.get('reduceOnly', False)
+                                    and not self._is_owned_entry_order(order)
+                                ]
+                                if foreign_orders:
+                                    self._mark_state_sync_required(
+                                        "主循环检测到外来开仓单"
+                                    )
+                                    print(
+                                        "🛑 主循环检测到外来开仓单，保留其原状并暂停部署: "
+                                        f"{[self._entry_order_identity(order)[0] or self._entry_order_identity(order)[1] for order in foreign_orders]}"
+                                    )
+                                    self._write_live_snapshot(force=True, include_market=True)
+                                    time.sleep(self.loop_interval)
+                                    continue
+                                add_orders = [
+                                    order for order in open_orders
+                                    if not order.get('reduceOnly', False)
+                                ]
+                                if self._retain_residual_fill_order(
+                                    add_orders,
+                                    current_phase,
+                                    position,
+                                ):
+                                    self._write_live_snapshot(force=False, include_market=True)
+                                    time.sleep(self.loop_interval)
+                                    continue
+
+                                orders_cleared = not add_orders
+                                if add_orders:
+                                    print("⚠️ 已达阶段上限，撤销不属于当前部分成交层的额外加仓挂单")
+                                    orders_cleared = self._cancel_entry_orders(add_orders)
+                                    if orders_cleared:
+                                        print(
+                                            "⏳ 阶段上限挂单已请求撤销，保留订单身份，"
+                                            "待确认零成交终态后再清理"
+                                        )
+                                elif self.state.pending_entry_order_id or self.state.pending_entry_client_oid:
+                                    resolving_order_id = str(
+                                        self.state.pending_entry_order_id
+                                        or self.state.unresolved_fill_order_id
+                                        or ''
+                                    ).strip()
+                                    pending_resolution = self._resolve_missing_pending_entry_order(position)
+                                    if pending_resolution in {'canceled_zero_fill', 'known_terminal'}:
+                                        self._clear_pending_entry_tracking(
+                                            reset_pending_layer=True,
+                                            clear_unresolved_order_id=resolving_order_id,
+                                        )
+                                    else:
+                                        print("⏳ 阶段上限的末次订单终态尚不明确，继续保留身份")
                                 if current_phase == 'PHASE1':
                                     print(
                                         f"⚠️ 已达 PHASE1 阶段上限 {phase_cfg['max_layers']}，"
@@ -4124,9 +6665,15 @@ class MartinBot:
                                     self._write_live_snapshot(force=True, include_market=True)
                                     time.sleep(self.loop_interval)
                                     continue
+                                if (
+                                    self.state.pending_entry_order_id
+                                    or self.state.pending_entry_client_oid
+                                ):
+                                    self.sync_state_with_exchange()
+                                    time.sleep(self.loop_interval)
+                                    continue
                                 print("✅ 检测到持仓已关闭，本轮结束")
-                                self.cancel_all_orders()
-                                self._reset_state()
+                                self._finalize_full_exit(reason="主循环确认持仓关闭")
                                 time.sleep(self.loop_interval)
                                 continue
 
@@ -4136,8 +6683,23 @@ class MartinBot:
                                 time.sleep(self.loop_interval)
                                 continue
                             if not open_orders:
-                                print("📭 无持仓无挂单，回到 IDLE")
-                                self._reset_state()
+                                if (
+                                    self.state.pending_entry_order_id
+                                    or self.state.pending_entry_client_oid
+                                ):
+                                    self.sync_state_with_exchange()
+                                    time.sleep(self.loop_interval)
+                                    continue
+                                if (
+                                    self.state.bot_state == 'IN_STRATEGY'
+                                    or self.state.layer > 0
+                                    or self.state.initial_balance > 0
+                                ):
+                                    print("⏳ 无仓无单但仍有策略周期状态，连续确认后再回到 IDLE")
+                                    self._finalize_full_exit(reason="主循环确认空仓空单")
+                                else:
+                                    print("📭 无持仓无挂单，回到 IDLE")
+                                    self._reset_state()
                                 time.sleep(self.loop_interval)
                                 continue
 
@@ -4148,15 +6710,13 @@ class MartinBot:
 
                             if self.state.position_side == 'long' and signal == 'SHORT':
                                 print("⚠️ 原计划做多，但当前更适合反向做空，撤单重挂")
-                                self.cancel_all_orders()
-                                self._reset_state()
-                                self.place_first_order('short', price)
+                                if self._finalize_full_exit(reason="首仓反向前清理"):
+                                    self.place_first_order('short', price)
 
                             elif self.state.position_side == 'short' and signal == 'LONG':
                                 print("⚠️ 原计划做空，但当前更适合反向做多，撤单重挂")
-                                self.cancel_all_orders()
-                                self._reset_state()
-                                self.place_first_order('long', price)
+                                if self._finalize_full_exit(reason="首仓反向前清理"):
+                                    self.place_first_order('long', price)
 
                             elif signal == "WAIT":
                                 if self._is_pending_entry_signal_compatible(
@@ -4166,8 +6726,7 @@ class MartinBot:
                                     print("📊 信号转为 stretched，但趋势方向仍兼容，保留首仓挂单继续等待")
                                 else:
                                     print("📊 横盘/方向失效，取消挂单，等待更清晰信号")
-                                    self.cancel_all_orders()
-                                    self._reset_state()
+                                    self._finalize_full_exit(reason="首仓信号失效清理")
 
                             else:
                                 print("📊 趋势与挂单方向兼容，继续等待成交")

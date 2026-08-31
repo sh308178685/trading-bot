@@ -91,9 +91,21 @@ class DashboardBotProfile:
         self.phase1_layer_multipliers = list(config.get("phase1_layer_multipliers", self.layer_multipliers[: self.phase1_max_layers]))
         self.phase2_layer_multipliers = list(config.get("phase2_layer_multipliers", self.layer_multipliers[self.phase1_max_layers :]))
         self.current_phase = "PHASE1"
-        self.dynamic_partial_tp1_pct = 0.0
-        self.dynamic_partial_tp2_pct = 0.0
-        self.dynamic_partial_tp_phase = "PHASE1"
+        self.trailing_activation_min_pct = safe_float(config.get("trailing_activation_min_pct", 0.005), 0.005)
+        self.trailing_activation_max_pct = safe_float(config.get("trailing_activation_max_pct", 0.01), 0.01)
+        self.trailing_drawdown_min_ratio = safe_float(config.get("trailing_drawdown_min_ratio", 0.10), 0.10)
+        self.trailing_activation_layer_multipliers = list(
+            config.get(
+                "trailing_activation_layer_multipliers",
+                [1.0, 0.9, 0.8, 0.7, 0.6, 0.52, 0.44, 0.37, 0.3],
+            )
+        )
+        self.trailing_drawdown_layer_multipliers = list(
+            config.get(
+                "trailing_drawdown_layer_multipliers",
+                [1.0, 0.92, 0.84, 0.76, 0.68, 0.6, 0.52, 0.44, 0.36],
+            )
+        )
         self.level_offset_pct = safe_float(config.get("level_offset_pct", 0.001), 0.001)
         self.add_layer_base_offset_pct = safe_float(config.get("add_layer_base_offset_pct", 0.005), 0.005)
         self.rsi_threshold = safe_float(config.get("rsi_threshold", 50), 50)
@@ -142,22 +154,29 @@ class DashboardBotProfile:
         )
         self.phase1_layer_multipliers = list(strategy.get("phase1_layer_multipliers") or self.phase1_layer_multipliers)
         self.phase2_layer_multipliers = list(strategy.get("phase2_layer_multipliers") or self.phase2_layer_multipliers)
+        self.trailing_activation_min_pct = safe_float(
+            strategy.get("trailing_activation_min_pct", self.trailing_activation_min_pct),
+            self.trailing_activation_min_pct,
+        )
+        self.trailing_activation_max_pct = safe_float(
+            strategy.get("trailing_activation_max_pct", self.trailing_activation_max_pct),
+            self.trailing_activation_max_pct,
+        )
+        self.trailing_drawdown_min_ratio = safe_float(
+            strategy.get("trailing_drawdown_min_ratio", self.trailing_drawdown_min_ratio),
+            self.trailing_drawdown_min_ratio,
+        )
+        self.trailing_activation_layer_multipliers = list(
+            strategy.get("trailing_activation_layer_multipliers") or self.trailing_activation_layer_multipliers
+        )
+        self.trailing_drawdown_layer_multipliers = list(
+            strategy.get("trailing_drawdown_layer_multipliers") or self.trailing_drawdown_layer_multipliers
+        )
         self.current_phase = str((snapshot.get("runtime") or {}).get("phase") or self.current_phase).upper()
         self.transport = str(strategy.get("transport") or self.transport)
         self.price_precision = strategy.get("price_precision")
         self.amount_precision = strategy.get("amount_precision")
         self.latest_atr = safe_float(indicators.get("atr", self.latest_atr))
-        self.dynamic_partial_tp1_pct = safe_float(
-            indicators.get("dynamic_partial_tp1_pct", self.dynamic_partial_tp1_pct),
-            self.dynamic_partial_tp1_pct,
-        )
-        self.dynamic_partial_tp2_pct = safe_float(
-            indicators.get("dynamic_partial_tp2_pct", self.dynamic_partial_tp2_pct),
-            self.dynamic_partial_tp2_pct,
-        )
-        self.dynamic_partial_tp_phase = str(
-            indicators.get("dynamic_partial_tp_phase") or self.dynamic_partial_tp_phase
-        ).upper()
 
     def strategy_payload(self) -> dict[str, Any]:
         payload = {
@@ -177,6 +196,11 @@ class DashboardBotProfile:
             "phase1_first_order_ratio": self.phase1_first_order_ratio,
             "phase1_layer_multipliers": self.phase1_layer_multipliers,
             "phase2_layer_multipliers": self.phase2_layer_multipliers,
+            "trailing_activation_min_pct": self.trailing_activation_min_pct,
+            "trailing_activation_max_pct": self.trailing_activation_max_pct,
+            "trailing_drawdown_min_ratio": self.trailing_drawdown_min_ratio,
+            "trailing_activation_layer_multipliers": self.trailing_activation_layer_multipliers,
+            "trailing_drawdown_layer_multipliers": self.trailing_drawdown_layer_multipliers,
             "trend_follow_adx_threshold": self.trend_follow_adx_threshold,
             "mean_reversion_adx_max": self.mean_reversion_adx_max,
             "transport": self.transport,
@@ -330,9 +354,10 @@ class DashboardService:
                 "best_profit_pct": safe_float(runtime.get("best_profit_pct", 0)) * 100,
                 "last_known_contracts": safe_float(runtime.get("last_known_contracts", 0)),
                 "entry_price": safe_float(runtime.get("entry_price", 0)),
-                "partial_tp_1_done": bool(runtime.get("partial_tp_1_done", False)),
-                "partial_tp_2_done": bool(runtime.get("partial_tp_2_done", False)),
                 "activated": bool(runtime.get("activated", False)),
+                "active_trailing_drawdown_ratio": safe_float(
+                    runtime.get("active_trailing_drawdown_ratio", 0)
+                ) * 100,
                 "last_update": runtime.get("last_update"),
             },
             "account": balance,

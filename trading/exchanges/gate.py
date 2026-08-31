@@ -7,6 +7,7 @@ counts.  This adapter keeps that exchange-specific detail out of the strategy.
 from __future__ import annotations
 
 import contextlib
+import json
 from copy import deepcopy
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
@@ -21,6 +22,55 @@ def _number(value: Any, default: float = 0.0) -> float:
         return float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _is_missing_auto_order_error(exc: Exception) -> bool:
+    """Gate treats canceling an already-consumed auto order as error 1034."""
+    if isinstance(exc, ccxt.OrderNotFound):
+        return True
+    if not isinstance(exc, ccxt.ExchangeError):
+        return False
+
+    message = str(exc or "")
+    start = message.find("{")
+    end = message.rfind("}")
+    if start < 0 or end <= start:
+        return False
+    try:
+        payload = json.loads(message[start : end + 1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("code") or "") == "1034"
+        and str(payload.get("label") or "") == "AUTO_ORDER_NOT_FOUND"
+    )
+
+
+def _is_finished_order_lookup_error(exc: Exception) -> bool:
+    """Return True only for Gate errors meaning the direct order view has expired."""
+    if isinstance(exc, ccxt.OrderNotFound):
+        return True
+    if not isinstance(exc, (ccxt.InvalidOrder, ccxt.ExchangeError)):
+        return False
+    message = str(exc or "")
+    start = message.find("{")
+    end = message.rfind("}")
+    if start < 0 or end <= start:
+        return False
+    try:
+        payload = json.loads(message[start : end + 1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    label = str((payload or {}).get("label") or "").strip().upper()
+    return label in {
+        "ORDER_NOT_FOUND",
+        "ORDER_CLOSED",
+        "ORDER_CANCELLED",
+        "ORDER_CANCELED",
+        "ORDER_FINISHED",
+    }
 
 
 class GateExchangeAdapter(ExchangeAdapter):
@@ -156,8 +206,33 @@ class GateExchangeAdapter(ExchangeAdapter):
         for field in ("amount", "filled", "remaining"):
             if item.get(field) is not None:
                 item[field] = self._base_amount(symbol, item[field])
-        if item.get("triggerPrice") is not None or (item.get("info") or {}).get("trigger"):
+        info = item.get("info") or {}
+        initial = info.get("initial") if isinstance(info.get("initial"), dict) else {}
+        if not item.get("clientOrderId"):
+            item["clientOrderId"] = str(
+                initial.get("text") or info.get("text") or ""
+            ).strip()
+        if item.get("reduceOnly") is None:
+            if "is_reduce_only" in initial:
+                item["reduceOnly"] = bool(initial.get("is_reduce_only"))
+            elif "reduce_only" in initial:
+                item["reduceOnly"] = bool(initial.get("reduce_only"))
+        if item.get("triggerPrice") is not None or info.get("trigger"):
             item["type"] = "trigger"
+            item["triggerOrderId"] = str(item.get("id") or info.get("id") or "")
+            # Gate's trade_id is the ordinary order created after an auto order
+            # triggers. me_order_id is a different TP/SL relationship and must
+            # never be used as an entry-fill identity.
+            execution_order_id = str(
+                info.get("trade_id_string") or info.get("trade_id") or ""
+            ).strip()
+            if execution_order_id and execution_order_id != "0":
+                item["triggerExecutionOrderId"] = execution_order_id
+            related_order_id = str(
+                info.get("me_order_id_string") or info.get("me_order_id") or ""
+            ).strip()
+            if related_order_id and related_order_id != "0":
+                item["relatedOrderId"] = related_order_id
         return item
 
     def fetch_open_orders(self, symbol: str | None = None, since: int | None = None, limit: int | None = None, params: dict[str, Any] | None = None):
@@ -179,19 +254,196 @@ class GateExchangeAdapter(ExchangeAdapter):
 
     def cancel_orders(self, orders: list[dict[str, Any]], symbol: str | None = None):
         return [
-            self.rest.cancel_order(str(order["id"]), symbol or self.symbol, {"settle": self.settle, "trigger": order.get("type") == "trigger"})
+            self._map_order(
+                self.rest.cancel_order(
+                    str(order["id"]),
+                    symbol or self.symbol,
+                    {"settle": self.settle, "trigger": order.get("type") == "trigger"},
+                )
+            )
             for order in orders if order.get("id")
         ]
 
     def fetch_order(self, id: str, symbol: str | None = None, params: dict[str, Any] | None = None):
         return self._map_order(self.rest.fetch_order(id, symbol or self.symbol, {"settle": self.settle, **(params or {})}))
 
+    def fetch_order_authoritative(self, id: str, symbol: str | None = None):
+        """Fetch a regular or auto order, including Gate's finished views."""
+        resolved_symbol = symbol or self.symbol
+        expected_id = str(id)
+        direct_error: Exception | None = None
+
+        # Auto-order IDs only exist in Gate's price-order endpoint.  Query both
+        # namespaces explicitly; never guess that a missing regular ID was canceled.
+        for trigger in (False, True):
+            try:
+                return self.fetch_order(
+                    expected_id,
+                    resolved_symbol,
+                    {"trigger": True} if trigger else None,
+                )
+            except ccxt.ExchangeError as exc:
+                recoverable = (
+                    _is_finished_order_lookup_error(exc)
+                    or (trigger and _is_missing_auto_order_error(exc))
+                )
+                if not recoverable:
+                    raise
+                if direct_error is None:
+                    direct_error = exc
+
+        for trigger in (False, True):
+            rows = self.rest.fetch_closed_orders(
+                resolved_symbol,
+                None,
+                100,
+                {
+                    "settle": self.settle,
+                    **({"trigger": True} if trigger else {}),
+                },
+            ) or []
+            for row in rows:
+                info = row.get("info") or {}
+                row_id = str(
+                    row.get("id")
+                    or row.get("orderId")
+                    or info.get("id")
+                    or ""
+                )
+                if row_id == expected_id:
+                    return self._map_order(row)
+        if direct_error is not None:
+            raise direct_error
+        raise ccxt.OrderNotFound(f"Gate order {expected_id} was not found")
+
+    @staticmethod
+    def _order_client_identity(row: dict[str, Any]) -> str:
+        info = row.get("info") or {}
+        initial = info.get("initial") if isinstance(info.get("initial"), dict) else {}
+        return str(
+            row.get("clientOrderId")
+            or info.get("text")
+            or info.get("clientOrderId")
+            or initial.get("text")
+            or ""
+        ).strip()
+
+    def _find_order_by_client_identity(
+        self,
+        rows: list[dict[str, Any]],
+        expected_client_oid: str,
+    ) -> dict[str, Any] | None:
+        for row in rows:
+            if self._order_client_identity(row) == expected_client_oid:
+                return self._map_order(row)
+        return None
+
+    def fetch_order_by_client_id_authoritative(
+        self,
+        client_oid: str,
+        symbol: str | None = None,
+    ):
+        """Resolve Gate's ``text`` client identity to its server order ID."""
+        resolved_symbol = symbol or self.symbol
+        expected_client_oid = str(client_oid or "").strip()
+        if not expected_client_oid:
+            raise ValueError("client_oid is required")
+        direct_error: Exception | None = None
+        try:
+            direct = self.fetch_order(
+                expected_client_oid,
+                resolved_symbol,
+                {"clientOrderId": expected_client_oid},
+            )
+            if self._order_client_identity(direct) == expected_client_oid:
+                return direct
+        except ccxt.ExchangeError as exc:
+            if not _is_finished_order_lookup_error(exc):
+                raise
+            direct_error = exc
+
+        matched = self._find_order_by_client_identity(
+            self.fetch_open_orders(resolved_symbol) or [],
+            expected_client_oid,
+        )
+        if matched is not None:
+            return matched
+
+        for trigger in (False, True):
+            rows = self.rest.fetch_closed_orders(
+                resolved_symbol,
+                None,
+                100,
+                {
+                    "settle": self.settle,
+                    **({"trigger": True} if trigger else {}),
+                },
+            ) or []
+            matched = self._find_order_by_client_identity(
+                rows,
+                expected_client_oid,
+            )
+            if matched is not None:
+                return matched
+        if direct_error is not None:
+            raise direct_error
+        raise ccxt.OrderNotFound(
+            f"Gate client order {expected_client_oid} was not found"
+        )
+
     def create_trigger_order(self, symbol: str, side: str, amount: float, trigger_price: float, price: float | None = None, trigger_type: str = "mark_price", order_type: str = "limit", params: dict[str, Any] | None = None) -> dict[str, Any]:
         options = {"settle": self.settle, "price_type": {"last_price": 0, "mark_price": 1, "index_price": 2}.get(trigger_type, 1)}
         options.update(params or {})
-        # CCXT maps stopLossPrice to Gate's /price_orders endpoint and derives the correct rule from side.
-        response = self.rest.create_order(symbol, order_type, side, self._contracts(symbol, amount), price, {**options, "stopLossPrice": trigger_price})
-        return self._map_order(response)
+        unified_client_oid = options.pop("clientOrderId", "")
+        legacy_client_oid = options.pop("clientOid", "")
+        client_oid = str(
+            unified_client_oid
+            or legacy_client_oid
+            or options.get("text")
+            or ""
+        ).strip()
+        if client_oid:
+            # CCXT 4.4.92 leaves this at the request root. Gate's futures
+            # FuturesPriceTriggeredOrder schema requires ``initial.text``.
+            options["text"] = client_oid
+        self.rest.load_unified_status()
+        market = self.rest.market(symbol)
+        request = self.rest.create_order_request(
+            symbol,
+            order_type,
+            side,
+            self._contracts(symbol, amount),
+            price,
+            {**options, "stopLossPrice": trigger_price},
+        )
+        initial = request.get("initial")
+        if not isinstance(initial, dict):
+            raise RuntimeError("Gate trigger order request is missing initial payload")
+        request["initial"] = dict(initial)
+        root_text = request.pop("text", "")
+        root_client_oid = request.pop("clientOrderId", "")
+        root_legacy_client_oid = request.pop("clientOid", "")
+        request_text = str(
+            root_text
+            or root_client_oid
+            or root_legacy_client_oid
+            or client_oid
+            or ""
+        ).strip()
+        if request_text:
+            request["initial"]["text"] = request_text
+        response = self.rest.privateFuturesPostSettlePriceOrders(request)
+        mapped = self._map_order(self.rest.parse_order(response, market))
+        mapped["type"] = "trigger"
+        mapped.setdefault("triggerPrice", trigger_price)
+        mapped.setdefault("amount", amount)
+        mapped.setdefault("side", side)
+        mapped.setdefault("price", price)
+        if mapped.get("reduceOnly") is None and "reduceOnly" in options:
+            mapped["reduceOnly"] = bool(options.get("reduceOnly"))
+        if client_oid and not mapped.get("clientOrderId"):
+            mapped["clientOrderId"] = client_oid
+        return mapped
 
     def place_position_stop_loss(self, symbol: str, hold_side: str, trigger_price: float, trigger_type: str = "mark_price", execute_price: float | None = 0.0, client_oid: str | None = None) -> dict[str, Any]:
         positions = self.fetch_positions([symbol])
@@ -211,8 +463,30 @@ class GateExchangeAdapter(ExchangeAdapter):
 
     def cancel_position_stop_loss(self, symbol: str | None = None, order_id: str | None = None, client_oid: str | None = None) -> dict[str, Any]:
         if not order_id:
+            if client_oid:
+                raise RuntimeError("Gate requires order_id to cancel a position stop loss")
             return {}
-        return self.rest.cancel_order(order_id, symbol or self.symbol, {"settle": self.settle, "trigger": True})
+        try:
+            return self.rest.cancel_order(
+                order_id,
+                symbol or self.symbol,
+                {"settle": self.settle, "trigger": True},
+            )
+        except ccxt.ExchangeError as exc:
+            if not _is_missing_auto_order_error(exc):
+                raise
+            # 保护单已成交或被 Gate 自动删除时，远端已达到“订单不存在”的
+            # 目标状态。将精确的 1034 响应转换为幂等撤销成功。
+            return {
+                "id": order_id,
+                "clientOrderId": client_oid or "",
+                "status": "canceled",
+                "alreadyAbsent": True,
+                "info": {
+                    "code": "1034",
+                    "label": "AUTO_ORDER_NOT_FOUND",
+                },
+            }
 
     def fetch_ticker(self, symbol: str, params: dict[str, Any] | None = None):
         return self.rest.fetch_ticker(symbol, {"settle": self.settle, **(params or {})})
