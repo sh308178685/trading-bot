@@ -1,0 +1,2352 @@
+{
+  "timestamp": "2026-09-05T17:00:51",
+  "source": "martin-bot",
+  "warnings": [],
+  "strategy": {
+    "name": "Bitget 马丁策略机器人",
+    "exchange": "Gate.io",
+    "mode": "live",
+    "symbol": "BTC/USDT:USDT",
+    "timeframe": "5m",
+    "sr_timeframe": "1h",
+    "max_layers": 9,
+    "leverage": 3,
+    "phase_switch_loss_pct": 0.025,
+    "phase_switch_layer": 4,
+    "trend_follow_enabled": true,
+    "trend_follow_adx_threshold": 28.0,
+    "mean_reversion_adx_max": 20.0,
+    "first_order_ratio": 0.025,
+    "layer_multipliers": [
+      1,
+      1.15,
+      1.35,
+      1.7,
+      2.1,
+      2.6,
+      3.2,
+      3.9,
+      4.8
+    ],
+    "phase1_max_layers": 3,
+    "phase1_first_order_ratio": 0.025,
+    "phase1_layer_multipliers": [
+      1,
+      1.15,
+      1.35
+    ],
+    "phase1_layer_min_gap_pct": 0.0,
+    "phase1_layer_trigger_base_pct": 0.0,
+    "phase2_extra_layers": 6,
+    "phase2_layer_multipliers": [
+      1.7,
+      2.1,
+      2.6,
+      3.2,
+      3.9,
+      4.8
+    ],
+    "phase2_layer_min_gap_pct": 0.01,
+    "phase2_layer_trigger_base_pct": 0.012,
+    "level_offset_pct": 0.001,
+    "add_layer_base_offset_pct": 0.005,
+    "structure_min_gap_pct": 0.005,
+    "layer_min_gap_pct": 0.01,
+    "layer_trigger_base_pct": 0.012,
+    "protective_stop_enabled": true,
+    "protective_stop_trigger_type": "mark_price",
+    "protective_stop_profit_lock_ratio": 0.75,
+    "protective_stop_min_profit_pct": 0.005,
+    "trailing_activation_min_pct": 0.005,
+    "trailing_activation_max_pct": 0.01,
+    "trailing_drawdown_min_ratio": 0.1,
+    "trailing_activation_layer_multipliers": [
+      1.0,
+      0.9,
+      0.8,
+      0.7,
+      0.6,
+      0.52,
+      0.44,
+      0.37,
+      0.3
+    ],
+    "trailing_drawdown_layer_multipliers": [
+      1.0,
+      0.92,
+      0.84,
+      0.76,
+      0.68,
+      0.6,
+      0.52,
+      0.44,
+      0.36
+    ],
+    "transport": "rest",
+    "price_precision": 0.1,
+    "amount_precision": 0.0001,
+    "min_amount": 0.0001,
+    "min_cost": null
+  },
+  "runtime": {
+    "symbol": "BTC/USDT:USDT",
+    "layer": 5,
+    "pending_layer": 6,
+    "phase": "PHASE2",
+    "last_phase": "PHASE2",
+    "phase2_start_layer": 4,
+    "pending_entry_price": 76857.9,
+    "pending_entry_amount": 0.0013000000000000002,
+    "pending_entry_order_id": "36028835830215370",
+    "pending_entry_client_oid": "t-martin-c90d85c5243943808a",
+    "last_fill_price": 78625.2,
+    "last_fill_time": "2026-09-04T22:50:06",
+    "last_fill_order_id": "36028835806322277",
+    "last_fill_amount": 0.001,
+    "last_fill_price_source": "trade_history",
+    "unresolved_fill_order_id": "",
+    "unresolved_fill_accounted_amount": 0.0,
+    "zero_fill_canceled_entry_order_id": "",
+    "protective_stop_active": false,
+    "protective_stop_order_id": "",
+    "protective_stop_client_oid": "",
+    "protective_stop_price": 0.0,
+    "best_profit_pct": 0.0019682177427925635,
+    "active_trailing_drawdown_ratio": 0.0,
+    "position_side": "long",
+    "last_known_contracts": 0.0033,
+    "bot_state": "IN_STRATEGY",
+    "activated": false,
+    "entry_price": 80281.28181818181,
+    "initial_balance": 512.919398996028,
+    "last_update": "2026-09-05T01:53:44"
+  },
+  "stream": {
+    "enabled": false,
+    "transport": "rest",
+    "exchange": "Gate.io"
+  },
+  "account": {
+    "currency": "USDT",
+    "free": 389.398736016982,
+    "used": 123.4462222295,
+    "total": 512.844958246482,
+    "utilization_pct": 24.070865910739762,
+    "tradable_margin": 389.398736016982,
+    "safe_tradable_margin": 369.9287992161329
+  },
+  "position": {
+    "side": "long",
+    "contracts": 0.0033,
+    "entry_price": 80281.28181818181,
+    "mark_price": 79609.02,
+    "notional": 262.709766,
+    "unrealized_pnl": -2.218464,
+    "percentage": -0.0,
+    "liquidation_price": 0.0,
+    "margin_mode": "cross",
+    "distance_to_liquidation_pct": 0.0
+  },
+  "open_orders": [
+    {
+      "id": "36028835830215370",
+      "side": "buy",
+      "type": "limit",
+      "price": 76857.9,
+      "amount": 0.0013000000000000002,
+      "filled": 0.0,
+      "status": "open",
+      "reduceOnly": false,
+      "timestamp": 1788544424771
+    }
+  ],
+  "recent_trades": [
+    {
+      "id": "826144086",
+      "order_id": "36028835722430687",
+      "timestamp_ms": 1788421723220.0,
+      "timestamp": "2026-09-03T15:48:43",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 77728.3,
+      "amount": 0.0005,
+      "cost": 38.86415,
+      "fee": 0.00777283,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826180088",
+      "order_id": "36028835725922090",
+      "timestamp_ms": 1788424202032.0,
+      "timestamp": "2026-09-03T16:30:02",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 77955.2,
+      "amount": 0.0009000000000000001,
+      "cost": 70.15968,
+      "fee": 0.03507984,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826204533",
+      "order_id": "36028835727671787",
+      "timestamp_ms": 1788427754608.0,
+      "timestamp": "2026-09-03T17:29:14",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 77725.3,
+      "amount": 0.0004,
+      "cost": 31.09012,
+      "fee": 0.01554506,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826210305",
+      "order_id": "36028835727681652",
+      "timestamp_ms": 1788428502042.0,
+      "timestamp": "2026-09-03T17:41:42",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 77638.5,
+      "amount": 0.0005,
+      "cost": 38.81925,
+      "fee": 0.00776385,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826218432",
+      "order_id": "36028835728058569",
+      "timestamp_ms": 1788429435026.0,
+      "timestamp": "2026-09-03T17:57:15",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 77570.5,
+      "amount": 0.0006000000000000001,
+      "cost": 46.5423,
+      "fee": 0.00930846,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826256244",
+      "order_id": "36028835731017853",
+      "timestamp_ms": 1788433851830.0,
+      "timestamp": "2026-09-03T19:10:51",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 77731.9,
+      "amount": 0.0015,
+      "cost": 116.59785,
+      "fee": 0.058298925,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826266984",
+      "order_id": "36028835731472718",
+      "timestamp_ms": 1788435080068.0,
+      "timestamp": "2026-09-03T19:31:20",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 77797.6,
+      "amount": 0.0004,
+      "cost": 31.11904,
+      "fee": 0.006223808,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826292154",
+      "order_id": "36028835733235106",
+      "timestamp_ms": 1788437861245.0,
+      "timestamp": "2026-09-03T20:17:41",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 77994.5,
+      "amount": 0.0004,
+      "cost": 31.1978,
+      "fee": 0.0155989,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826293149",
+      "order_id": "36028835733285849",
+      "timestamp_ms": 1788437904542.0,
+      "timestamp": "2026-09-03T20:18:24",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 77917.7,
+      "amount": 0.0004,
+      "cost": 31.16708,
+      "fee": 0.01558354,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826314028",
+      "order_id": "36028835734321543",
+      "timestamp_ms": 1788438917244.0,
+      "timestamp": "2026-09-03T20:35:17",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 78170.9,
+      "amount": 0.0004,
+      "cost": 31.26836,
+      "fee": 0.01563418,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826314550",
+      "order_id": "36028835734348603",
+      "timestamp_ms": 1788438940602.0,
+      "timestamp": "2026-09-03T20:35:40",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 78182.1,
+      "amount": 0.0004,
+      "cost": 31.27284,
+      "fee": 0.01563642,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826318877",
+      "order_id": "36028835734603046",
+      "timestamp_ms": 1788439165245.0,
+      "timestamp": "2026-09-03T20:39:25",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 78288.5,
+      "amount": 0.0004,
+      "cost": 31.3154,
+      "fee": 0.0156577,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826319879",
+      "order_id": "36028835734642041",
+      "timestamp_ms": 1788439195272.0,
+      "timestamp": "2026-09-03T20:39:55",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 78317.4,
+      "amount": 0.0004,
+      "cost": 31.32696,
+      "fee": 0.01566348,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826355034",
+      "order_id": "36028835736070012",
+      "timestamp_ms": 1788440402033.0,
+      "timestamp": "2026-09-03T21:00:02",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 78608.3,
+      "amount": 0.0004,
+      "cost": 31.44332,
+      "fee": 0.01572166,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826356275",
+      "order_id": "36028835736125157",
+      "timestamp_ms": 1788440425368.0,
+      "timestamp": "2026-09-03T21:00:25",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 78514.5,
+      "amount": 0.0001,
+      "cost": 7.85145,
+      "fee": 0.003925725,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826356276",
+      "order_id": "36028835736125157",
+      "timestamp_ms": 1788440425368.0,
+      "timestamp": "2026-09-03T21:00:25",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 78514.5,
+      "amount": 0.00030000000000000003,
+      "cost": 23.55435,
+      "fee": 0.011777175,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826411516",
+      "order_id": "36028835739040994",
+      "timestamp_ms": 1788442847262.0,
+      "timestamp": "2026-09-03T21:40:47",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 78740.0,
+      "amount": 0.0004,
+      "cost": 31.496,
+      "fee": 0.015748,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826412868",
+      "order_id": "36028835739093331",
+      "timestamp_ms": 1788442875320.0,
+      "timestamp": "2026-09-03T21:41:15",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 78783.7,
+      "amount": 0.0004,
+      "cost": 31.51348,
+      "fee": 0.01575674,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826424342",
+      "order_id": "36028835739621716",
+      "timestamp_ms": 1788443199248.0,
+      "timestamp": "2026-09-03T21:46:39",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 78895.1,
+      "amount": 0.0004,
+      "cost": 31.55804,
+      "fee": 0.01577902,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826425508",
+      "order_id": "36028835739688172",
+      "timestamp_ms": 1788443235482.0,
+      "timestamp": "2026-09-03T21:47:15",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 78895.6,
+      "amount": 0.0004,
+      "cost": 31.55824,
+      "fee": 0.01577912,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826470224",
+      "order_id": "36028835742186647",
+      "timestamp_ms": 1788445126261.0,
+      "timestamp": "2026-09-03T22:18:46",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 79018.5,
+      "amount": 0.0004,
+      "cost": 31.6074,
+      "fee": 0.0158037,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826471349",
+      "order_id": "36028835742234117",
+      "timestamp_ms": 1788445157189.0,
+      "timestamp": "2026-09-03T22:19:17",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 78955.1,
+      "amount": 0.0004,
+      "cost": 31.58204,
+      "fee": 0.01579102,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826547636",
+      "order_id": "36028835744798281",
+      "timestamp_ms": 1788446405264.0,
+      "timestamp": "2026-09-03T22:40:05",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 79593.6,
+      "amount": 0.0004,
+      "cost": 31.83744,
+      "fee": 0.01591872,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826548789",
+      "order_id": "36028835744845654",
+      "timestamp_ms": 1788446428356.0,
+      "timestamp": "2026-09-03T22:40:28",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 79668.1,
+      "amount": 0.0004,
+      "cost": 31.86724,
+      "fee": 0.01593362,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826595770",
+      "order_id": "36028835746444139",
+      "timestamp_ms": 1788447065257.0,
+      "timestamp": "2026-09-03T22:51:05",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 80197.3,
+      "amount": 0.0004,
+      "cost": 32.07892,
+      "fee": 0.01603946,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826599716",
+      "order_id": "36028835746577042",
+      "timestamp_ms": 1788447107248.0,
+      "timestamp": "2026-09-03T22:51:47",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80102.9,
+      "amount": 0.0004,
+      "cost": 32.04116,
+      "fee": 0.01602058,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826618109",
+      "order_id": "36028835747379457",
+      "timestamp_ms": 1788447448228.0,
+      "timestamp": "2026-09-03T22:57:28",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 80208.7,
+      "amount": 0.0004,
+      "cost": 32.08348,
+      "fee": 0.01604174,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826620015",
+      "order_id": "36028835747458188",
+      "timestamp_ms": 1788447489590.0,
+      "timestamp": "2026-09-03T22:58:09",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80275.1,
+      "amount": 0.0004,
+      "cost": 32.11004,
+      "fee": 0.01605502,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826632483",
+      "order_id": "36028835747852362",
+      "timestamp_ms": 1788447648266.0,
+      "timestamp": "2026-09-03T23:00:48",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 80481.9,
+      "amount": 0.0004,
+      "cost": 32.19276,
+      "fee": 0.01609638,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826636535",
+      "order_id": "36028835747978126",
+      "timestamp_ms": 1788447681604.0,
+      "timestamp": "2026-09-03T23:01:21",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80736.5,
+      "amount": 0.0004,
+      "cost": 32.2946,
+      "fee": 0.0161473,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826648734",
+      "order_id": "36028835748388333",
+      "timestamp_ms": 1788447777265.0,
+      "timestamp": "2026-09-03T23:02:57",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 80829.4,
+      "amount": 0.0004,
+      "cost": 32.33176,
+      "fee": 0.01616588,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826651848",
+      "order_id": "36028835748520988",
+      "timestamp_ms": 1788447810169.0,
+      "timestamp": "2026-09-03T23:03:30",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80827.3,
+      "amount": 0.0004,
+      "cost": 32.33092,
+      "fee": 0.01616546,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826657661",
+      "order_id": "36028835748592049",
+      "timestamp_ms": 1788447878840.0,
+      "timestamp": "2026-09-03T23:04:38",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 80636.3,
+      "amount": 0.0005,
+      "cost": 40.31815,
+      "fee": 0.00806363,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826683923",
+      "order_id": "36028835749292502",
+      "timestamp_ms": 1788448333343.0,
+      "timestamp": "2026-09-03T23:12:13",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 80409.8,
+      "amount": 0.0006000000000000001,
+      "cost": 48.24588,
+      "fee": 0.009649176,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826721989",
+      "order_id": "36028835751849732",
+      "timestamp_ms": 1788449524276.0,
+      "timestamp": "2026-09-03T23:32:04",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 80688.0,
+      "amount": 0.0015,
+      "cost": 121.032,
+      "fee": 0.060516,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826723147",
+      "order_id": "36028835751905960",
+      "timestamp_ms": 1788449553150.0,
+      "timestamp": "2026-09-03T23:32:33",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80716.1,
+      "amount": 0.0004,
+      "cost": 32.28644,
+      "fee": 0.01614322,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826731492",
+      "order_id": "36028835752239688",
+      "timestamp_ms": 1788449804275.0,
+      "timestamp": "2026-09-03T23:36:44",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 80832.0,
+      "amount": 0.0004,
+      "cost": 32.3328,
+      "fee": 0.0161664,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826732152",
+      "order_id": "36028835752273829",
+      "timestamp_ms": 1788449828833.0,
+      "timestamp": "2026-09-03T23:37:08",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80800.1,
+      "amount": 0.0004,
+      "cost": 32.32004,
+      "fee": 0.01616002,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826739108",
+      "order_id": "36028835752579985",
+      "timestamp_ms": 1788450029256.0,
+      "timestamp": "2026-09-03T23:40:29",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 80890.0,
+      "amount": 0.0004,
+      "cost": 32.356,
+      "fee": 0.016178,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826740140",
+      "order_id": "36028835752633583",
+      "timestamp_ms": 1788450062285.0,
+      "timestamp": "2026-09-03T23:41:02",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80934.6,
+      "amount": 0.0004,
+      "cost": 32.37384,
+      "fee": 0.01618692,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826770431",
+      "order_id": "36028835753896078",
+      "timestamp_ms": 1788450865422.0,
+      "timestamp": "2026-09-03T23:54:25",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 81172.4,
+      "amount": 0.0004,
+      "cost": 32.46896,
+      "fee": 0.01623448,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826771407",
+      "order_id": "36028835753938723",
+      "timestamp_ms": 1788450887439.0,
+      "timestamp": "2026-09-03T23:54:47",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 81214.9,
+      "amount": 0.0004,
+      "cost": 32.48596,
+      "fee": 0.01624298,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826793616",
+      "order_id": "36028835754084046",
+      "timestamp_ms": 1788451350609.0,
+      "timestamp": "2026-09-04T00:02:30",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 81102.7,
+      "amount": 0.0005,
+      "cost": 40.55135,
+      "fee": 0.00811027,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826804412",
+      "order_id": "36028835754945380",
+      "timestamp_ms": 1788451493157.0,
+      "timestamp": "2026-09-04T00:04:53",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 80730.5,
+      "amount": 0.0006000000000000001,
+      "cost": 48.4383,
+      "fee": 0.00968766,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826911965",
+      "order_id": "36028835761347815",
+      "timestamp_ms": 1788457112308.0,
+      "timestamp": "2026-09-04T01:38:32",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 81051.9,
+      "amount": 0.0015,
+      "cost": 121.57785,
+      "fee": 0.060788925,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826912576",
+      "order_id": "36028835761369830",
+      "timestamp_ms": 1788457156598.0,
+      "timestamp": "2026-09-04T01:39:16",
+      "side": "sell",
+      "taker_or_maker": "maker",
+      "price": 81096.4,
+      "amount": 0.0001,
+      "cost": 8.10964,
+      "fee": 0.001621928,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826912577",
+      "order_id": "36028835761369830",
+      "timestamp_ms": 1788457156599.0,
+      "timestamp": "2026-09-04T01:39:16",
+      "side": "sell",
+      "taker_or_maker": "maker",
+      "price": 81096.4,
+      "amount": 0.0002,
+      "cost": 16.21928,
+      "fee": 0.003243856,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826912578",
+      "order_id": "36028835761369830",
+      "timestamp_ms": 1788457156599.0,
+      "timestamp": "2026-09-04T01:39:16",
+      "side": "sell",
+      "taker_or_maker": "maker",
+      "price": 81096.4,
+      "amount": 0.0001,
+      "cost": 8.10964,
+      "fee": 0.001621928,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826938512",
+      "order_id": "36028835762146584",
+      "timestamp_ms": 1788458981205.0,
+      "timestamp": "2026-09-04T02:09:41",
+      "side": "sell",
+      "taker_or_maker": "maker",
+      "price": 81311.0,
+      "amount": 0.0005,
+      "cost": 40.6555,
+      "fee": 0.0081311,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826957733",
+      "order_id": "36028835764034620",
+      "timestamp_ms": 1788460408141.0,
+      "timestamp": "2026-09-04T02:33:28",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80950.0,
+      "amount": 0.0009000000000000001,
+      "cost": 72.855,
+      "fee": 0.0364275,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826958754",
+      "order_id": "36028835764118929",
+      "timestamp_ms": 1788460553999.0,
+      "timestamp": "2026-09-04T02:35:53",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 80967.5,
+      "amount": 0.0004,
+      "cost": 32.387,
+      "fee": 0.0161935,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "826987946",
+      "order_id": "36028835765508891",
+      "timestamp_ms": 1788462343249.0,
+      "timestamp": "2026-09-04T03:05:43",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 81268.9,
+      "amount": 0.0004,
+      "cost": 32.50756,
+      "fee": 0.01625378,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "827069429",
+      "order_id": "36028835769803851",
+      "timestamp_ms": 1788466518901.0,
+      "timestamp": "2026-09-04T04:15:18",
+      "side": "buy",
+      "taker_or_maker": "taker",
+      "price": 81405.3,
+      "amount": 0.0004,
+      "cost": 32.56212,
+      "fee": 0.01628106,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "827096526",
+      "order_id": "36028835769817246",
+      "timestamp_ms": 1788469447617.0,
+      "timestamp": "2026-09-04T05:04:07",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 81323.8,
+      "amount": 0.0005,
+      "cost": 40.6619,
+      "fee": 0.00813238,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "827096825",
+      "order_id": "36028835771641903",
+      "timestamp_ms": 1788469473507.0,
+      "timestamp": "2026-09-04T05:04:33",
+      "side": "sell",
+      "taker_or_maker": "taker",
+      "price": 81312.8,
+      "amount": 0.0009000000000000001,
+      "cost": 73.18152,
+      "fee": 0.03659076,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "827140555",
+      "order_id": "36028835773410507",
+      "timestamp_ms": 1788471318014.0,
+      "timestamp": "2026-09-04T05:35:18",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 81850.7,
+      "amount": 0.0004,
+      "cost": 32.74028,
+      "fee": 0.006548056,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "827152352",
+      "order_id": "36028835773461634",
+      "timestamp_ms": 1788471616465.0,
+      "timestamp": "2026-09-04T05:40:16",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 81591.1,
+      "amount": 0.0005,
+      "cost": 40.79555,
+      "fee": 0.00815911,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "827184772",
+      "order_id": "36028835773902847",
+      "timestamp_ms": 1788473593461.0,
+      "timestamp": "2026-09-04T06:13:13",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 81244.4,
+      "amount": 0.0006000000000000001,
+      "cost": 48.74664,
+      "fee": 0.009749328,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "827681331",
+      "order_id": "36028835792771916",
+      "timestamp_ms": 1788525091107.0,
+      "timestamp": "2026-09-04T20:31:31",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 80025.7,
+      "amount": 0.0008,
+      "cost": 64.02056,
+      "fee": 0.012804112,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    },
+    {
+      "id": "828018153",
+      "order_id": "36028835806322277",
+      "timestamp_ms": 1788533406799.0,
+      "timestamp": "2026-09-04T22:50:06",
+      "side": "buy",
+      "taker_or_maker": "maker",
+      "price": 78625.2,
+      "amount": 0.001,
+      "cost": 78.6252,
+      "fee": 0.01572504,
+      "fee_currency": "USDT",
+      "symbol": "BTC/USDT:USDT",
+      "reduce_only": false
+    }
+  ],
+  "ledger": [
+    {
+      "timestamp": "2026-09-03T19:31:20",
+      "currency": null,
+      "amount": 0.006223808,
+      "before": 511.836175075588,
+      "after": 511.829951267588,
+      "type": "fee",
+      "id": "216"
+    },
+    {
+      "timestamp": "2026-09-03T20:17:41",
+      "currency": null,
+      "amount": 0.07876,
+      "before": 511.814352367588,
+      "after": 511.893112367588,
+      "type": "trade",
+      "id": "218"
+    },
+    {
+      "timestamp": "2026-09-03T20:17:41",
+      "currency": null,
+      "amount": 0.0155989,
+      "before": 511.829951267588,
+      "after": 511.814352367588,
+      "type": "fee",
+      "id": "217"
+    },
+    {
+      "timestamp": "2026-09-03T20:18:24",
+      "currency": null,
+      "amount": 0.01558354,
+      "before": 511.893112367588,
+      "after": 511.877528827588,
+      "type": "fee",
+      "id": "219"
+    },
+    {
+      "timestamp": "2026-09-03T20:35:17",
+      "currency": null,
+      "amount": 0.10128,
+      "before": 511.861894647588,
+      "after": 511.963174647588,
+      "type": "trade",
+      "id": "221"
+    },
+    {
+      "timestamp": "2026-09-03T20:35:17",
+      "currency": null,
+      "amount": 0.01563418,
+      "before": 511.877528827588,
+      "after": 511.861894647588,
+      "type": "fee",
+      "id": "220"
+    },
+    {
+      "timestamp": "2026-09-03T20:35:40",
+      "currency": null,
+      "amount": 0.01563642,
+      "before": 511.963174647588,
+      "after": 511.947538227588,
+      "type": "fee",
+      "id": "222"
+    },
+    {
+      "timestamp": "2026-09-03T20:39:25",
+      "currency": null,
+      "amount": 0.04256,
+      "before": 511.931880527588,
+      "after": 511.974440527588,
+      "type": "trade",
+      "id": "224"
+    },
+    {
+      "timestamp": "2026-09-03T20:39:25",
+      "currency": null,
+      "amount": 0.0156577,
+      "before": 511.947538227588,
+      "after": 511.931880527588,
+      "type": "fee",
+      "id": "223"
+    },
+    {
+      "timestamp": "2026-09-03T20:39:55",
+      "currency": null,
+      "amount": 0.01566348,
+      "before": 511.974440527588,
+      "after": 511.958777047588,
+      "type": "fee",
+      "id": "225"
+    },
+    {
+      "timestamp": "2026-09-03T21:00:02",
+      "currency": null,
+      "amount": 0.11636,
+      "before": 511.943055387588,
+      "after": 512.059415387588,
+      "type": "trade",
+      "id": "227"
+    },
+    {
+      "timestamp": "2026-09-03T21:00:02",
+      "currency": null,
+      "amount": 0.01572166,
+      "before": 511.958777047588,
+      "after": 511.943055387588,
+      "type": "fee",
+      "id": "226"
+    },
+    {
+      "timestamp": "2026-09-03T21:00:25",
+      "currency": null,
+      "amount": 0.011777175,
+      "before": 512.055489662588,
+      "after": 512.043712487588,
+      "type": "fee",
+      "id": "229"
+    },
+    {
+      "timestamp": "2026-09-03T21:00:25",
+      "currency": null,
+      "amount": 0.003925725,
+      "before": 512.059415387588,
+      "after": 512.055489662588,
+      "type": "fee",
+      "id": "228"
+    },
+    {
+      "timestamp": "2026-09-03T21:40:47",
+      "currency": null,
+      "amount": 0.0902,
+      "before": 512.027964487588,
+      "after": 512.118164487588,
+      "type": "trade",
+      "id": "231"
+    },
+    {
+      "timestamp": "2026-09-03T21:40:47",
+      "currency": null,
+      "amount": 0.015748,
+      "before": 512.043712487588,
+      "after": 512.027964487588,
+      "type": "fee",
+      "id": "230"
+    },
+    {
+      "timestamp": "2026-09-03T21:41:15",
+      "currency": null,
+      "amount": 0.01575674,
+      "before": 512.118164487588,
+      "after": 512.102407747588,
+      "type": "fee",
+      "id": "232"
+    },
+    {
+      "timestamp": "2026-09-03T21:46:39",
+      "currency": null,
+      "amount": 0.04456,
+      "before": 512.086628727588,
+      "after": 512.131188727588,
+      "type": "trade",
+      "id": "234"
+    },
+    {
+      "timestamp": "2026-09-03T21:46:39",
+      "currency": null,
+      "amount": 0.01577902,
+      "before": 512.102407747588,
+      "after": 512.086628727588,
+      "type": "fee",
+      "id": "233"
+    },
+    {
+      "timestamp": "2026-09-03T21:47:15",
+      "currency": null,
+      "amount": 0.01577912,
+      "before": 512.131188727588,
+      "after": 512.115409607588,
+      "type": "fee",
+      "id": "235"
+    },
+    {
+      "timestamp": "2026-09-03T22:18:46",
+      "currency": null,
+      "amount": 0.04916,
+      "before": 512.099605907588,
+      "after": 512.148765907588,
+      "type": "trade",
+      "id": "237"
+    },
+    {
+      "timestamp": "2026-09-03T22:18:46",
+      "currency": null,
+      "amount": 0.0158037,
+      "before": 512.115409607588,
+      "after": 512.099605907588,
+      "type": "fee",
+      "id": "236"
+    },
+    {
+      "timestamp": "2026-09-03T22:19:17",
+      "currency": null,
+      "amount": 0.01579102,
+      "before": 512.148765907588,
+      "after": 512.132974887588,
+      "type": "fee",
+      "id": "238"
+    },
+    {
+      "timestamp": "2026-09-03T22:40:05",
+      "currency": null,
+      "amount": 0.2554,
+      "before": 512.117056167588,
+      "after": 512.372456167588,
+      "type": "trade",
+      "id": "240"
+    },
+    {
+      "timestamp": "2026-09-03T22:40:05",
+      "currency": null,
+      "amount": 0.01591872,
+      "before": 512.132974887588,
+      "after": 512.117056167588,
+      "type": "fee",
+      "id": "239"
+    },
+    {
+      "timestamp": "2026-09-03T22:40:28",
+      "currency": null,
+      "amount": 0.01593362,
+      "before": 512.372456167588,
+      "after": 512.356522547588,
+      "type": "fee",
+      "id": "241"
+    },
+    {
+      "timestamp": "2026-09-03T22:51:05",
+      "currency": null,
+      "amount": 0.21168,
+      "before": 512.340483087588,
+      "after": 512.552163087588,
+      "type": "trade",
+      "id": "243"
+    },
+    {
+      "timestamp": "2026-09-03T22:51:05",
+      "currency": null,
+      "amount": 0.01603946,
+      "before": 512.356522547588,
+      "after": 512.340483087588,
+      "type": "fee",
+      "id": "242"
+    },
+    {
+      "timestamp": "2026-09-03T22:51:47",
+      "currency": null,
+      "amount": 0.01602058,
+      "before": 512.552163087588,
+      "after": 512.536142507588,
+      "type": "fee",
+      "id": "244"
+    },
+    {
+      "timestamp": "2026-09-03T22:57:28",
+      "currency": null,
+      "amount": 0.04232,
+      "before": 512.520100767588,
+      "after": 512.562420767588,
+      "type": "trade",
+      "id": "246"
+    },
+    {
+      "timestamp": "2026-09-03T22:57:28",
+      "currency": null,
+      "amount": 0.01604174,
+      "before": 512.536142507588,
+      "after": 512.520100767588,
+      "type": "fee",
+      "id": "245"
+    },
+    {
+      "timestamp": "2026-09-03T22:58:09",
+      "currency": null,
+      "amount": 0.01605502,
+      "before": 512.562420767588,
+      "after": 512.546365747588,
+      "type": "fee",
+      "id": "247"
+    },
+    {
+      "timestamp": "2026-09-03T23:00:48",
+      "currency": null,
+      "amount": 0.08272,
+      "before": 512.530269367588,
+      "after": 512.612989367588,
+      "type": "trade",
+      "id": "249"
+    },
+    {
+      "timestamp": "2026-09-03T23:00:48",
+      "currency": null,
+      "amount": 0.01609638,
+      "before": 512.546365747588,
+      "after": 512.530269367588,
+      "type": "fee",
+      "id": "248"
+    },
+    {
+      "timestamp": "2026-09-03T23:01:21",
+      "currency": null,
+      "amount": 0.0161473,
+      "before": 512.612989367588,
+      "after": 512.596842067588,
+      "type": "fee",
+      "id": "250"
+    },
+    {
+      "timestamp": "2026-09-03T23:02:57",
+      "currency": null,
+      "amount": 0.03716,
+      "before": 512.580676187588,
+      "after": 512.617836187588,
+      "type": "trade",
+      "id": "252"
+    },
+    {
+      "timestamp": "2026-09-03T23:02:57",
+      "currency": null,
+      "amount": 0.01616588,
+      "before": 512.596842067588,
+      "after": 512.580676187588,
+      "type": "fee",
+      "id": "251"
+    },
+    {
+      "timestamp": "2026-09-03T23:03:30",
+      "currency": null,
+      "amount": 0.01616546,
+      "before": 512.617836187588,
+      "after": 512.601670727588,
+      "type": "fee",
+      "id": "253"
+    },
+    {
+      "timestamp": "2026-09-03T23:04:38",
+      "currency": null,
+      "amount": 0.00806363,
+      "before": 512.601670727588,
+      "after": 512.593607097588,
+      "type": "fee",
+      "id": "254"
+    },
+    {
+      "timestamp": "2026-09-03T23:12:13",
+      "currency": null,
+      "amount": 0.009649176,
+      "before": 512.593607097588,
+      "after": 512.583957921588,
+      "type": "fee",
+      "id": "255"
+    },
+    {
+      "timestamp": "2026-09-03T23:32:04",
+      "currency": null,
+      "amount": 0.13705,
+      "before": 512.523441921588,
+      "after": 512.660491921588,
+      "type": "trade",
+      "id": "257"
+    },
+    {
+      "timestamp": "2026-09-03T23:32:04",
+      "currency": null,
+      "amount": 0.060516,
+      "before": 512.583957921588,
+      "after": 512.523441921588,
+      "type": "fee",
+      "id": "256"
+    },
+    {
+      "timestamp": "2026-09-03T23:32:33",
+      "currency": null,
+      "amount": 0.01614322,
+      "before": 512.660491921588,
+      "after": 512.644348701588,
+      "type": "fee",
+      "id": "258"
+    },
+    {
+      "timestamp": "2026-09-03T23:36:44",
+      "currency": null,
+      "amount": 0.04636,
+      "before": 512.628182301588,
+      "after": 512.674542301588,
+      "type": "trade",
+      "id": "260"
+    },
+    {
+      "timestamp": "2026-09-03T23:36:44",
+      "currency": null,
+      "amount": 0.0161664,
+      "before": 512.644348701588,
+      "after": 512.628182301588,
+      "type": "fee",
+      "id": "259"
+    },
+    {
+      "timestamp": "2026-09-03T23:37:08",
+      "currency": null,
+      "amount": 0.01616002,
+      "before": 512.674542301588,
+      "after": 512.658382281588,
+      "type": "fee",
+      "id": "261"
+    },
+    {
+      "timestamp": "2026-09-03T23:40:29",
+      "currency": null,
+      "amount": 0.03596,
+      "before": 512.642204281588,
+      "after": 512.678164281588,
+      "type": "trade",
+      "id": "263"
+    },
+    {
+      "timestamp": "2026-09-03T23:40:29",
+      "currency": null,
+      "amount": 0.016178,
+      "before": 512.658382281588,
+      "after": 512.642204281588,
+      "type": "fee",
+      "id": "262"
+    },
+    {
+      "timestamp": "2026-09-03T23:41:02",
+      "currency": null,
+      "amount": 0.01618692,
+      "before": 512.678164281588,
+      "after": 512.661977361588,
+      "type": "fee",
+      "id": "264"
+    },
+    {
+      "timestamp": "2026-09-03T23:54:25",
+      "currency": null,
+      "amount": 0.09512,
+      "before": 512.645742881588,
+      "after": 512.740862881588,
+      "type": "trade",
+      "id": "266"
+    },
+    {
+      "timestamp": "2026-09-03T23:54:25",
+      "currency": null,
+      "amount": 0.01623448,
+      "before": 512.661977361588,
+      "after": 512.645742881588,
+      "type": "fee",
+      "id": "265"
+    },
+    {
+      "timestamp": "2026-09-03T23:54:47",
+      "currency": null,
+      "amount": 0.01624298,
+      "before": 512.740862881588,
+      "after": 512.724619901588,
+      "type": "fee",
+      "id": "267"
+    },
+    {
+      "timestamp": "2026-09-04T00:00:01",
+      "currency": null,
+      "amount": 0.00149625856,
+      "before": 512.724619901588,
+      "after": 512.723123643028,
+      "type": "fee",
+      "id": "268"
+    },
+    {
+      "timestamp": "2026-09-04T00:02:30",
+      "currency": null,
+      "amount": 0.00811027,
+      "before": 512.723123643028,
+      "after": 512.715013373028,
+      "type": "fee",
+      "id": "269"
+    },
+    {
+      "timestamp": "2026-09-04T00:04:53",
+      "currency": null,
+      "amount": 0.00968766,
+      "before": 512.715013373028,
+      "after": 512.705325713028,
+      "type": "fee",
+      "id": "270"
+    },
+    {
+      "timestamp": "2026-09-04T01:38:32",
+      "currency": null,
+      "amount": 0.10224,
+      "before": 512.644536788028,
+      "after": 512.746776788028,
+      "type": "trade",
+      "id": "272"
+    },
+    {
+      "timestamp": "2026-09-04T01:38:32",
+      "currency": null,
+      "amount": 0.060788925,
+      "before": 512.705325713028,
+      "after": 512.644536788028,
+      "type": "fee",
+      "id": "271"
+    },
+    {
+      "timestamp": "2026-09-04T01:39:16",
+      "currency": null,
+      "amount": 0.001621928,
+      "before": 512.741911004028,
+      "after": 512.740289076028,
+      "type": "fee",
+      "id": "275"
+    },
+    {
+      "timestamp": "2026-09-04T01:39:16",
+      "currency": null,
+      "amount": 0.003243856,
+      "before": 512.745154860028,
+      "after": 512.741911004028,
+      "type": "fee",
+      "id": "274"
+    },
+    {
+      "timestamp": "2026-09-04T01:39:16",
+      "currency": null,
+      "amount": 0.001621928,
+      "before": 512.746776788028,
+      "after": 512.745154860028,
+      "type": "fee",
+      "id": "273"
+    },
+    {
+      "timestamp": "2026-09-04T02:09:41",
+      "currency": null,
+      "amount": 0.0081311,
+      "before": 512.740289076028,
+      "after": 512.732157976028,
+      "type": "fee",
+      "id": "276"
+    },
+    {
+      "timestamp": "2026-09-04T02:33:28",
+      "currency": null,
+      "amount": 0.23906,
+      "before": 512.695730476028,
+      "after": 512.934790476028,
+      "type": "trade",
+      "id": "278"
+    },
+    {
+      "timestamp": "2026-09-04T02:33:28",
+      "currency": null,
+      "amount": 0.0364275,
+      "before": 512.732157976028,
+      "after": 512.695730476028,
+      "type": "fee",
+      "id": "277"
+    },
+    {
+      "timestamp": "2026-09-04T02:35:53",
+      "currency": null,
+      "amount": 0.0161935,
+      "before": 512.934790476028,
+      "after": 512.918596976028,
+      "type": "fee",
+      "id": "279"
+    },
+    {
+      "timestamp": "2026-09-04T03:05:43",
+      "currency": null,
+      "amount": 0.12056,
+      "before": 512.902343196028,
+      "after": 513.022903196028,
+      "type": "trade",
+      "id": "281"
+    },
+    {
+      "timestamp": "2026-09-04T03:05:43",
+      "currency": null,
+      "amount": 0.01625378,
+      "before": 512.918596976028,
+      "after": 512.902343196028,
+      "type": "fee",
+      "id": "280"
+    },
+    {
+      "timestamp": "2026-09-04T04:15:18",
+      "currency": null,
+      "amount": 0.01628106,
+      "before": 513.022903196028,
+      "after": 513.006622136028,
+      "type": "fee",
+      "id": "282"
+    },
+    {
+      "timestamp": "2026-09-04T05:04:07",
+      "currency": null,
+      "amount": 0.00813238,
+      "before": 513.006622136028,
+      "after": 512.998489756028,
+      "type": "fee",
+      "id": "283"
+    },
+    {
+      "timestamp": "2026-09-04T05:04:33",
+      "currency": null,
+      "amount": 0.0425,
+      "before": 512.961898996028,
+      "after": 512.919398996028,
+      "type": "trade",
+      "id": "285"
+    },
+    {
+      "timestamp": "2026-09-04T05:04:33",
+      "currency": null,
+      "amount": 0.03659076,
+      "before": 512.998489756028,
+      "after": 512.961898996028,
+      "type": "fee",
+      "id": "284"
+    },
+    {
+      "timestamp": "2026-09-04T05:35:18",
+      "currency": null,
+      "amount": 0.006548056,
+      "before": 512.919398996028,
+      "after": 512.912850940028,
+      "type": "fee",
+      "id": "286"
+    },
+    {
+      "timestamp": "2026-09-04T05:40:16",
+      "currency": null,
+      "amount": 0.00815911,
+      "before": 512.912850940028,
+      "after": 512.904691830028,
+      "type": "fee",
+      "id": "287"
+    },
+    {
+      "timestamp": "2026-09-04T06:13:13",
+      "currency": null,
+      "amount": 0.009749328,
+      "before": 512.904691830028,
+      "after": 512.894942502028,
+      "type": "fee",
+      "id": "288"
+    },
+    {
+      "timestamp": "2026-09-04T08:00:01",
+      "currency": null,
+      "amount": 0.00633565296,
+      "before": 512.894942502028,
+      "after": 512.888606849068,
+      "type": "fee",
+      "id": "289"
+    },
+    {
+      "timestamp": "2026-09-04T16:00:01",
+      "currency": null,
+      "amount": 0.00882842655,
+      "before": 512.888606849068,
+      "after": 512.879778422518,
+      "type": "fee",
+      "id": "290"
+    },
+    {
+      "timestamp": "2026-09-04T20:31:31",
+      "currency": null,
+      "amount": 0.012804112,
+      "before": 512.879778422518,
+      "after": 512.866974310518,
+      "type": "fee",
+      "id": "291"
+    },
+    {
+      "timestamp": "2026-09-04T22:50:06",
+      "currency": null,
+      "amount": 0.01572504,
+      "before": 512.866974310518,
+      "after": 512.851249270518,
+      "type": "fee",
+      "id": "292"
+    },
+    {
+      "timestamp": "2026-09-05T00:00:01",
+      "currency": null,
+      "amount": 0.004976895264,
+      "before": 512.851249270518,
+      "after": 512.846272375254,
+      "type": "fee",
+      "id": "293"
+    },
+    {
+      "timestamp": "2026-09-05T08:00:01",
+      "currency": null,
+      "amount": 0.000788302152,
+      "before": 512.846272375254,
+      "after": 512.845484073102,
+      "type": "fee",
+      "id": "294"
+    },
+    {
+      "timestamp": "2026-09-05T16:00:01",
+      "currency": null,
+      "amount": 0.00052582662,
+      "before": 512.845484073102,
+      "after": 512.844958246482,
+      "type": "fee",
+      "id": "295"
+    }
+  ],
+  "market": {
+    "ticker": {
+      "last": 79607.3,
+      "bid": 79607.2,
+      "ask": 79607.3,
+      "high": 81371.9,
+      "low": 78609.1,
+      "change_pct": -1.86,
+      "base_volume": 44270.0,
+      "quote_volume": 3525876892.0
+    },
+    "indicators": {
+      "price": 79607.3,
+      "ema_fast": 79603.69918096358,
+      "ema_slow": 79596.14104526314,
+      "rsi": 37.97585886722282,
+      "adx": 20.14676578118313,
+      "atr": 44.63571428571283,
+      "trend": "NEUTRAL",
+      "signal": "WAIT",
+      "dynamic_tp_activate_pct": 0.5,
+      "dynamic_tp_trail_ratio": 21.080000000000002,
+      "dynamic_tp_layer": 5
+    },
+    "support_resistance": {
+      "timeframe": "1h",
+      "current_price": 79607.3,
+      "gap_ratio": 0.005,
+      "atr": 150.2642857142855,
+      "vp_levels": [
+        77233.18,
+        77354.26,
+        77475.34,
+        77717.5,
+        80986.66
+      ],
+      "vp_resistance": [
+        80986.66
+      ],
+      "vp_support": [
+        77717.5,
+        77475.34,
+        77354.26,
+        77233.18
+      ],
+      "resistance": [
+        79611.0,
+        80986.66
+      ],
+      "support": [
+        79594.6,
+        78609.1,
+        77717.5,
+        77233.18
+      ]
+    },
+    "price_series": {
+      "points": [
+        {
+          "timestamp": "2026-09-05T11:05:00",
+          "close": 79485.5,
+          "ema_fast": 79538.81007609324,
+          "ema_slow": 79576.86906250347,
+          "volume": 267916.0
+        },
+        {
+          "timestamp": "2026-09-05T11:10:00",
+          "close": 79512.7,
+          "ema_fast": 79536.32340217961,
+          "ema_slow": 79574.3526286798,
+          "volume": 330235.0
+        },
+        {
+          "timestamp": "2026-09-05T11:15:00",
+          "close": 79550.7,
+          "ema_fast": 79537.69260197203,
+          "ema_slow": 79573.42507461393,
+          "volume": 357887.0
+        },
+        {
+          "timestamp": "2026-09-05T11:20:00",
+          "close": 79567.0,
+          "ema_fast": 79540.4837827366,
+          "ema_slow": 79573.17311090358,
+          "volume": 310538.0
+        },
+        {
+          "timestamp": "2026-09-05T11:25:00",
+          "close": 79542.1,
+          "ema_fast": 79540.63770819025,
+          "ema_slow": 79571.95455753482,
+          "volume": 154251.0
+        },
+        {
+          "timestamp": "2026-09-05T11:30:00",
+          "close": 79557.7,
+          "ema_fast": 79542.2626883626,
+          "ema_slow": 79571.39555527856,
+          "volume": 143353.0
+        },
+        {
+          "timestamp": "2026-09-05T11:35:00",
+          "close": 79572.1,
+          "ema_fast": 79545.10433708997,
+          "ema_slow": 79571.42318056176,
+          "volume": 225614.0
+        },
+        {
+          "timestamp": "2026-09-05T11:40:00",
+          "close": 79587.8,
+          "ema_fast": 79549.17059070045,
+          "ema_slow": 79572.06540877502,
+          "volume": 125321.0
+        },
+        {
+          "timestamp": "2026-09-05T11:45:00",
+          "close": 79584.8,
+          "ema_fast": 79552.5638677766,
+          "ema_slow": 79572.56480450934,
+          "volume": 122451.0
+        },
+        {
+          "timestamp": "2026-09-05T11:50:00",
+          "close": 79552.6,
+          "ema_fast": 79552.56730894072,
+          "ema_slow": 79571.78187099917,
+          "volume": 86476.0
+        },
+        {
+          "timestamp": "2026-09-05T11:55:00",
+          "close": 79546.8,
+          "ema_fast": 79552.01804142256,
+          "ema_slow": 79570.80218978353,
+          "volume": 106158.0
+        },
+        {
+          "timestamp": "2026-09-05T12:00:00",
+          "close": 79537.2,
+          "ema_fast": 79550.60679938232,
+          "ema_slow": 79569.48445685084,
+          "volume": 339926.0
+        },
+        {
+          "timestamp": "2026-09-05T12:05:00",
+          "close": 79512.5,
+          "ema_fast": 79546.97758039353,
+          "ema_slow": 79567.24977226845,
+          "volume": 183976.0
+        },
+        {
+          "timestamp": "2026-09-05T12:10:00",
+          "close": 79502.6,
+          "ema_fast": 79542.75114416558,
+          "ema_slow": 79564.71448708145,
+          "volume": 612883.0
+        },
+        {
+          "timestamp": "2026-09-05T12:15:00",
+          "close": 79526.7,
+          "ema_fast": 79541.22246376886,
+          "ema_slow": 79563.22372288218,
+          "volume": 171407.0
+        },
+        {
+          "timestamp": "2026-09-05T12:20:00",
+          "close": 79531.0,
+          "ema_fast": 79540.24889579086,
+          "ema_slow": 79561.96004747503,
+          "volume": 69901.0
+        },
+        {
+          "timestamp": "2026-09-05T12:25:00",
+          "close": 79515.8,
+          "ema_fast": 79537.92042952507,
+          "ema_slow": 79560.14984953484,
+          "volume": 72829.0
+        },
+        {
+          "timestamp": "2026-09-05T12:30:00",
+          "close": 79519.1,
+          "ema_fast": 79536.12800766554,
+          "ema_slow": 79558.54005151386,
+          "volume": 49213.0
+        },
+        {
+          "timestamp": "2026-09-05T12:35:00",
+          "close": 79498.7,
+          "ema_fast": 79532.5634355069,
+          "ema_slow": 79556.19338282706,
+          "volume": 110367.0
+        },
+        {
+          "timestamp": "2026-09-05T12:40:00",
+          "close": 79504.3,
+          "ema_fast": 79529.87167974435,
+          "ema_slow": 79554.15834820639,
+          "volume": 103402.0
+        },
+        {
+          "timestamp": "2026-09-05T12:45:00",
+          "close": 79523.4,
+          "ema_fast": 79529.25532929251,
+          "ema_slow": 79552.9521384728,
+          "volume": 412609.0
+        },
+        {
+          "timestamp": "2026-09-05T12:50:00",
+          "close": 79506.0,
+          "ema_fast": 79527.04053602656,
+          "ema_slow": 79551.11087814053,
+          "volume": 480276.0
+        },
+        {
+          "timestamp": "2026-09-05T12:55:00",
+          "close": 79460.9,
+          "ema_fast": 79520.74143735737,
+          "ema_slow": 79547.57319664484,
+          "volume": 210466.0
+        },
+        {
+          "timestamp": "2026-09-05T13:00:00",
+          "close": 79436.8,
+          "ema_fast": 79512.7470147519,
+          "ema_slow": 79543.22914971759,
+          "volume": 847020.0
+        },
+        {
+          "timestamp": "2026-09-05T13:05:00",
+          "close": 79434.8,
+          "ema_fast": 79505.32348953743,
+          "ema_slow": 79538.97702619925,
+          "volume": 970629.0
+        },
+        {
+          "timestamp": "2026-09-05T13:10:00",
+          "close": 79519.6,
+          "ema_fast": 79506.68315720053,
+          "ema_slow": 79538.2171428189,
+          "volume": 466992.0
+        },
+        {
+          "timestamp": "2026-09-05T13:15:00",
+          "close": 79508.7,
+          "ema_fast": 79506.87523746715,
+          "ema_slow": 79537.0596078064,
+          "volume": 374991.0
+        },
+        {
+          "timestamp": "2026-09-05T13:20:00",
+          "close": 79499.7,
+          "ema_fast": 79506.1918815179,
+          "ema_slow": 79535.59452514732,
+          "volume": 615568.0
+        },
+        {
+          "timestamp": "2026-09-05T13:25:00",
+          "close": 79550.0,
+          "ema_fast": 79510.3640832781,
+          "ema_slow": 79536.15944572978,
+          "volume": 203098.0
+        },
+        {
+          "timestamp": "2026-09-05T13:30:00",
+          "close": 79555.6,
+          "ema_fast": 79514.67226582304,
+          "ema_slow": 79536.92182040703,
+          "volume": 346839.0
+        },
+        {
+          "timestamp": "2026-09-05T13:35:00",
+          "close": 79532.2,
+          "ema_fast": 79516.34157383989,
+          "ema_slow": 79536.73665097932,
+          "volume": 173148.0
+        },
+        {
+          "timestamp": "2026-09-05T13:40:00",
+          "close": 79480.1,
+          "ema_fast": 79512.88999537895,
+          "ema_slow": 79534.51560584288,
+          "volume": 213918.0
+        },
+        {
+          "timestamp": "2026-09-05T13:45:00",
+          "close": 79460.7,
+          "ema_fast": 79507.91951962859,
+          "ema_slow": 79531.620876202,
+          "volume": 874954.0
+        },
+        {
+          "timestamp": "2026-09-05T13:50:00",
+          "close": 79538.5,
+          "ema_fast": 79510.83194633063,
+          "ema_slow": 79531.8906457627,
+          "volume": 728890.0
+        },
+        {
+          "timestamp": "2026-09-05T13:55:00",
+          "close": 79535.8,
+          "ema_fast": 79513.2098562039,
+          "ema_slow": 79532.04395377201,
+          "volume": 182482.0
+        },
+        {
+          "timestamp": "2026-09-05T14:00:00",
+          "close": 79566.0,
+          "ema_fast": 79518.2374889464,
+          "ema_slow": 79533.37556342801,
+          "volume": 208969.0
+        },
+        {
+          "timestamp": "2026-09-05T14:05:00",
+          "close": 79547.3,
+          "ema_fast": 79521.00534714198,
+          "ema_slow": 79533.92161976417,
+          "volume": 406771.0
+        },
+        {
+          "timestamp": "2026-09-05T14:10:00",
+          "close": 79586.1,
+          "ema_fast": 79527.20483789037,
+          "ema_slow": 79535.9678307538,
+          "volume": 518774.0
+        },
+        {
+          "timestamp": "2026-09-05T14:15:00",
+          "close": 79583.7,
+          "ema_fast": 79532.58532951986,
+          "ema_slow": 79537.83968052817,
+          "volume": 120655.0
+        },
+        {
+          "timestamp": "2026-09-05T14:20:00",
+          "close": 79587.0,
+          "ema_fast": 79537.7676790894,
+          "ema_slow": 79539.76753619373,
+          "volume": 245752.0
+        },
+        {
+          "timestamp": "2026-09-05T14:25:00",
+          "close": 79604.0,
+          "ema_fast": 79544.07551917613,
+          "ema_slow": 79542.286456343,
+          "volume": 376022.0
+        },
+        {
+          "timestamp": "2026-09-05T14:30:00",
+          "close": 79586.2,
+          "ema_fast": 79548.0873744927,
+          "ema_slow": 79544.00855609425,
+          "volume": 191238.0
+        },
+        {
+          "timestamp": "2026-09-05T14:35:00",
+          "close": 79679.6,
+          "ema_fast": 79560.61238644578,
+          "ema_slow": 79549.32586761998,
+          "volume": 354274.0
+        },
+        {
+          "timestamp": "2026-09-05T14:40:00",
+          "close": 79619.7,
+          "ema_fast": 79566.23977821285,
+          "ema_slow": 79552.08563751723,
+          "volume": 785060.0
+        },
+        {
+          "timestamp": "2026-09-05T14:45:00",
+          "close": 79627.7,
+          "ema_fast": 79572.09313266879,
+          "ema_slow": 79555.05090663419,
+          "volume": 143940.0
+        },
+        {
+          "timestamp": "2026-09-05T14:50:00",
+          "close": 79611.4,
+          "ema_fast": 79575.83664384318,
+          "ema_slow": 79557.26067500148,
+          "volume": 133043.0
+        },
+        {
+          "timestamp": "2026-09-05T14:55:00",
+          "close": 79600.8,
+          "ema_fast": 79578.21410633432,
+          "ema_slow": 79558.96809951124,
+          "volume": 424632.0
+        },
+        {
+          "timestamp": "2026-09-05T15:00:00",
+          "close": 79639.9,
+          "ema_fast": 79584.0889533501,
+          "ema_slow": 79562.14189953041,
+          "volume": 340531.0
+        },
+        {
+          "timestamp": "2026-09-05T15:05:00",
+          "close": 79619.3,
+          "ema_fast": 79587.44238636439,
+          "ema_slow": 79564.38339366647,
+          "volume": 195549.0
+        },
+        {
+          "timestamp": "2026-09-05T15:10:00",
+          "close": 79648.5,
+          "ema_fast": 79593.25739718684,
+          "ema_slow": 79567.68208411093,
+          "volume": 269360.0
+        },
+        {
+          "timestamp": "2026-09-05T15:15:00",
+          "close": 79626.2,
+          "ema_fast": 79596.39478793094,
+          "ema_slow": 79569.97690434188,
+          "volume": 306432.0
+        },
+        {
+          "timestamp": "2026-09-05T15:20:00",
+          "close": 79663.6,
+          "ema_fast": 79602.79528431848,
+          "ema_slow": 79573.64839828925,
+          "volume": 223203.0
+        },
+        {
+          "timestamp": "2026-09-05T15:25:00",
+          "close": 79674.9,
+          "ema_fast": 79609.66240009767,
+          "ema_slow": 79577.61904933673,
+          "volume": 138429.0
+        },
+        {
+          "timestamp": "2026-09-05T15:30:00",
+          "close": 79699.9,
+          "ema_fast": 79618.25645723123,
+          "ema_slow": 79582.4143807353,
+          "volume": 328917.0
+        },
+        {
+          "timestamp": "2026-09-05T15:35:00",
+          "close": 79685.2,
+          "ema_fast": 79624.63203273302,
+          "ema_slow": 79586.44518933391,
+          "volume": 323228.0
+        },
+        {
+          "timestamp": "2026-09-05T15:40:00",
+          "close": 79682.3,
+          "ema_fast": 79630.12422009178,
+          "ema_slow": 79590.2042015169,
+          "volume": 315272.0
+        },
+        {
+          "timestamp": "2026-09-05T15:45:00",
+          "close": 79682.0,
+          "ema_fast": 79635.06477055923,
+          "ema_slow": 79593.80403675154,
+          "volume": 504892.0
+        },
+        {
+          "timestamp": "2026-09-05T15:50:00",
+          "close": 79685.0,
+          "ema_fast": 79639.82050669644,
+          "ema_slow": 79597.38034903578,
+          "volume": 208577.0
+        },
+        {
+          "timestamp": "2026-09-05T15:55:00",
+          "close": 79670.7,
+          "ema_fast": 79642.7614108206,
+          "ema_slow": 79600.25562946574,
+          "volume": 253332.0
+        },
+        {
+          "timestamp": "2026-09-05T16:00:00",
+          "close": 79605.2,
+          "ema_fast": 79639.18413359959,
+          "ema_slow": 79600.44952634943,
+          "volume": 575937.0
+        },
+        {
+          "timestamp": "2026-09-05T16:05:00",
+          "close": 79609.1,
+          "ema_fast": 79636.31897801868,
+          "ema_slow": 79600.78876061024,
+          "volume": 372542.0
+        },
+        {
+          "timestamp": "2026-09-05T16:10:00",
+          "close": 79613.2,
+          "ema_fast": 79634.11717058833,
+          "ema_slow": 79601.27547588042,
+          "volume": 297868.0
+        },
+        {
+          "timestamp": "2026-09-05T16:15:00",
+          "close": 79624.2,
+          "ema_fast": 79633.17267815134,
+          "ema_slow": 79602.17447682629,
+          "volume": 300574.0
+        },
+        {
+          "timestamp": "2026-09-05T16:20:00",
+          "close": 79603.6,
+          "ema_fast": 79630.35623261312,
+          "ema_slow": 79602.23037969584,
+          "volume": 269342.0
+        },
+        {
+          "timestamp": "2026-09-05T16:25:00",
+          "close": 79601.7,
+          "ema_fast": 79627.62706760234,
+          "ema_slow": 79602.20958049208,
+          "volume": 541771.0
+        },
+        {
+          "timestamp": "2026-09-05T16:30:00",
+          "close": 79528.3,
+          "ema_fast": 79618.16734687831,
+          "ema_slow": 79599.31116557082,
+          "volume": 636265.0
+        },
+        {
+          "timestamp": "2026-09-05T16:35:00",
+          "close": 79567.6,
+          "ema_fast": 79613.35140908038,
+          "ema_slow": 79598.0675904504,
+          "volume": 686049.0
+        },
+        {
+          "timestamp": "2026-09-05T16:40:00",
+          "close": 79577.4,
+          "ema_fast": 79609.92746535844,
+          "ema_slow": 79597.25709670725,
+          "volume": 152838.0
+        },
+        {
+          "timestamp": "2026-09-05T16:45:00",
+          "close": 79555.6,
+          "ema_fast": 79604.7534210386,
+          "ema_slow": 79595.62348507167,
+          "volume": 141487.0
+        },
+        {
+          "timestamp": "2026-09-05T16:50:00",
+          "close": 79582.1,
+          "ema_fast": 79602.59595236825,
+          "ema_slow": 79595.09315232377,
+          "volume": 211465.0
+        },
+        {
+          "timestamp": "2026-09-05T16:55:00",
+          "close": 79610.2,
+          "ema_fast": 79603.3201473808,
+          "ema_slow": 79595.68557772285,
+          "volume": 367028.0
+        },
+        {
+          "timestamp": "2026-09-05T17:00:00",
+          "close": 79607.3,
+          "ema_fast": 79603.69918096358,
+          "ema_slow": 79596.14104526314,
+          "volume": 155071.0
+        }
+      ]
+    }
+  }
+}
