@@ -8,9 +8,10 @@ if str(ROOT) not in sys.path:
 from trading.martin_core import *  # Preserve the existing module/test interface.
 from trading.martin_core import MartinBot as LegacyMartinBot
 from trading.risk_guard import GateRiskMixin
+from trading.risk_sizing import GateDynamicSizingMixin
 
 
-class MartinBot(GateRiskMixin, LegacyMartinBot):
+class MartinBot(GateDynamicSizingMixin, GateRiskMixin, LegacyMartinBot):
     pass
 
 
