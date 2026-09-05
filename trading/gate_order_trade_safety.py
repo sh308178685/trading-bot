@@ -1,9 +1,18 @@
-"""Gate-specific order-scoped fill verification for the martingale bot.
+"""Gate-specific order-scoped fill and protective-stop safety extensions.
 
 The core strategy intentionally fails closed when its generic recent-trade window
 is full. Gate supports filtering personal futures trades by exact order ID, so
 we can replace that ambiguous account-wide window with a complete order-scoped
 window whenever the bot already knows the server order ID.
+
+Gate also requires a newly-created downside/upside trigger to sit on the safe
+side of the current reference price.  The core keeps a 0.1 percentage-point ROI
+buffer for that reason, but historically treated the configured minimum locked
+profit as an additional arming gate.  Around the minimum activation threshold
+that left an activated strategy without a server-side protective order.  This
+mixin keeps the Gate buffer while allowing the first protective order to lock
+whatever positive profit is currently safe to place; later updates remain
+monotonic and can tighten the stop normally.
 """
 
 from __future__ import annotations
@@ -12,13 +21,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 class GateOrderTradeSafetyMixin:
-    """Use Gate's ``my_trades?order=...`` before falling back to broad history."""
+    """Add Gate-specific fill verification and protective-stop arming safety."""
 
     _gate_trade_window_override: Optional[List[Dict[str, Any]]] = None
 
-    def _is_gate_order_trade_query_available(self) -> bool:
+    def _is_gate_exchange(self) -> bool:
         exchange_name = str(getattr(self.exchange, "name", "") or "").strip().lower()
-        return exchange_name in {"gate.io", "gateio", "gate"} and callable(
+        return exchange_name in {"gate.io", "gateio", "gate"}
+
+    def _is_gate_order_trade_query_available(self) -> bool:
+        return self._is_gate_exchange() and callable(
             getattr(self.exchange, "fetch_my_trades", None)
         )
 
@@ -32,6 +44,84 @@ class GateOrderTradeSafetyMixin:
             or info.get("orderId")
             or ""
         ).strip()
+
+    def _gate_protective_stop_arm_buffer_pct(self) -> float:
+        config = getattr(self, "config", {}) or {}
+        return max(
+            self._safe_float(
+                config.get("gate_protective_stop_arm_buffer_pct", 0.001),
+                0.001,
+            ),
+            0.0,
+        )
+
+    def _protective_stop_target(
+        self,
+        position: Dict[str, Any],
+        current_profit_pct: Optional[float] = None,
+        best_profit_pct: Optional[float] = None,
+        trail_ratio: Optional[float] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Arm Gate protection immediately once trailing TP is activated.
+
+        The core intentionally subtracts 0.1 percentage points from current ROI
+        so a Gate trigger is not submitted at/through the current mark price.  Its
+        old minimum-profit check could then return ``None`` at the exact activation
+        threshold (for example 0.50% current ROI -> 0.40% safely lockable ROI while
+        the configured minimum is 0.50%).  For Gate only, retain the placement
+        buffer but permit that first stop to lock the smaller positive amount.
+
+        Existing stops are never loosened by this method: the core
+        ``_should_update_protective_stop`` gate still accepts only tighter prices.
+        """
+        target = super()._protective_stop_target(
+            position,
+            current_profit_pct=current_profit_pct,
+            best_profit_pct=best_profit_pct,
+            trail_ratio=trail_ratio,
+        )
+        if target is not None or not self._is_gate_exchange() or current_profit_pct is None:
+            return target
+
+        current_profit = self._safe_float(current_profit_pct, 0.0)
+        arm_buffer = self._gate_protective_stop_arm_buffer_pct()
+        lockable_profit = max(current_profit - arm_buffer, 0.0)
+        if lockable_profit <= 0:
+            return None
+
+        # Ask the core for the otherwise-desired target without the live-price cap.
+        # If that also fails, the missing entry/best-profit prerequisites are real
+        # and must remain fail-closed.
+        desired = super()._protective_stop_target(
+            position,
+            current_profit_pct=None,
+            best_profit_pct=best_profit_pct,
+            trail_ratio=trail_ratio,
+        )
+        if not desired:
+            return None
+
+        locked_profit = min(
+            self._safe_float(desired.get("locked_profit_pct"), 0.0),
+            lockable_profit,
+        )
+        entry_price = self._safe_float(desired.get("entry_price"), 0.0)
+        leverage = max(self._safe_float(desired.get("leverage"), 1.0), 1.0)
+        side = str(desired.get("side") or "").lower()
+        if locked_profit <= 0 or entry_price <= 0 or side not in {"long", "short"}:
+            return None
+
+        raw_move_ratio = locked_profit / leverage
+        trigger_price = (
+            entry_price * (1 - raw_move_ratio)
+            if side == "short"
+            else entry_price * (1 + raw_move_ratio)
+        )
+        relaxed = dict(desired)
+        relaxed["locked_profit_pct"] = locked_profit
+        relaxed["trigger_price"] = trigger_price
+        relaxed["gate_arm_buffer_pct"] = arm_buffer
+        return relaxed
 
     def _fetch_gate_order_trades_complete(
         self,
