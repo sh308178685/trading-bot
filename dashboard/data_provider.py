@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from trading.runtime_config import load_runtime_config
+from trading.ledger import ledger_category, normalize_ledger_entry
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -330,6 +331,12 @@ class DashboardService:
             or market.get("support_resistance", {}).get("current_price")
         )
         performance = self._build_performance(balance, position, trades, ledger, current_price)
+        if performance["ledger_unresolved_24h"]:
+            warnings.append(
+                "部分账本缺少收支方向或原始类型，已排除；已实现盈亏仅为可核对部分，请重新同步交易所流水。"
+            )
+        if not performance["ledger_window_covers_24h"]:
+            warnings.append("账本快照未覆盖完整24小时；已实现盈亏为当前已获取流水之和。")
         trade_analytics = self._build_trade_analytics(trades)
         order_book = self._build_orders(open_orders, current_price)
         ladder = self._build_ladder(runtime, balance, position, current_price, market)
@@ -352,6 +359,10 @@ class DashboardService:
                 "last_phase": str(runtime.get("last_phase", runtime.get("phase", "PHASE1"))).upper(),
                 "position_side": runtime.get("position_side"),
                 "best_profit_pct": safe_float(runtime.get("best_profit_pct", 0)) * 100,
+                "trailing_peak_profit_pct": (
+                    safe_float(runtime.get("trailing_peak_profit_pct"), safe_float(runtime.get("best_profit_pct", 0))) * 100
+                    if runtime.get("activated") else None
+                ),
                 "last_known_contracts": safe_float(runtime.get("last_known_contracts", 0)),
                 "entry_price": safe_float(runtime.get("entry_price", 0)),
                 "activated": bool(runtime.get("activated", False)),
@@ -438,6 +449,11 @@ class DashboardService:
         realized = 0.0
         fees = 0.0
         turnover = 0.0
+        funding = 0.0
+        ledger_fees = 0.0
+        unresolved = 0
+        oldest_timestamp = None
+        settlement_currency = str(self.bot.config.get("settleCoin", "USDT")).upper()
         now = datetime.now()
         cutoff = now.timestamp() - 24 * 60 * 60
 
@@ -447,16 +463,33 @@ class DashboardService:
 
         for entry in ledger:
             ts = entry.get("timestamp")
+            parsed_ts = None
             if ts:
                 try:
-                    if datetime.fromisoformat(ts).timestamp() < cutoff:
-                        continue
-                except ValueError:
+                    parsed_ts = datetime.fromisoformat(ts).timestamp()
+                    oldest_timestamp = min(oldest_timestamp, parsed_ts) if oldest_timestamp is not None else parsed_ts
+                except (TypeError, ValueError, OSError):
                     pass
-            entry_type = str(entry.get("type", "")).lower()
-            amount = safe_float(entry.get("amount", 0))
-            if any(token in entry_type for token in ("pnl", "profit", "realized", "settle")):
+            if parsed_ts is not None and parsed_ts < cutoff:
+                continue
+            normalized = normalize_ledger_entry(entry)
+            category = ledger_category(normalized)
+            if category == "other":
+                continue
+            currency = str(normalized.get("currency") or settlement_currency).upper()
+            if currency != settlement_currency:
+                continue  # Never add different currencies without conversion.
+            if (parsed_ts is None or parsed_ts > now.timestamp()
+                    or category == "unclassified" or not normalized["sign_resolved"]):
+                unresolved += 1
+                continue
+            amount = normalized["signed_amount"]
+            if category == "pnl":
                 realized += amount
+            elif category == "funding":
+                funding += amount
+            elif category == "fee":
+                ledger_fees += amount
 
         equity_estimate = safe_float(balance.get("total", 0)) + unrealized
         roi = safe_float(position["percentage"]) if position else 0.0
@@ -464,6 +497,11 @@ class DashboardService:
             "equity_estimate": equity_estimate,
             "unrealized_pnl": unrealized,
             "realized_pnl_24h": realized,
+            "funding_pnl_24h": funding,
+            "trading_fees_24h": ledger_fees,
+            "net_pnl_24h": realized + funding + ledger_fees,
+            "ledger_unresolved_24h": unresolved,
+            "ledger_window_covers_24h": oldest_timestamp is not None and oldest_timestamp <= cutoff,
             "fees_recent": fees,
             "turnover_recent": turnover,
             "roi_pct": roi,

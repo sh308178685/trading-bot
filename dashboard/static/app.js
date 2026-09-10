@@ -245,7 +245,8 @@ function renderRuntimeFlags(snapshot) {
   const activeDrawdown = snapshot.runtime.active_trailing_drawdown_ratio || 0;
   const flags = [
     { label: "当前阶段", value: translatePhase(snapshot.runtime.phase) },
-    { label: "最高浮盈", value: fmtPct(snapshot.runtime.best_profit_pct) },
+    { label: "历史最高浮盈", value: fmtPct(snapshot.runtime.best_profit_pct) },
+    { label: "激活后追踪峰值", value: snapshot.runtime.activated ? fmtPct(snapshot.runtime.trailing_peak_profit_pct ?? snapshot.runtime.best_profit_pct) : "--" },
     { label: "移动止盈", value: snapshot.runtime.activated ? "已激活" : "待激活" },
     { label: "动态激活值", value: fmtPct(indicators.dynamic_tp_activate_pct) },
     {
@@ -654,7 +655,9 @@ function renderCharts(snapshot) {
 function renderHeader(snapshot) {
   setText("last-update", snapshot.timestamp || "--");
   setText("refresh-cadence", `${snapshot.server.refresh_ttl_sec || 5} 秒`);
-  setText("equity-note", `24 小时已实现 ${fmtMoney(snapshot.performance.realized_pnl_24h)}`);
+  const accountingPartial = snapshot.performance.ledger_unresolved_24h || !snapshot.performance.ledger_window_covers_24h;
+  const pnlLabel = accountingPartial ? "已获取流水净额（不完整）" : "24 小时流水净额";
+  setText("equity-note", `${pnlLabel} ${fmtMoney(snapshot.performance.net_pnl_24h ?? snapshot.performance.realized_pnl_24h)}`);
   setText("equity-current", fmtMoney(snapshot.performance.equity_estimate));
   setText("pnl-current", fmtMoney(snapshot.performance.unrealized_pnl));
   setText("price-current", fmtMoney(snapshot.market.indicators.price));

@@ -65,6 +65,7 @@ for extra_path in (DEPS_DIR, LEGACY_DEPS_DIR, USER_SITE):
 
 from trading.exchanges import create_exchange_adapter
 from trading.runtime_config import load_runtime_config
+from trading.ledger import normalize_ledger_entry
 
 import pandas as pd
 
@@ -166,6 +167,9 @@ class RuntimeState:
     protective_stop_client_oid: str = ""
     protective_stop_price: float = 0.0
     best_profit_pct: float = 0.0
+    # None identifies an old runtime snapshot. This peak starts at valid
+    # activation; best_profit_pct remains an all-cycle diagnostic statistic.
+    trailing_peak_profit_pct: Optional[float] = None
     active_trailing_drawdown_ratio: float = 0.0
     position_side: Optional[str] = None     # long / short
     last_known_contracts: float = 0.0
@@ -675,6 +679,8 @@ class MartinBot:
         return 0.0
 
     def _update_best_profit(self, current_profit_pct: float, source: str = "轮询", log_step_pct: Optional[float] = None) -> bool:
+        if not math.isfinite(current_profit_pct):
+            return False
         should_log = False
         with self.state_lock:
             if current_profit_pct <= self.state.best_profit_pct + 1e-9:
@@ -693,6 +699,54 @@ class MartinBot:
         if should_log:
             print(f"📈 [{source}] 最高浮盈更新: {current_profit_pct*100:.2f}%")
         return True
+
+    def _advance_trailing_peak(
+        self,
+        current_profit_pct: float,
+        activate_pct: float,
+        source: str = "轮询",
+    ) -> Optional[float]:
+        """Atomically arm from CURRENT profit and advance the active-only peak.
+
+        Never retroactively arm on an old best_profit_pct when ADX, layer or
+        configuration lowers the threshold. Once armed, protection stays sticky:
+        a negative profit or a higher activation threshold must not veto exits.
+        Legacy already-active snapshots retain their old peak on first use.
+        """
+        if not math.isfinite(current_profit_pct):
+            return None
+        changed = False
+        newly_activated = False
+        with self.state_lock:
+            if not self.state.activated:
+                if (not math.isfinite(activate_pct) or activate_pct <= 0
+                        or current_profit_pct < activate_pct):
+                    return None
+                self.state.activated = True
+                self.state.trailing_peak_profit_pct = current_profit_pct
+                newly_activated = True
+                changed = True
+            else:
+                peak = self.state.trailing_peak_profit_pct
+                if peak is None:
+                    peak = self._safe_float(self.state.best_profit_pct, 0.0)
+                    if not math.isfinite(peak):
+                        peak = 0.0
+                    self.state.trailing_peak_profit_pct = max(peak, current_profit_pct, 0.0)
+                    changed = True
+                elif current_profit_pct > peak:
+                    self.state.trailing_peak_profit_pct = current_profit_pct
+                    changed = True
+            result = self.state.trailing_peak_profit_pct
+        if changed:
+            self._save_runtime_state()
+        if newly_activated:
+            print(
+                f"⚡ [{source}] 移动止盈已激活（本持仓周期）: "
+                f"当前收益 {current_profit_pct*100:.2f}% >= {activate_pct*100:.2f}%；"
+                "追踪峰值从本次激活开始"
+            )
+        return result
 
     def _set_runtime_flag(self, field_name: str, value: Any) -> bool:
         changed = False
@@ -781,9 +835,14 @@ class MartinBot:
             best_profit * max(lock_ratio, 0.0),
         )
         if current_profit_pct is not None:
-            lockable_profit_pct = max(self._safe_float(current_profit_pct, 0.0) - 0.001, 0.0)
-            if lockable_profit_pct < self.protective_stop_min_profit_pct:
+            current_profit = self._safe_float(current_profit_pct, 0.0)
+            if not math.isfinite(current_profit) or current_profit <= 0:
                 return None
+            # A configured target floor must not prevent protection at the
+            # activation boundary. Shrink the cushion for small profits instead
+            # of demanding another +0.1% before submitting any protection.
+            cushion = min(0.001, current_profit * 0.20)
+            lockable_profit_pct = current_profit - cushion
             locked_profit_pct = min(locked_profit_pct, lockable_profit_pct)
 
         raw_move_ratio = locked_profit_pct / max(leverage, 1.0)
@@ -3331,6 +3390,7 @@ class MartinBot:
                 protective_stop_client_oid=raw.get('protective_stop_client_oid', ""),
                 protective_stop_price=raw.get('protective_stop_price', 0.0),
                 best_profit_pct=raw.get('best_profit_pct', 0.0),
+                trailing_peak_profit_pct=raw.get('trailing_peak_profit_pct'),
                 active_trailing_drawdown_ratio=raw.get('active_trailing_drawdown_ratio', 0.0),
                 position_side=raw.get('position_side'),
                 last_known_contracts=raw.get('last_known_contracts', 0.0),
@@ -3668,17 +3728,11 @@ class MartinBot:
     def _snapshot_ledger(self) -> List[Dict[str, Any]]:
         entries = []
         for entry in self.exchange.fetch_ledger(limit=80):
-            entries.append(
-                {
-                    'timestamp': self._format_timestamp_ms(entry.get('timestamp')),
-                    'currency': entry.get('currency'),
-                    'amount': self._safe_float(entry.get('amount', 0)),
-                    'before': self._safe_float(entry.get('before', 0)),
-                    'after': self._safe_float(entry.get('after', 0)),
-                    'type': entry.get('type'),
-                    'id': entry.get('id'),
-                }
-            )
+            normalized = normalize_ledger_entry(entry)
+            # Keep direction, raw type/change, IDs and genuinely missing values.
+            # Never replace missing balances by 0: that destroys sign evidence.
+            normalized['timestamp'] = self._format_timestamp_ms(entry.get('timestamp'))
+            entries.append(normalized)
         return entries
 
     def _snapshot_price_series(self, frame: pd.DataFrame) -> Dict[str, Any]:
@@ -4219,6 +4273,7 @@ class MartinBot:
                 self.state.phase2_start_layer = 0
                 self.state.initial_balance = 0.0
                 self.state.best_profit_pct = 0.0
+                self.state.trailing_peak_profit_pct = None
                 self.state.active_trailing_drawdown_ratio = 0.0
                 self.state.activated = False
                 self.state.last_known_contracts = 0.0
@@ -5148,6 +5203,9 @@ class MartinBot:
         if live_price <= 0:
             live_price = self._live_price_from_ws(position, allow_rest=False)
         current_profit_pct = self._position_profit_pct(position, live_price if live_price > 0 else None)
+        if not math.isfinite(current_profit_pct):
+            print("⚠️ WS收益率无效，跳过本次判断，不修改止盈状态")
+            return
         self._update_best_profit(
             current_profit_pct,
             source="WS",
@@ -5158,7 +5216,7 @@ class MartinBot:
         if current_profit_pct < -self.max_loss_pct:
             print(
                 f"🔴 WS止损触发: 亏损 {current_profit_pct*100:.2f}% "
-                f"< -{self.max_loss_pct*100:.0f}%"
+                f"< -{self.max_loss_pct*100:.2f}%"
             )
             self._execute_exit_pipeline("WS 止损触发，执行总平仓", position)
             return
@@ -5167,15 +5225,11 @@ class MartinBot:
         fallback_activate_pct, fallback_trail_ratio = self._fallback_trailing_values_for_layer(self.state.layer)
         activate_pct = context['activate_pct'] if context else fallback_activate_pct
         trail_ratio = context['trail_ratio'] if context else fallback_trail_ratio
-        best_profit_pct = self.state.best_profit_pct
-        if not self.state.activated:
-            if best_profit_pct < activate_pct:
-                return
-            if self._set_runtime_flag('activated', True):
-                print(
-                    f"⚡ WS移动止盈已激活: 第{max(self.state.layer, 1)}层 "
-                    f"{best_profit_pct*100:.2f}% >= {activate_pct*100:.2f}%"
-                )
+        best_profit_pct = self._advance_trailing_peak(
+            current_profit_pct, activate_pct, source="WS"
+        )
+        if best_profit_pct is None:
+            return
 
         # activated 是当前持仓周期内的粘性状态。即使后续指标上下文缺失、
         # 配置阈值变化或利润回落，也必须继续执行回撤保护。
@@ -5225,12 +5279,15 @@ class MartinBot:
                 current_price = self._safe_float(position.get('markPrice', 0))
 
             current_profit_pct = self._position_profit_pct(position, current_price if current_price > 0 else None)
+            if not math.isfinite(current_profit_pct):
+                print("⚠️ 收益率无效，跳过本次判断，不修改止盈状态")
+                return False
 
             # 硬止损
             if current_profit_pct < -self.max_loss_pct:
                 print(
                     f"🔴 止损触发: 亏损 {current_profit_pct*100:.2f}% "
-                    f"< -{self.max_loss_pct*100:.0f}%"
+                    f"< -{self.max_loss_pct*100:.2f}%"
                 )
                 return True
 
@@ -5253,32 +5310,30 @@ class MartinBot:
                 f"| 激活阈值={activate_pct*100:.2f}% 允许回撤={trail_ratio*100:.0f}%"
             )
 
-            if not self.state.activated:
-                if self.state.best_profit_pct < activate_pct:
-                    print(
-                        f"⏳ 等待激活: {self.state.best_profit_pct*100:.2f}% "
-                        f"< {activate_pct*100:.2f}%"
-                    )
-                    return False
-                if self._set_runtime_flag('activated', True):
-                    print(
-                        f"⚡ 移动止盈已永久激活（本持仓周期）: "
-                        f"{self.state.best_profit_pct*100:.2f}% >= {activate_pct*100:.2f}%"
-                    )
-                trail_ratio = self._tighten_active_trail_ratio(trail_ratio)
+            best_profit_pct = self._advance_trailing_peak(
+                current_profit_pct, activate_pct, source="轮询"
+            )
+            if best_profit_pct is None:
+                print(
+                    f"⏳ 等待激活: 当前收益 {current_profit_pct*100:.2f}% "
+                    f"/ 阈值 {activate_pct*100:.2f}% "
+                    f"（历史峰值 {self.state.best_profit_pct*100:.2f}% 仅供展示）"
+                )
+                return False
+            trail_ratio = self._tighten_active_trail_ratio(trail_ratio)
 
             self._arm_protective_stop(
                 position,
                 current_profit_pct=current_profit_pct,
-                best_profit_pct=self.state.best_profit_pct,
+                best_profit_pct=best_profit_pct,
                 trail_ratio=trail_ratio,
                 reason="轮询移动止盈激活",
             )
 
             # 回撤保护
-            if self.state.best_profit_pct > 0:
-                drawdown = self.state.best_profit_pct - current_profit_pct
-                max_drawdown = trail_ratio * self.state.best_profit_pct
+            if best_profit_pct > 0:
+                drawdown = best_profit_pct - current_profit_pct
+                max_drawdown = trail_ratio * best_profit_pct
                 if drawdown >= max_drawdown:
                     print(
                         f"🔴 回撤保护触发: 回撤 {drawdown*100:.2f}% "
@@ -5420,6 +5475,7 @@ class MartinBot:
                     self.state.pending_layer = 1
                     self.state.initial_balance = equity
                     self.state.best_profit_pct = 0.0
+                    self.state.trailing_peak_profit_pct = None
                     self.state.active_trailing_drawdown_ratio = 0.0
                     self.state.activated = False
                     self.state.entry_price = entry_price
@@ -6263,6 +6319,10 @@ class MartinBot:
         print(f"  交易所: {getattr(self.exchange, 'name', 'Bitget')}")
         print(f"  交易对: {self.symbol}")
         print(f"  杠杆: {self.leverage}X")
+        print(
+            f"  硬止损: 收益率 < -{self.max_loss_pct*100:.2f}% "
+            f"(max_loss_pct={self.max_loss_pct}; 0.5=50%, 0.005=0.5%)"
+        )
         print(f"  Phase1 首仓: {self.phase1_first_order_ratio*100:.2f}%")
         print(f"  Phase1 层数/倍率: {self.phase1_max_layers} / {self.phase1_layer_multipliers}")
         print(f"  Phase2 额外层数/倍率: {self.phase2_extra_layers} / {self.phase2_layer_multipliers}")
